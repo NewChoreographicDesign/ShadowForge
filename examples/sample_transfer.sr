@@ -1,0 +1,3 @@
+tx buy x from sender to receiver amount 100 {
+    project_fee = amount * 0.05 to vault_address;
+}

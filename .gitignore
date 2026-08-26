@@ -1,0 +1,7 @@
+*.exe
+*.test
+*.out
+/bin/
+/dist/
+zz_gentest_*/
+*.db
