@@ -149,7 +149,7 @@ pkg/state/           encrypted Badger KV store + Merkle tree
 pkg/consensus/       epoch clock, revolver, BFT, sentinels, outage/megabatch
 pkg/net/             libp2p + Noise, message protocol, rate limiter
 pkg/tx/              mempool + five-stage pipeline
-pkg/bank/ pkg/oracle/  ATR deposit/withdraw math, oracle quorum
+pkg/bank/ pkg/oracle/  ATR deposit/withdraw math, oracle quorum, hashed-IP correlation
 pkg/vault/           fee treasury and splits
 pkg/nft/             soulbound mint/traits/Trust Points/slashing
 pkg/governance/       genesis parameters, NFT-weighted voting
