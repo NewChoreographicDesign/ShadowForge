@@ -54,11 +54,26 @@ type walletStats struct {
 	baselinePerMinute decimal.Decimal
 	recentTimestamps  []time.Time
 	whitelisted       bool
+
+	firstSeen  time.Time
+	totalCount int64
+	holdUntil  time.Time
 }
 
 // windowSize is how far back RateMonitor looks when computing a wallet's
 // current rate.
 const windowSize = time.Minute
+
+// baselineEstablishPeriod is how long a wallet must be observed before
+// RecordTx automatically locks in a baseline from its lifetime average
+// rate (spec 15.4 names the +20% spike threshold and the hold/fee
+// response but doesn't prescribe how a baseline gets set in the first
+// place; this is that implementation decision, made explicit rather than
+// left as a caller obligation nobody ever calls). A wallet that hasn't
+// been observed this long yet has baseline 0 and — per IsSpiking's own
+// contract — can never spike, matching spec 15.4's rate-limiting intent
+// without flagging brand-new wallets on their first burst of activity.
+const baselineEstablishPeriod = 10 * time.Minute
 
 // RateMonitor tracks per-wallet transaction rates (including silent-padded
 // traffic) and flags a spike per spec 15.4.
@@ -98,12 +113,48 @@ func (m *RateMonitor) Whitelist(w types.Address) {
 }
 
 // RecordTx logs one transaction from w at time now, for rate computation.
+// Once w has been observed for baselineEstablishPeriod without an
+// explicit SetBaseline call, RecordTx locks in a baseline automatically
+// from the wallet's lifetime average rate — see baselineEstablishPeriod's
+// doc for why this exists.
 func (m *RateMonitor) RecordTx(w types.Address, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.stats(w)
+	if s.firstSeen.IsZero() {
+		s.firstSeen = now
+	}
+	s.totalCount++
 	s.recentTimestamps = append(s.recentTimestamps, now)
 	s.recentTimestamps = pruneOlderThan(s.recentTimestamps, now.Add(-windowSize))
+
+	if s.baselinePerMinute.Sign() <= 0 {
+		if elapsed := now.Sub(s.firstSeen); elapsed >= baselineEstablishPeriod {
+			minutes := decimal.FromInt(int64(elapsed / time.Minute))
+			if minutes.Sign() > 0 {
+				s.baselinePerMinute = decimal.FromInt(s.totalCount).Div(minutes)
+			}
+		}
+	}
+}
+
+// IsHeld reports whether w is currently under a spike-response hold
+// (spec 15.4: "a 7-day hold"), regardless of its current instantaneous
+// rate — a hold placed by PlaceHold persists even if the wallet's traffic
+// immediately settles back down.
+func (m *RateMonitor) IsHeld(w types.Address, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.stats(w).holdUntil.After(now)
+}
+
+// PlaceHold puts w under a hold until the given time. Callers apply this
+// after EvaluateSpike flags a wallet — EvaluateSpike itself stays a pure
+// query so callers can decide whether/when to act on it.
+func (m *RateMonitor) PlaceHold(w types.Address, until time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.stats(w).holdUntil = until
 }
 
 func pruneOlderThan(ts []time.Time, cutoff time.Time) []time.Time {

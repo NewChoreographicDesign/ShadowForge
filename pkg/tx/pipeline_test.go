@@ -7,6 +7,7 @@ import (
 
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -169,6 +170,72 @@ func TestPipelineHappyPathTransfer(t *testing.T) {
 		if err != nil || !spent {
 			t.Fatalf("expected nullifier %s to be committed spent: spent=%v err=%v", n, spent, err)
 		}
+	}
+}
+
+// TestPipelineCommittedTransferCollectsFeeIntoVault proves Stage 5 routes
+// a committed Transfer's fee into the Vault's real 20/10/10/60 split
+// (spec 9.2) — using buildValidTransfer's real ZK-proven FeeAmount (5),
+// not a fabricated number. A rejected transfer must not touch the Vault
+// at all (its fee was never actually collected).
+func TestPipelineCommittedTransferCollectsFeeIntoVault(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+	wantFee := decimal.FromInt(int64(shieldedTx.TransferPublicInputs.FeeAmount))
+	if wantFee.Sign() <= 0 {
+		t.Fatalf("test fixture must carry a positive fee, got %s", wantFee)
+	}
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
+	if results[0].Error != nil {
+		t.Fatalf("expected success, got error: %v", results[0].Error)
+	}
+
+	splits := vault.DefaultSplits()
+	wantEpochBonus := wantFee.Mul(splits.EpochBonus)
+	wantAudit := wantFee.Mul(splits.Audit)
+	wantRemainder := wantFee.Mul(splits.Remainder)
+	wantBurn := wantFee.Mul(splits.Burn)
+
+	v := deps.Vault
+	if v.EpochBonusPool.Cmp(wantEpochBonus) != 0 {
+		t.Fatalf("epoch bonus pool: got %s want %s", v.EpochBonusPool, wantEpochBonus)
+	}
+	if v.AuditPool.Cmp(wantAudit) != 0 {
+		t.Fatalf("audit pool: got %s want %s", v.AuditPool, wantAudit)
+	}
+	if v.RemainderPool.Cmp(wantRemainder) != 0 {
+		t.Fatalf("remainder pool: got %s want %s", v.RemainderPool, wantRemainder)
+	}
+	if v.BurnedTotal.Cmp(wantBurn) != 0 {
+		t.Fatalf("burned total: got %s want %s", v.BurnedTotal, wantBurn)
+	}
+}
+
+// TestPipelineRejectedTransferDoesNotCollectFee proves a Transfer that
+// fails a later stage never has its fee collected — the Vault must stay
+// untouched, matching the pipeline's atomicity rule (spec 5.3: rejection
+// leaves no trait or balance changes).
+func TestPipelineRejectedTransferDoesNotCollectFee(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+	shieldedTx = mustSign(t, types.ShieldedTx{
+		Kind:                 types.TxTransfer,
+		TransferPublicInputs: shieldedTx.TransferPublicInputs,
+		FeeCommit:            shieldedTx.FeeCommit,
+		Proof:                []byte("tampered proof, must fail stage 1 verification"),
+	})
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected the tampered transfer to be rejected")
+	}
+
+	v := deps.Vault
+	if v.EpochBonusPool.Sign() != 0 || v.AuditPool.Sign() != 0 || v.RemainderPool.Sign() != 0 || v.BurnedTotal.Sign() != 0 {
+		t.Fatalf("expected the Vault to be untouched by a rejected transfer, got %+v", v)
 	}
 }
 
@@ -412,6 +479,99 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 	}
 	if len(record.Commitments) != 2 {
 		t.Fatalf("expected 2 accumulated commitments, got %d", len(record.Commitments))
+	}
+}
+
+// mustSignWithKey signs in with a caller-supplied keypair, unlike mustSign
+// (which always generates a fresh one) — needed to submit multiple
+// transactions from the same real, signature-verified wallet identity.
+func mustSignWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, in types.ShieldedTx) types.ShieldedTx {
+	t.Helper()
+	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
+	sig, err := crypto.DilithiumSign(sk, in.TxID[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	in.Sig = types.DilithiumSig(sig)
+	in.SignerPubKey = []byte(pk)
+	return in
+}
+
+// TestPipelineSpikeDetectionHoldsFloodingWallet proves Stage 2 genuinely
+// enforces spec 15.4's spike defense end to end: real signature-verified
+// traffic from one wallet is recorded against a real RateMonitor, a burst
+// past its baseline is rejected and places a real hold, that hold persists
+// even for a follow-up transaction with no further burst, and a different
+// wallet's traffic is entirely unaffected.
+func TestPipelineSpikeDetectionHoldsFloodingWallet(t *testing.T) {
+	deps := newDeps(t)
+	deps.Silent = silent.NewRateMonitor()
+	p := tx.NewPipeline(deps)
+
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	addr := types.Address(types.SumHash([]byte(pk)))
+	deps.Silent.SetBaseline(addr, decimal.FromInt(1)) // 1 tx/min normal
+
+	now := time.Now()
+	voteTx := func(commit byte) types.ShieldedTx {
+		return mustSignWithKey(t, pk, sk, types.ShieldedTx{
+			Kind: types.TxVote,
+			VotePublicInputs: &types.VotePublicInputs{
+				ProposalID: types.ID("spike-test-proposal"),
+				Commitment: types.Hash{commit},
+			},
+		})
+	}
+
+	// First tx: at/under baseline, must be admitted.
+	r := p.ProcessBatch([]tx.Entry{{Tx: voteTx(1), SubmittedAt: now}})
+	if r[0].Error != nil {
+		t.Fatalf("expected the first transaction to be admitted: %v", r[0].Error)
+	}
+
+	// Burst well past baseline*1.2 within the same window.
+	var lastErr error
+	for i := byte(2); i < 10; i++ {
+		res := p.ProcessBatch([]tx.Entry{{Tx: voteTx(i), SubmittedAt: now}})
+		lastErr = res[0].Error
+		if lastErr != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		t.Fatalf("expected the burst to trip spike detection and be rejected")
+	}
+
+	if !deps.Silent.IsHeld(addr, now) {
+		t.Fatalf("expected the flooding wallet to be under a real hold after the spike was flagged")
+	}
+
+	// A follow-up transaction, even with no further burst, must still be
+	// rejected while the hold is active — the hold is real state, not
+	// just a value EvaluateSpike computed and discarded.
+	res := p.ProcessBatch([]tx.Entry{{Tx: voteTx(200), SubmittedAt: now.Add(time.Second)}})
+	if res[0].Error == nil {
+		t.Fatalf("expected a transaction from a held wallet to still be rejected")
+	}
+
+	// A different wallet is entirely unaffected.
+	otherPK, otherSK, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate other signer key: %v", err)
+	}
+	otherTx := mustSignWithKey(t, otherPK, otherSK, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("spike-test-proposal"),
+			Commitment: types.Hash{99},
+		},
+	})
+	otherRes := p.ProcessBatch([]tx.Entry{{Tx: otherTx, SubmittedAt: now}})
+	if otherRes[0].Error != nil {
+		t.Fatalf("expected an unrelated wallet's transaction to be unaffected: %v", otherRes[0].Error)
 	}
 }
 

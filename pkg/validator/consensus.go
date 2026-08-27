@@ -221,7 +221,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	for i, t := range prop.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 
 	for _, res := range results {
@@ -373,7 +373,7 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	for i, t := range ann.Block.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 	for _, res := range results {
 		if res.Error != nil {

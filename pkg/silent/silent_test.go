@@ -138,6 +138,75 @@ func TestEvaluateSpikeNotFlaggedForNormalTraffic(t *testing.T) {
 	}
 }
 
+// TestRecordTxAutoEstablishesBaselineAfterObservationPeriod proves a
+// wallet with no explicit SetBaseline call still gets a real baseline
+// locked in from its own lifetime average rate, once it's been observed
+// long enough — otherwise IsSpiking could never fire for a wallet nobody
+// ever manually baselined, silently defeating the whole defense.
+func TestRecordTxAutoEstablishesBaselineAfterObservationPeriod(t *testing.T) {
+	m := silent.NewRateMonitor()
+	w := addr(10)
+	start := time.Now()
+
+	// 5 tx/min steady state for exactly the establish period: 50 tx over
+	// 10 minutes.
+	for i := 0; i < 50; i++ {
+		m.RecordTx(w, start.Add(time.Duration(i)*12*time.Second))
+	}
+	afterPeriod := start.Add(10 * time.Minute)
+	m.RecordTx(w, afterPeriod) // one more tx exactly at the boundary triggers the check
+
+	if m.IsSpiking(w, afterPeriod) {
+		t.Fatalf("steady 5 tx/min traffic must not itself read as a spike right after baselining")
+	}
+
+	// Now burst well past whatever baseline got established.
+	burst := afterPeriod.Add(time.Second)
+	for i := 0; i < 50; i++ {
+		m.RecordTx(w, burst)
+	}
+	if !m.IsSpiking(w, burst) {
+		t.Fatalf("expected the auto-established baseline to make a later burst detectable as a spike")
+	}
+}
+
+// TestRecordTxNeverEstablishesBaselineBeforeObservationPeriod proves a
+// brand-new wallet's first burst of activity is never mistaken for a
+// spike — there is no baseline yet to compare against.
+func TestRecordTxNeverEstablishesBaselineBeforeObservationPeriod(t *testing.T) {
+	m := silent.NewRateMonitor()
+	w := addr(11)
+	now := time.Now()
+	for i := 0; i < 500; i++ {
+		m.RecordTx(w, now)
+	}
+	if m.IsSpiking(w, now) {
+		t.Fatalf("a wallet observed for less than baselineEstablishPeriod must not yet have a baseline")
+	}
+}
+
+// TestPlaceHoldAndIsHeld proves a hold is a real, queryable, time-bounded
+// state — not just a value EvaluateSpike computes and the caller discards.
+func TestPlaceHoldAndIsHeld(t *testing.T) {
+	m := silent.NewRateMonitor()
+	w := addr(12)
+	now := time.Now()
+	if m.IsHeld(w, now) {
+		t.Fatalf("a wallet must not be held before any hold is placed")
+	}
+	until := now.Add(silent.HoldDuration)
+	m.PlaceHold(w, until)
+	if !m.IsHeld(w, now) {
+		t.Fatalf("expected the wallet to be held immediately after PlaceHold")
+	}
+	if !m.IsHeld(w, until.Add(-time.Second)) {
+		t.Fatalf("expected the wallet to still be held just before the hold expires")
+	}
+	if m.IsHeld(w, until.Add(time.Second)) {
+		t.Fatalf("expected the hold to have expired")
+	}
+}
+
 func TestRunPadGeneratorEmitsAndStopsOnCancel(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	ctx, cancel := context.WithCancel(context.Background())

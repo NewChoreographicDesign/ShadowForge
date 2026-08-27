@@ -37,6 +37,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
+	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -97,6 +98,11 @@ type Node struct {
 	zkSys   *zk.System
 	vlt     *vault.Vault
 	chn     *chain.Chain
+	// silentMon is spec 15.4's per-wallet rate monitor. Constructed
+	// internally (not a NewNode parameter) since it's this node's own
+	// runtime defense state, not an external dependency a caller owns —
+	// same treatment as rounds/online below.
+	silentMon *silent.RateMonitor
 
 	identity types.NFTID
 	pk       crypto.DilithiumPublicKey
@@ -132,19 +138,20 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		logf = log.Printf
 	}
 	n := &Node{
-		cfg:      cfg,
-		mempool:  mempool,
-		store:    store,
-		tree:     tree,
-		zkSys:    zkSys,
-		vlt:      vlt,
-		chn:      chn,
-		identity: types.NFTID(types.SumHash(pk)),
-		pk:       pk,
-		sk:       sk,
-		log:      logf,
-		online:   map[types.NFTID]onlineInfo{},
-		rounds:   map[uint64]*round{},
+		cfg:       cfg,
+		mempool:   mempool,
+		store:     store,
+		tree:      tree,
+		zkSys:     zkSys,
+		vlt:       vlt,
+		chn:       chn,
+		silentMon: silent.NewRateMonitor(),
+		identity:  types.NFTID(types.SumHash(pk)),
+		pk:        pk,
+		sk:        sk,
+		log:       logf,
+		online:    map[types.NFTID]onlineInfo{},
+		rounds:    map[uint64]*round{},
 	}
 	n.net = shadownet.NewNode(h, limiter, n.handleMessage)
 	n.recordOnline(n.identity, pk, time.Now())

@@ -9,6 +9,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/container"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/vault"
@@ -27,7 +28,13 @@ type Deps struct {
 	StateTree *state.MerkleTree
 	ZK        *zk.System
 	Vault     *vault.Vault
-	Now       func() time.Time
+	// Silent is spec 15.4's per-wallet rate monitor. Nil disables spike
+	// detection entirely (existing single-tx tests that don't care about
+	// it keep working unchanged); when set, Stage 2 records every
+	// signature-verified transaction against it and rejects one from a
+	// wallet currently under a spike-response hold.
+	Silent *silent.RateMonitor
+	Now    func() time.Time
 }
 
 func (d Deps) now() time.Time {
@@ -225,6 +232,24 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 		return fmt.Errorf("signature does not verify against the claimed signer key")
 	}
 
+	// Spike detection (spec 15.4) keys off the wallet identity the
+	// signature check above just proved genuine — never off an unverified
+	// claimed pubkey, which an attacker could pick freely to paint an
+	// arbitrary victim address as spiking. This must run after the
+	// DilithiumVerify above, not before it.
+	if p.deps.Silent != nil {
+		now := p.deps.now()
+		addr := types.Address(types.SumHash(t.SignerPubKey))
+		if p.deps.Silent.IsHeld(addr, now) {
+			return fmt.Errorf("wallet is under an active spike-response hold")
+		}
+		p.deps.Silent.RecordTx(addr, now)
+		if action, flagged := silent.EvaluateSpike(p.deps.Silent, addr, now); flagged {
+			p.deps.Silent.PlaceHold(addr, action.HoldUntil)
+			return fmt.Errorf("transaction rate spike detected: wallet held until %s", action.HoldUntil)
+		}
+	}
+
 	switch t.Kind {
 	case types.TxTransfer:
 		if t.FeeCommit.IsZero() {
@@ -396,6 +421,14 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 			if err := p.deps.Store.MarkNullifierSpent(n); err != nil {
 				return fmt.Errorf("commit nullifier: %w", err)
 			}
+		}
+		// FeeAmount is a public input the ZK proof already bound and Stage
+		// 1 already verified (value conservation: inputs = outputs + fee),
+		// so this is real, cryptographically-proven revenue, not a
+		// fabricated figure — route it into the Vault's 20/10/10/60 split
+		// (spec 9.2) now that every stage has committed.
+		if p.deps.Vault != nil {
+			p.deps.Vault.CollectFee(decimal.FromInt(int64(t.TransferPublicInputs.FeeAmount)))
 		}
 	}
 	t.StageHints = t.StageHints.With(5)
