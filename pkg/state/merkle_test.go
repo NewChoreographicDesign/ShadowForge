@@ -77,6 +77,42 @@ func TestMerkleProofFailsForWrongLeaf(t *testing.T) {
 	}
 }
 
+func TestTruncateToRollsBackAppends(t *testing.T) {
+	m := state.NewMerkleTree()
+	m.Append(leaf(1))
+	m.Append(leaf(2))
+	snapshot := m.Len()
+	rootBefore := m.Root()
+
+	m.Append(leaf(3))
+	m.Append(leaf(4))
+	if m.Root() == rootBefore {
+		t.Fatalf("root should have changed after the tentative appends")
+	}
+
+	m.TruncateTo(snapshot)
+	if m.Len() != snapshot {
+		t.Fatalf("expected len %d after truncate, got %d", snapshot, m.Len())
+	}
+	if m.Root() != rootBefore {
+		t.Fatalf("expected root to match pre-append snapshot after rollback")
+	}
+}
+
+func TestTruncateToClampsOutOfRange(t *testing.T) {
+	m := state.NewMerkleTree()
+	m.Append(leaf(1))
+	m.TruncateTo(-5)
+	if m.Len() != 0 {
+		t.Fatalf("negative truncate target should clamp to 0, got len=%d", m.Len())
+	}
+	m.Append(leaf(2))
+	m.TruncateTo(1000)
+	if m.Len() != 1 {
+		t.Fatalf("truncate target beyond current length should clamp to current length, got len=%d", m.Len())
+	}
+}
+
 func TestMerkleProofOutOfRange(t *testing.T) {
 	m := state.NewMerkleTree()
 	m.Append(leaf(1))

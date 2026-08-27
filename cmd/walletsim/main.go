@@ -10,7 +10,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -132,11 +131,7 @@ func submitRandomVote(ctx context.Context, node *shadownet.Node, pk crypto.Dilit
 	t.Sig = types.DilithiumSig(sig)
 	t.SignerPubKey = []byte(pk)
 
-	blob, err := json.Marshal(t)
-	if err != nil {
-		return err
-	}
-	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{TxBytes: blob})
+	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: t})
 	if err != nil {
 		return err
 	}

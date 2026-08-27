@@ -21,17 +21,36 @@ func BFTFaultTolerance(assigned int) int {
 	return assigned / 3
 }
 
-// TallyVotes counts, for a candidate state root, how many of the supplied
-// votes (already signature-verified by the caller) endorse it, and reports
-// whether that reaches the BFTQuorumMet majority for the given assignment
-// size. Votes for a different state root are counted as dissent, not as
-// abstentions — an assigned validator who signs the wrong root does not
-// help finalize any root.
-func TallyVotes(assigned int, candidate types.Hash, votes []types.Vote) (endorsements int, quorum bool) {
-	for _, v := range votes {
-		if v.StateRoot == candidate {
-			endorsements++
-		}
+// TallyVotes counts, for a candidate state root, how many *distinct*
+// committee members endorse it, and reports whether that reaches
+// BFTQuorumMet's majority for len(committee).
+//
+// Two defenses live here that a naive "just count matching votes" tally
+// would miss: a vote from an identity not in committee is ignored (an
+// outsider cannot pad the count), and a committee member's second vote for
+// the same root is not counted twice (one validator, one vote — otherwise
+// a single validator could unilaterally manufacture "quorum" by submitting
+// duplicate votes). votes must already be signature-verified by the
+// caller — TallyVotes only knows about Vote.Validator/StateRoot, not
+// cryptographic validity.
+func TallyVotes(committee []types.NFTID, candidate types.Hash, votes []types.Vote) (endorsements int, quorum bool) {
+	inCommittee := make(map[types.NFTID]bool, len(committee))
+	for _, id := range committee {
+		inCommittee[id] = true
 	}
-	return endorsements, BFTQuorumMet(assigned, endorsements)
+	counted := make(map[types.NFTID]bool, len(votes))
+	for _, v := range votes {
+		if v.StateRoot != candidate {
+			continue
+		}
+		if !inCommittee[v.Validator] {
+			continue
+		}
+		if counted[v.Validator] {
+			continue
+		}
+		counted[v.Validator] = true
+		endorsements++
+	}
+	return endorsements, BFTQuorumMet(len(committee), endorsements)
 }

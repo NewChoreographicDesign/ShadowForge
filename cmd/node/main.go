@@ -129,12 +129,7 @@ func main() {
 				log.Printf("bad tx offer from %s: %v", p, err)
 				return
 			}
-			var t types.ShieldedTx
-			if err := json.Unmarshal(offer.TxBytes, &t); err != nil {
-				log.Printf("bad tx blob from %s: %v", p, err)
-				return
-			}
-			if err := mempool.Submit(t, time.Now()); err != nil {
+			if err := mempool.Submit(offer.Tx, time.Now()); err != nil {
 				log.Printf("tx offer from %s not admitted: %v", p, err)
 			}
 
@@ -232,10 +227,8 @@ func waitForAddrFile(ctx context.Context, path string) (string, error) {
 }
 
 func handleHeartbeat(revolver *consensus.Revolver, hb shadownet.HeartbeatPayload) {
-	var nftID types.NFTID
-	copy(nftID[:], []byte(hb.NFT))
 	revolver.RequestJoin(types.QueueItem{
-		NFT:      nftID,
+		NFT:      hb.NFT,
 		JoinedAt: hb.Timestamp,
 		LastBeat: hb.Timestamp,
 	}, time.Now())
@@ -250,7 +243,7 @@ func heartbeatLoop(ctx context.Context, node *shadownet.Node) {
 			return
 		case <-ticker.C:
 			env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
-				NFT:       node.Host.ID().String(),
+				NFT:       types.NFTID(types.SumHash([]byte(node.Host.ID().String()))),
 				Timestamp: time.Now().UnixMilli(),
 			})
 			if err != nil {

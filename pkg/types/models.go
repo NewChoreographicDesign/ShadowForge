@@ -156,6 +156,28 @@ type Block struct {
 	DualTrack   bool // true if this block is the backlog track of a megabatch
 }
 
+// HashBlock computes a block's canonical header hash: everything a
+// validator commits to before voting (Height, Epoch, PrevHash, Timestamp,
+// TxRoot, StateRoot, DARoot, Proposer). Votes and ProposerSig are
+// deliberately excluded — they are produced *over* this hash (a StageVote
+// signs it; ProposerSig authenticates the proposal that led to it), so
+// including them would be circular. Two blocks that differ only in which
+// votes they happened to collect still hash identically, which is exactly
+// what lets independently-computing validators agree on "the candidate"
+// before votes exist.
+func HashBlock(b Block) Hash {
+	var heightBuf, epochBuf, tsBuf [8]byte
+	for i := 0; i < 8; i++ {
+		heightBuf[i] = byte(b.Height >> (8 * i))
+		epochBuf[i] = byte(b.Epoch >> (8 * i))
+		tsBuf[i] = byte(uint64(b.Timestamp) >> (8 * i))
+	}
+	return SumHash(
+		heightBuf[:], epochBuf[:], b.PrevHash[:], tsBuf[:],
+		b.TxRoot[:], b.StateRoot[:], b.DARoot[:], b.Proposer[:],
+	)
+}
+
 // Note is a private unspent value object; only Commitment is public
 // (spec 4.4).
 type Note struct {

@@ -38,6 +38,20 @@ func (m *MerkleTree) Append(leaf types.Hash) int {
 
 func (m *MerkleTree) Len() int { return len(m.leaves) }
 
+// TruncateTo discards every leaf from index n onward, restoring the tree
+// to the state it was in after its n-th Append. Used to roll back a
+// tentatively-applied batch that failed to reach BFT quorum (spec 5.7):
+// pair with Len() called before the tentative appends to capture n.
+func (m *MerkleTree) TruncateTo(n int) {
+	if n < 0 {
+		n = 0
+	}
+	if n > len(m.leaves) {
+		n = len(m.leaves)
+	}
+	m.leaves = m.leaves[:n]
+}
+
 // Root computes the current Merkle root. An empty tree's root is the zero
 // hash. A tree with an odd node count at any level duplicates the last node
 // (the standard Bitcoin-style padding rule), so Root is deterministic for

@@ -32,15 +32,68 @@ func TestBFTQuorumTwoValidatorsPerStage(t *testing.T) {
 func TestTallyVotesCountsOnlyMatchingRoot(t *testing.T) {
 	root := types.Hash{1}
 	other := types.Hash{2}
+	committee := []types.NFTID{nftID(1), nftID(2), nftID(3), nftID(4), nftID(5)}
 	votes := []types.Vote{
-		{StateRoot: root}, {StateRoot: root}, {StateRoot: other},
+		{Validator: nftID(1), StateRoot: root},
+		{Validator: nftID(2), StateRoot: root},
+		{Validator: nftID(3), StateRoot: other},
 	}
-	endorsements, quorum := consensus.TallyVotes(5, root, votes)
+	endorsements, quorum := consensus.TallyVotes(committee, root, votes)
 	if endorsements != 2 {
 		t.Fatalf("expected 2 endorsements, got %d", endorsements)
 	}
 	if quorum {
 		t.Fatalf("2 of 5 must not reach quorum")
+	}
+}
+
+func TestTallyVotesIgnoresDuplicateVoteFromSameValidator(t *testing.T) {
+	root := types.Hash{1}
+	committee := []types.NFTID{nftID(1), nftID(2), nftID(3), nftID(4), nftID(5)}
+	// nftID(1) votes three times for the same root — must still only
+	// count once, or a single validator could manufacture quorum alone.
+	votes := []types.Vote{
+		{Validator: nftID(1), StateRoot: root},
+		{Validator: nftID(1), StateRoot: root},
+		{Validator: nftID(1), StateRoot: root},
+	}
+	endorsements, quorum := consensus.TallyVotes(committee, root, votes)
+	if endorsements != 1 {
+		t.Fatalf("expected exactly 1 endorsement despite 3 votes from the same validator, got %d", endorsements)
+	}
+	if quorum {
+		t.Fatalf("1 of 5 must not reach quorum, even padded with duplicate votes")
+	}
+}
+
+func TestTallyVotesIgnoresNonCommitteeVoter(t *testing.T) {
+	root := types.Hash{1}
+	committee := []types.NFTID{nftID(1), nftID(2), nftID(3)}
+	outsider := nftID(99)
+	votes := []types.Vote{
+		{Validator: nftID(1), StateRoot: root},
+		{Validator: outsider, StateRoot: root},
+	}
+	endorsements, quorum := consensus.TallyVotes(committee, root, votes)
+	if endorsements != 1 {
+		t.Fatalf("expected an outsider's vote to be ignored, got %d endorsements", endorsements)
+	}
+	if quorum {
+		t.Fatalf("1 of 3 must not reach quorum")
+	}
+}
+
+func TestTallyVotesReachesQuorum(t *testing.T) {
+	root := types.Hash{1}
+	committee := []types.NFTID{nftID(1), nftID(2), nftID(3), nftID(4), nftID(5)}
+	votes := []types.Vote{
+		{Validator: nftID(1), StateRoot: root},
+		{Validator: nftID(2), StateRoot: root},
+		{Validator: nftID(3), StateRoot: root},
+	}
+	endorsements, quorum := consensus.TallyVotes(committee, root, votes)
+	if endorsements != 3 || !quorum {
+		t.Fatalf("expected 3/5 to reach quorum, got endorsements=%d quorum=%v", endorsements, quorum)
 	}
 }
 

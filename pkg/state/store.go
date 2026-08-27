@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 
@@ -18,6 +19,11 @@ import (
 //	hold id -> BankHold
 //	proposal id -> vote commitments
 //	container id -> subspace root
+//
+// block/head are this package's own addition, for the block persistence
+// pkg/chain needs (spec 18.1 lists no explicit row for it, but section 7's
+// state layer is where block history naturally lives alongside everything
+// else Badger-backed).
 var (
 	prefixCommitment = []byte("commit:")
 	prefixNullifier  = []byte("null:")
@@ -25,7 +31,30 @@ var (
 	prefixHold       = []byte("hold:")
 	prefixProposal   = []byte("prop:")
 	prefixContainer  = []byte("container:")
+	prefixBlock      = []byte("block:")
+	keyHead          = []byte("head")
 )
+
+// Accessor is the read/write surface pkg/tx's pipeline needs. Both *Store
+// (auto-commits every call, its original behavior) and *Txn (batches many
+// calls into one long-lived, explicitly committed-or-discarded Badger
+// transaction) implement it — see txn.go's doc comment for why the
+// pipeline needs both modes.
+type Accessor interface {
+	MarkNullifierSpent(nullifier types.Hash) error
+	IsNullifierSpent(nullifier types.Hash) (bool, error)
+	PutNFT(nft types.ValidatorNFT) error
+	GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error)
+	PutHold(hold types.BankHold) error
+	GetHold(id types.Hash) (types.BankHold, bool, error)
+	PutProposal(p ProposalRecord) error
+	GetProposal(id string) (ProposalRecord, bool, error)
+	PutContainerRoot(containerID string, root types.Hash) error
+	GetContainerRoot(containerID string) (types.Hash, bool, error)
+}
+
+var _ Accessor = (*Store)(nil)
+var _ Accessor = (*Txn)(nil)
 
 // Store is the Badger-backed encrypted account/note KV store (spec 3.3,
 // section 7). Note blobs and memos are sealed with the store's
@@ -56,42 +85,44 @@ func Open(path string, inMemory bool, key crypto.EncryptionKey) (*Store, error) 
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// BeginTxn opens a long-lived, explicitly committed-or-discarded Badger
+// transaction sharing this Store's encryption key. See txn.go.
+func (s *Store) BeginTxn() *Txn {
+	return &Txn{txn: s.db.NewTransaction(true), key: s.key}
+}
+
 func withPrefix(prefix []byte, id string) []byte {
 	return append(append([]byte{}, prefix...), []byte(id)...)
 }
 
-func (s *Store) setJSON(prefix []byte, id string, v interface{}) error {
+func setJSON(txn *badger.Txn, prefix []byte, id string, v interface{}) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("state: marshal: %w", err)
 	}
-	return s.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(withPrefix(prefix, id), b)
-	})
+	return txn.Set(withPrefix(prefix, id), b)
 }
 
-func (s *Store) getJSON(prefix []byte, id string, v interface{}) (bool, error) {
-	var found bool
-	err := s.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(withPrefix(prefix, id))
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		found = true
-		return item.Value(func(val []byte) error {
-			return json.Unmarshal(val, v)
-		})
-	})
-	if err != nil {
-		return false, fmt.Errorf("state: get: %w", err)
+func getJSON(txn *badger.Txn, prefix []byte, id string, v interface{}) (bool, error) {
+	item, err := txn.Get(withPrefix(prefix, id))
+	if err == badger.ErrKeyNotFound {
+		return false, nil
 	}
-	return found, nil
+	if err != nil {
+		return false, err
+	}
+	if err := item.Value(func(val []byte) error {
+		return json.Unmarshal(val, v)
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
-// --- Notes (encrypted) ---
+// --- Notes (encrypted). Only *Store exposes these: notes are written by a
+// receiving wallet scanning commitments, not by the validating pipeline
+// (which never learns note plaintext), so they don't need Txn's batched-
+// round semantics. ---
 
 // PutNote seals note under the store's encryption key (AAD = commitment
 // bytes, so a ciphertext cannot be replayed under a different commitment
@@ -139,34 +170,41 @@ func (s *Store) GetNote(commitment types.Hash) (types.Note, bool, error) {
 
 // --- Nullifiers ---
 
+func markNullifierSpent(txn *badger.Txn, nullifier types.Hash) error {
+	key := withPrefix(prefixNullifier, nullifier.String())
+	if _, err := txn.Get(key); err == nil {
+		return fmt.Errorf("state: nullifier %s already spent (double-spend rejected)", nullifier)
+	} else if err != badger.ErrKeyNotFound {
+		return err
+	}
+	return txn.Set(key, []byte{1})
+}
+
+func isNullifierSpent(txn *badger.Txn, nullifier types.Hash) (bool, error) {
+	_, err := txn.Get(withPrefix(prefixNullifier, nullifier.String()))
+	if err == badger.ErrKeyNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // MarkNullifierSpent records that a note's nullifier has been spent. It
 // fails if the nullifier is already spent, enforcing the double-spend rule
 // at the storage layer as a defense-in-depth check behind the circuit's own
 // nullifier-derivation proof (spec 8.1).
 func (s *Store) MarkNullifierSpent(nullifier types.Hash) error {
-	return s.db.Update(func(txn *badger.Txn) error {
-		key := withPrefix(prefixNullifier, nullifier.String())
-		if _, err := txn.Get(key); err == nil {
-			return fmt.Errorf("state: nullifier %s already spent (double-spend rejected)", nullifier)
-		} else if err != badger.ErrKeyNotFound {
-			return err
-		}
-		return txn.Set(key, []byte{1})
-	})
+	return s.db.Update(func(txn *badger.Txn) error { return markNullifierSpent(txn, nullifier) })
 }
 
 func (s *Store) IsNullifierSpent(nullifier types.Hash) (bool, error) {
-	spent := false
+	var spent bool
 	err := s.db.View(func(txn *badger.Txn) error {
-		_, err := txn.Get(withPrefix(prefixNullifier, nullifier.String()))
-		if err == badger.ErrKeyNotFound {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		spent = true
-		return nil
+		var err error
+		spent, err = isNullifierSpent(txn, nullifier)
+		return err
 	})
 	return spent, err
 }
@@ -174,24 +212,34 @@ func (s *Store) IsNullifierSpent(nullifier types.Hash) (bool, error) {
 // --- NFTs ---
 
 func (s *Store) PutNFT(nft types.ValidatorNFT) error {
-	return s.setJSON(prefixNFT, nft.ID.String(), nft)
+	return s.db.Update(func(txn *badger.Txn) error { return setJSON(txn, prefixNFT, nft.ID.String(), nft) })
 }
 
 func (s *Store) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
 	var nft types.ValidatorNFT
-	found, err := s.getJSON(prefixNFT, id.String(), &nft)
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		found, err = getJSON(txn, prefixNFT, id.String(), &nft)
+		return err
+	})
 	return nft, found, err
 }
 
 // --- Bank holds ---
 
 func (s *Store) PutHold(hold types.BankHold) error {
-	return s.setJSON(prefixHold, hold.HoldID.String(), hold)
+	return s.db.Update(func(txn *badger.Txn) error { return setJSON(txn, prefixHold, hold.HoldID.String(), hold) })
 }
 
 func (s *Store) GetHold(id types.Hash) (types.BankHold, bool, error) {
 	var hold types.BankHold
-	found, err := s.getJSON(prefixHold, id.String(), &hold)
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		found, err = getJSON(txn, prefixHold, id.String(), &hold)
+		return err
+	})
 	return hold, found, err
 }
 
@@ -203,23 +251,105 @@ type ProposalRecord struct {
 }
 
 func (s *Store) PutProposal(p ProposalRecord) error {
-	return s.setJSON(prefixProposal, p.ProposalID, p)
+	return s.db.Update(func(txn *badger.Txn) error { return setJSON(txn, prefixProposal, p.ProposalID, p) })
 }
 
 func (s *Store) GetProposal(id string) (ProposalRecord, bool, error) {
 	var p ProposalRecord
-	found, err := s.getJSON(prefixProposal, id, &p)
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		found, err = getJSON(txn, prefixProposal, id, &p)
+		return err
+	})
 	return p, found, err
 }
 
 // --- Containers (subspace roots) ---
 
 func (s *Store) PutContainerRoot(containerID string, root types.Hash) error {
-	return s.setJSON(prefixContainer, containerID, root)
+	return s.db.Update(func(txn *badger.Txn) error { return setJSON(txn, prefixContainer, containerID, root) })
 }
 
 func (s *Store) GetContainerRoot(containerID string) (types.Hash, bool, error) {
 	var root types.Hash
-	found, err := s.getJSON(prefixContainer, containerID, &root)
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		found, err = getJSON(txn, prefixContainer, containerID, &root)
+		return err
+	})
 	return root, found, err
+}
+
+// --- Blocks + chain head (pkg/chain) ---
+
+func blockKey(height uint64) []byte {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], height)
+	return withPrefix(prefixBlock, string(b[:]))
+}
+
+func (s *Store) PutBlock(b types.Block) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		enc, err := json.Marshal(b)
+		if err != nil {
+			return fmt.Errorf("state: marshal block: %w", err)
+		}
+		return txn.Set(blockKey(b.Height), enc)
+	})
+}
+
+func (s *Store) GetBlock(height uint64) (types.Block, bool, error) {
+	var b types.Block
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(blockKey(height))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return item.Value(func(val []byte) error { return json.Unmarshal(val, &b) })
+	})
+	if err != nil {
+		return types.Block{}, false, fmt.Errorf("state: get block: %w", err)
+	}
+	return b, found, nil
+}
+
+// SetHead records height as the current chain head height.
+func (s *Store) SetHead(height uint64) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], height)
+		return txn.Set(keyHead, b[:])
+	})
+}
+
+// GetHead returns the current chain head height, or found=false if no
+// block has ever been committed.
+func (s *Store) GetHead() (uint64, bool, error) {
+	var height uint64
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(keyHead)
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return item.Value(func(val []byte) error {
+			if len(val) != 8 {
+				return fmt.Errorf("state: corrupt head record")
+			}
+			height = binary.BigEndian.Uint64(val)
+			return nil
+		})
+	})
+	return height, found, err
 }

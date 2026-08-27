@@ -1,14 +1,24 @@
 package net
 
-import "encoding/json"
+import (
+	"encoding/json"
 
-// MessageType enumerates spec 6's message types: "Heartbeat, TxOffer,
-// StageVote, BlockAnnounce, MegabatchPart, ContainerSync, SilentPad."
+	"github.com/shadowforge/shadowforge-l1/pkg/types"
+)
+
+// MessageType enumerates spec 6's message types ("Heartbeat, TxOffer,
+// StageVote, BlockAnnounce, MegabatchPart, ContainerSync, SilentPad") plus
+// BlockProposal, a necessary addition spec 6 doesn't spell out at the wire
+// level: real cross-node BFT voting (spec 5.7) requires committee members
+// to vote on one agreed-upon batch, not their own independently-chosen
+// mempool contents, so someone has to broadcast the batch before anyone
+// can vote on it.
 type MessageType string
 
 const (
 	MsgHeartbeat     MessageType = "Heartbeat"
 	MsgTxOffer       MessageType = "TxOffer"
+	MsgBlockProposal MessageType = "BlockProposal"
 	MsgStageVote     MessageType = "StageVote"
 	MsgBlockAnnounce MessageType = "BlockAnnounce"
 	MsgMegabatchPart MessageType = "MegabatchPart"
@@ -32,29 +42,52 @@ func NewEnvelope(t MessageType, payload interface{}) (Envelope, error) {
 	return Envelope{Type: t, Payload: b}, nil
 }
 
-// HeartbeatPayload is sent every HeartbeatInterval (spec 5.4.2).
+// HeartbeatPayload is sent every HeartbeatInterval (spec 5.4.2). PubKey is
+// this validator's real Dilithium public key, so peers can build the
+// identity registry real StageVote/Block verification needs
+// (pkg/chain.PubKeyLookup) — a trust-on-first-heartbeat substitute for a
+// real on-chain NFT-mint identity binding, which this reference build
+// doesn't wire end to end (see docs/ARCHITECTURE.md's scope notes).
 type HeartbeatPayload struct {
-	NFT       string `json:"nft"`
-	Timestamp int64  `json:"timestamp"`
+	NFT       types.NFTID `json:"nft"`
+	PubKey    []byte      `json:"pub_key"`
+	Timestamp int64       `json:"timestamp"`
 }
 
-// TxOfferPayload carries a shielded transaction blob into the mempool.
+// TxOfferPayload carries a shielded transaction into the mempool.
 type TxOfferPayload struct {
-	TxBytes []byte `json:"tx_bytes"`
+	Tx types.ShieldedTx `json:"tx"`
 }
 
-// StageVotePayload is one validator's BFT vote for a candidate state root
-// (spec 5.7).
+// BlockProposalPayload is broadcast by the height's deterministically
+// assigned proposer (consensus.AssignCommittee[0]) before any committee
+// member runs the pipeline. Committee members vote on this exact batch,
+// never on their own independently-drained mempool — that's what lets
+// every honest node that executes it compute the identical candidate root.
+type BlockProposalPayload struct {
+	Height    uint64             `json:"height"`
+	Epoch     uint64             `json:"epoch"`
+	Proposer  types.NFTID        `json:"proposer"`
+	Batch     []types.ShieldedTx `json:"batch"`
+	Timestamp int64              `json:"timestamp"`
+}
+
+// StageVotePayload is one committee member's BFT vote for a candidate
+// block header hash (spec 5.7; types.HashBlock is what CandidateHash
+// signs over).
 type StageVotePayload struct {
-	Validator string `json:"validator"`
-	StateRoot string `json:"state_root"`
-	Sig       []byte `json:"sig"`
+	Height        uint64             `json:"height"`
+	Validator     types.NFTID        `json:"validator"`
+	CandidateHash types.Hash         `json:"candidate_hash"`
+	Sig           types.DilithiumSig `json:"sig"`
 }
 
-// BlockAnnouncePayload announces a newly committed block.
+// BlockAnnouncePayload carries a fully-assembled, quorum-voted block so
+// any node — committee member or not — can independently verify (real
+// signature checks against the announced Votes, real chain.Append
+// height/PrevHash validation) and adopt it.
 type BlockAnnouncePayload struct {
-	Height    uint64 `json:"height"`
-	BlockHash string `json:"block_hash"`
+	Block types.Block `json:"block"`
 }
 
 // MegabatchPartPayload carries one chunk of an outage-recovery megabatch
@@ -68,8 +101,8 @@ type MegabatchPartPayload struct {
 // ContainerSyncPayload carries an enterprise container's aggregated
 // mega-batch sync (spec 15.3).
 type ContainerSyncPayload struct {
-	ContainerID string `json:"container_id"`
-	RootHash    string `json:"root_hash"`
+	ContainerID string     `json:"container_id"`
+	RootHash    types.Hash `json:"root_hash"`
 }
 
 // SilentPadPayload is a null ZK pad used to keep circuits warm and absorb

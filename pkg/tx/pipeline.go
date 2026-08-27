@@ -18,7 +18,12 @@ import (
 // Deps are the modules the pipeline orchestrates. ZK may be nil only in
 // tests that never submit a Kind Transfer transaction.
 type Deps struct {
-	Store     *state.Store
+	// Store is state.Accessor, not *state.Store, so the pipeline can run
+	// against either the real auto-committing Store (spec-compliant
+	// single-node use, and every existing test) or a state.Txn held open
+	// across a BFT vote round (pkg/validator) without any change to the
+	// stage functions below.
+	Store     state.Accessor
 	StateTree *state.MerkleTree
 	ZK        *zk.System
 	Vault     *vault.Vault

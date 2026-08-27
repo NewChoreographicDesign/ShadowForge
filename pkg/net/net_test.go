@@ -9,6 +9,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/peer"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
+	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
 
 func newTestHost(t *testing.T) *shadownet.Node {
@@ -67,8 +68,9 @@ func TestTwoNodesConnectAndExchangeHeartbeat(t *testing.T) {
 		t.Fatalf("connect: %v", err)
 	}
 
+	wantNFT := types.NFTID{1, 2, 3}
 	env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
-		NFT: "nft-123", Timestamp: 42,
+		NFT: wantNFT, Timestamp: 42,
 	})
 	if err != nil {
 		t.Fatalf("build envelope: %v", err)
@@ -80,7 +82,7 @@ func TestTwoNodesConnectAndExchangeHeartbeat(t *testing.T) {
 	waitOrTimeout(t, &wg, 5*time.Second)
 	select {
 	case hb := <-received:
-		if hb.NFT != "nft-123" || hb.Timestamp != 42 {
+		if hb.NFT != wantNFT || hb.Timestamp != 42 {
 			t.Fatalf("unexpected heartbeat payload: %+v", hb)
 		}
 	default:
