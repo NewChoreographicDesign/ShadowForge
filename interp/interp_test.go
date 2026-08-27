@@ -79,6 +79,114 @@ func TestOracleSuppliesValue(t *testing.T) {
 	}
 }
 
+func TestAllStatementKindsExecuteWithoutError(t *testing.T) {
+	src := `mint proposer1 amount 100 epoch 5;
+validate v1 stage 1 {
+    x = 1;
+}
+queue insert validator1 positions 4, 10, 2, 7;
+container { id=finance; }
+network { listen=1234; }
+async_stagger { entry_ms=50; }
+resilience if 1 {
+    activate sentinels;
+}
+update_trait finance balance = 100;
+update_trait finance balance += 50;
+update_trait finance balance -= 20;
+vote proposal1 commit1;
+shard finance count 4;
+shard finance;
+`
+	prog, errs := ast.Parse(src)
+	if len(errs) != 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	it := interp.New(nil)
+	if err := it.Run(prog); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	v, ok := it.Env.Get("finance.balance")
+	if !ok || v.Cmp(big.NewRat(130, 1)) != 0 {
+		t.Fatalf("expected finance.balance=130 after =100 +50 -20, got %v ok=%v", v, ok)
+	}
+	if len(it.QueueInsert) != 1 || len(it.QueueInsert[0].Positions) != 4 {
+		t.Fatalf("unexpected queue insert events: %+v", it.QueueInsert)
+	}
+}
+
+func TestMintMissingEpochOmittedIsFine(t *testing.T) {
+	prog, errs := ast.Parse(`mint proposer1 amount 100;`)
+	if len(errs) != 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if err := interp.New(nil).Run(prog); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestResilienceConditionFalseSkipsBody(t *testing.T) {
+	prog, errs := ast.Parse(`resilience if 0 {
+    activate sentinels;
+}
+`)
+	if len(errs) != 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	it := interp.New(nil)
+	if err := it.Run(prog); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+}
+
+func TestComparisonOperators(t *testing.T) {
+	cases := []struct {
+		expr string
+		want int64
+	}{
+		{"5 > 3", 1}, {"3 > 5", 0},
+		{"5 >= 5", 1}, {"4 >= 5", 0},
+		{"3 < 5", 1}, {"5 < 3", 0},
+		{"5 <= 5", 1}, {"6 <= 5", 0},
+		{"5 == 5", 1}, {"5 == 6", 0},
+		{"5 != 6", 1}, {"5 != 5", 0},
+	}
+	for _, c := range cases {
+		prog, errs := ast.Parse("result = " + c.expr + ";")
+		if len(errs) != 0 {
+			t.Fatalf("%s: parse errors: %v", c.expr, errs)
+		}
+		it := interp.New(nil)
+		if err := it.Run(prog); err != nil {
+			t.Fatalf("%s: run: %v", c.expr, err)
+		}
+		v, _ := it.Env.Get("result")
+		if v.Cmp(big.NewRat(c.want, 1)) != 0 {
+			t.Errorf("%s = %s, want %d", c.expr, v.RatString(), c.want)
+		}
+	}
+}
+
+func TestDivisionByZeroErrors(t *testing.T) {
+	prog, errs := ast.Parse(`result = 1 / 0;`)
+	if len(errs) != 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if err := interp.New(nil).Run(prog); err == nil {
+		t.Fatalf("expected division by zero to error")
+	}
+}
+
+func TestUnknownIdentifierInMintAmountErrors(t *testing.T) {
+	prog, errs := ast.Parse(`mint proposer1 amount missing_var;`)
+	if len(errs) != 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if err := interp.New(nil).Run(prog); err == nil {
+		t.Fatalf("expected undefined identifier error")
+	}
+}
+
 func TestIfStatementBranches(t *testing.T) {
 	prog, errs := ast.Parse(`x = 5;
 if x > 3 {

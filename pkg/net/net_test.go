@@ -17,7 +17,7 @@ func newTestHost(t *testing.T) *shadownet.Node {
 	if err != nil {
 		t.Fatalf("new host: %v", err)
 	}
-	t.Cleanup(func() { h.Close() })
+	t.Cleanup(func() { _ = h.Close() })
 	return shadownet.NewNode(h, nil, nil)
 }
 
@@ -30,12 +30,12 @@ func TestTwoNodesConnectAndExchangeHeartbeat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("host A: %v", err)
 	}
-	defer hostA.Close()
+	defer func() { _ = hostA.Close() }()
 	hostB, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
 	if err != nil {
 		t.Fatalf("host B: %v", err)
 	}
-	defer hostB.Close()
+	defer func() { _ = hostB.Close() }()
 
 	received := make(chan shadownet.HeartbeatPayload, 1)
 	var wg sync.WaitGroup
@@ -154,7 +154,7 @@ func TestConnectFailsForUnreachableAddr(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new host: %v", err)
 	}
-	defer h.Close()
+	defer func() { _ = h.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	unreachable := "/ip4/127.0.0.1/tcp/1/p2p/QmVzKJj1Uv2pJTL5RJXrKvGVSPUZJKquBmk4bYS4gh1rvS"

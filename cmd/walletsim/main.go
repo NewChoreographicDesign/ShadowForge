@@ -35,7 +35,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("create libp2p host: %v", err)
 	}
-	defer h.Close()
+	defer func() {
+		if err := h.Close(); err != nil {
+			log.Printf("close libp2p host: %v", err)
+		}
+	}()
 
 	node := shadownet.NewNode(h, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())

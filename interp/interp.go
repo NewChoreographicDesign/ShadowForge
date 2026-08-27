@@ -13,26 +13,21 @@ import (
 )
 
 // Env is the mutable variable environment a program executes against.
+// ShadowRust has no block scoping (spec 14.2's grammar has no let/var
+// binding form narrower than a whole program), so a single flat map is
+// the right shape: an if-block's assignments are visible after the block,
+// same as everywhere else in the language.
 type Env struct {
-	vars   map[string]*big.Rat
-	parent *Env
+	vars map[string]*big.Rat
 }
 
 func NewEnv() *Env {
 	return &Env{vars: map[string]*big.Rat{}}
 }
 
-func (e *Env) child() *Env {
-	return &Env{vars: map[string]*big.Rat{}, parent: e}
-}
-
 func (e *Env) Get(name string) (*big.Rat, bool) {
-	for env := e; env != nil; env = env.parent {
-		if v, ok := env.vars[name]; ok {
-			return v, true
-		}
-	}
-	return nil, false
+	v, ok := e.vars[name]
+	return v, ok
 }
 
 func (e *Env) Set(name string, v *big.Rat) {

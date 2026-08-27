@@ -36,7 +36,7 @@ func NewNode(h host.Host, limiter *RateLimiter, handler Handler) *Node {
 }
 
 func (n *Node) handleStream(s network.Stream) {
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	remote := s.Conn().RemotePeer()
 	dec := json.NewDecoder(s)
 	for {
@@ -59,7 +59,7 @@ func (n *Node) Send(ctx context.Context, p peer.ID, env Envelope) error {
 	if err != nil {
 		return fmt.Errorf("net: open stream to %s: %w", p, err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if err := json.NewEncoder(s).Encode(env); err != nil {
 		return fmt.Errorf("net: write envelope to %s: %w", p, err)
 	}

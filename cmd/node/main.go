@@ -68,7 +68,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("open state store: %v", err)
 	}
-	defer store.Close()
+	defer func() {
+		if err := store.Close(); err != nil {
+			log.Printf("close state store: %v", err)
+		}
+	}()
 	stateTree := state.NewMerkleTree()
 
 	var zkSys *zk.System
@@ -94,13 +98,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("create libp2p host: %v", err)
 	}
-	defer h.Close()
+	defer func() {
+		if err := h.Close(); err != nil {
+			log.Printf("close libp2p host: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var node *shadownet.Node
-	node = shadownet.NewNode(h, nil, func(p peer.ID, env shadownet.Envelope) {
+	node := shadownet.NewNode(h, nil, func(p peer.ID, env shadownet.Envelope) {
 		switch env.Type {
 		case shadownet.MsgHeartbeat:
 			var hb shadownet.HeartbeatPayload
@@ -268,7 +275,7 @@ func batchLoop(ctx context.Context, mempool *tx.Mempool, pipeline *tx.Pipeline) 
 func epochLoop(ctx context.Context, genesis consensus.GenesisTime, revolver *consensus.Revolver, sentinels *consensus.SentinelManager) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
-	var lastEpoch uint64 = ^uint64(0)
+	var lastEpoch = ^uint64(0)
 	for {
 		select {
 		case <-ctx.Done():
