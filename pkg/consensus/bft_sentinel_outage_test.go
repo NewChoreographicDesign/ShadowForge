@@ -2,6 +2,7 @@ package consensus_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -151,8 +152,11 @@ func TestOutageRecoveryPipeline(t *testing.T) {
 		t.Fatalf("expected OutageFlag to be set after Declare")
 	}
 
+	now := time.Now()
 	for i := 0; i < 25; i++ {
-		o.Enqueue(types.ShieldedTx{TxID: types.Hash{byte(i)}})
+		if err := o.Enqueue(types.ShieldedTx{TxID: types.Hash{byte(i)}}, now); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
 	}
 	if o.BacklogDepth() != 25 {
 		t.Fatalf("expected backlog depth 25, got %d", o.BacklogDepth())
@@ -179,10 +183,61 @@ func TestOutageRecoveryPipeline(t *testing.T) {
 	}
 }
 
+// TestOutageEnqueueRejectsDuplicateWithinTTL proves Enqueue dedups the way
+// pkg/tx.Mempool.Submit does — the property a real validator's gossip
+// forwarding of backlogged transactions (pkg/validator's handleMessage,
+// wired identically to how it already forwards live TxOffers) relies on to
+// avoid re-enqueuing the same backlogged tx forever as it echoes between
+// peers.
+func TestOutageEnqueueRejectsDuplicateWithinTTL(t *testing.T) {
+	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
+	tx := types.ShieldedTx{TxID: types.Hash{7}}
+	if err := o.Enqueue(tx, now); err != nil {
+		t.Fatalf("first enqueue: %v", err)
+	}
+	if err := o.Enqueue(tx, now.Add(time.Second)); err != consensus.ErrDuplicateBacklogTx {
+		t.Fatalf("expected ErrDuplicateBacklogTx for a resubmitted TxID, got %v", err)
+	}
+	if o.BacklogDepth() != 1 {
+		t.Fatalf("a rejected duplicate must not grow the backlog, depth=%d", o.BacklogDepth())
+	}
+}
+
+// TestOutageReinsertBypassesDuplicateCheck proves Reinsert (used by a real
+// validator's dual-track proposal builder to return backlog entries that
+// didn't fit a byte-bounded recovery batch) succeeds even though Enqueue
+// would reject the same TxID as a duplicate — this is the backlog's own
+// entry coming back, not an external resubmission. Mirrors
+// pkg/tx.Mempool's identical Submit/Reinsert split.
+func TestOutageReinsertBypassesDuplicateCheck(t *testing.T) {
+	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
+	tr := types.ShieldedTx{TxID: types.Hash{3}}
+	if err := o.Enqueue(tr, now); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	drained := o.BuildMegabatch(1) // drains it out, simulating a proposer draining the backlog
+	if len(drained) != 1 {
+		t.Fatalf("expected the megabatch to drain the one entry, got %d", len(drained))
+	}
+
+	if err := o.Enqueue(tr, now); err != consensus.ErrDuplicateBacklogTx {
+		t.Fatalf("expected Enqueue to still reject this TxID as a duplicate, got %v", err)
+	}
+	o.Reinsert(tr)
+	if o.BacklogDepth() != 1 {
+		t.Fatalf("expected the reinserted tx to be pending again, len=%d", o.BacklogDepth())
+	}
+}
+
 func TestMegabatchRespectsMultiplierCap(t *testing.T) {
 	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
 	for i := 0; i < 100; i++ {
-		o.Enqueue(types.ShieldedTx{TxID: types.Hash{byte(i)}})
+		if err := o.Enqueue(types.ShieldedTx{TxID: types.Hash{byte(i)}}, now); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
 	}
 	batch := o.BuildMegabatch(5) // cap = 5*10 = 50
 	if len(batch) != 50 {

@@ -18,11 +18,30 @@
 // block if its own recomputed state root disagrees with what was
 // announced.
 //
+// Sentinel activation (spec 5.5) and outage/megabatch recovery (spec 5.6)
+// are wired in for real too, not just unit-tested in pkg/consensus in
+// isolation: every node evaluates consensus.SentinelManager off its own
+// real online-civilian heartbeat count each heartbeat tick (a
+// sentinel-flagged node genuinely stands down — stops heartbeating and
+// therefore drops out of committee assignment — while not needed, rather
+// than "sentinel" being a label that only affects logging), and
+// consensus.OutageController off real missing-heartbeat history each
+// round tick. While an outage is declared, incoming transactions are
+// diverted to the backlog instead of the live mempool (handleMessage's
+// MsgTxOffer case), and maybePropose builds dual-track batches (Track A
+// live + Track B drained backlog, still bounded by the same MaxBatchBytes
+// budget that protects every ordinary batch) until a clean dual-track
+// cycle reaches real BFT quorum and OutageFlag clears.
+//
 // What is intentionally out of scope, documented rather than silently
 // skipped: multi-block catch-up sync for a node that falls more than one
-// block behind (see handleBlockAnnounce), and wiring pkg/consensus's
-// already-implemented, already-tested outage/megabatch recovery into this
-// loop (a separate, large piece of work — see docs/ARCHITECTURE.md).
+// block behind (see handleBlockAnnounce), and MegabatchPart's chunked
+// wire-format reassembly for a recovery batch too large to fit even a
+// single MaxBatchBytes-bounded proposal (see pkg/net/message.go's doc) —
+// a real megabatch fits the existing single-proposal pipeline for any
+// backlog depth this build's own MaxBatchBytes budget can absorb per
+// round; splitting one across multiple wire messages is a separate,
+// larger undertaking.
 package validator
 
 import (
@@ -127,8 +146,9 @@ func DefaultConfig(genesis consensus.GenesisTime) Config {
 type Logf func(format string, args ...interface{})
 
 type onlineInfo struct {
-	lastBeat time.Time
-	pubKey   crypto.DilithiumPublicKey
+	lastBeat   time.Time
+	pubKey     crypto.DilithiumPublicKey
+	isSentinel bool
 }
 
 // Node runs the propose/vote/commit state machine for one validator
@@ -154,6 +174,26 @@ type Node struct {
 	// runtime defense state, not an external dependency a caller owns —
 	// same treatment as rounds/online below.
 	silentMon *silent.RateMonitor
+	// sentinels tracks spec 5.5's sentinel activation state (10 protocol
+	// -run validators activate when online civilians drop below 10, and
+	// withdraw once the civilian queue recovers) — real evaluation driven
+	// off real heartbeat data in heartbeatLoop, not a static role label.
+	// Constructed internally: this node's own runtime state, evaluated
+	// identically by every node from its own local view, same as online.
+	sentinels *consensus.SentinelManager
+	// outage tracks spec 5.6's outage/megabatch recovery pipeline: detect
+	// outage from real missing-heartbeat data, backlog incoming
+	// transactions instead of admitting them live, and build dual-track
+	// recovery batches (Track A live + Track B drained backlog) once
+	// enough of the network is heartbeating again. Constructed internally
+	// for the same reason as sentinels above.
+	outage *consensus.OutageController
+	// isSentinel is this node's own configured role (cmd/node's -sentinel
+	// flag). A sentinel-flagged node only heartbeats/participates in
+	// committee assignment while n.sentinels.Active() — see
+	// heartbeatLoop — so it genuinely stands down when not needed rather
+	// than always running with role only affecting logging.
+	isSentinel bool
 
 	identity types.NFTID
 	pk       crypto.DilithiumPublicKey
@@ -161,8 +201,14 @@ type Node struct {
 
 	log Logf
 
-	mu     sync.Mutex // guards online only
+	mu     sync.Mutex // guards online and everSeen
 	online map[types.NFTID]onlineInfo
+	// everSeen records the last time each identity was ever heartbeat-seen,
+	// independent of online's OnlineTimeout pruning — outageBaseline uses
+	// it to compute "more than 50% of the last-known online set is missing
+	// heartbeats" (spec 5.6), which needs a longer-lived baseline than
+	// online's own live-committee-assignment window.
+	everSeen map[types.NFTID]time.Time
 
 	// roundMu guards rounds and every mutation of tree/store/txn state
 	// made while processing a round (handleBlockProposal, handleStageVote,
@@ -184,7 +230,7 @@ type Node struct {
 // keypair; the node's consensus identity (types.NFTID) is derived from the
 // public key (types.NFTID(types.SumHash(pk))) — a genuine cryptographic
 // binding, not an arbitrary label.
-func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, logf Logf) *Node {
+func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -198,15 +244,24 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		chn:          chn,
 		oracleQuorum: oracleQuorum,
 		silentMon:    silent.NewRateMonitor(),
+		sentinels:    consensus.NewSentinelManager(),
+		outage:       consensus.NewOutageController(consensus.DefaultOutageThresholds()),
+		isSentinel:   isSentinel,
 		identity:     types.NFTID(types.SumHash(pk)),
 		pk:           pk,
 		sk:           sk,
 		log:          logf,
 		online:       map[types.NFTID]onlineInfo{},
+		everSeen:     map[types.NFTID]time.Time{},
 		rounds:       map[uint64]*round{},
 	}
 	n.net = shadownet.NewNode(h, limiter, n.handleMessage)
-	n.recordOnline(n.identity, pk, time.Now())
+	if !isSentinel {
+		// A sentinel-flagged node only joins the online set once sentinels
+		// are actually activated (see heartbeatLoop) — it must not record
+		// itself here at construction time the way a civilian does.
+		n.recordOnline(n.identity, pk, isSentinel, time.Now())
+	}
 	return n
 }
 
@@ -234,10 +289,11 @@ func (n *Node) Start(ctx context.Context) {
 	go n.roundLoop(ctx)
 }
 
-func (n *Node) recordOnline(id types.NFTID, pk crypto.DilithiumPublicKey, now time.Time) {
+func (n *Node) recordOnline(id types.NFTID, pk crypto.DilithiumPublicKey, isSentinel bool, now time.Time) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.online[id] = onlineInfo{lastBeat: now, pubKey: pk}
+	n.online[id] = onlineInfo{lastBeat: now, pubKey: pk, isSentinel: isSentinel}
+	n.everSeen[id] = now
 }
 
 // onlineSet returns the sorted set of validator identities heartbeat-active
@@ -252,6 +308,51 @@ func (n *Node) onlineSet(now time.Time) []types.NFTID {
 	}
 	n.mu.Unlock()
 	return consensus.SortNFTIDs(ids)
+}
+
+// onlineCivilianCount counts online (within OnlineTimeout), non-sentinel
+// identities — the input consensus.SentinelManager.Evaluate needs (spec
+// 5.5's "if revolver.Online() < 10" is meant as the civilian queue, not
+// sentinels themselves, since sentinels activating because sentinels are
+// scarce would be circular).
+func (n *Node) onlineCivilianCount(now time.Time) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	count := 0
+	for _, info := range n.online {
+		if !info.isSentinel && now.Sub(info.lastBeat) <= n.cfg.OnlineTimeout {
+			count++
+		}
+	}
+	return count
+}
+
+// outageBaselineWindow bounds how long an identity's last heartbeat is
+// still counted toward outageBaseline's "last-known online set" — long
+// enough to span a real outage's detection-to-recovery cycle, short enough
+// that a validator gone for good eventually stops being counted as
+// "missing" forever.
+const outageBaselineWindow = 10 * time.Minute
+
+// outageBaseline computes spec 5.6's detection inputs from real heartbeat
+// history: lastKnownOnline is how many distinct identities have
+// heartbeated at all within outageBaselineWindow, and missing is how many
+// of those are not currently within OnlineTimeout (i.e. have gone quiet
+// more recently than that, but not so long ago they've aged out of the
+// baseline entirely).
+func (n *Node) outageBaseline(now time.Time) (lastKnownOnline, missing int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for id, seenAt := range n.everSeen {
+		if now.Sub(seenAt) > outageBaselineWindow {
+			continue
+		}
+		lastKnownOnline++
+		if info, ok := n.online[id]; !ok || now.Sub(info.lastBeat) > n.cfg.OnlineTimeout {
+			missing++
+		}
+	}
+	return lastKnownOnline, missing
 }
 
 // pubKeyLookup implements chain.PubKeyLookup against the online registry.
@@ -274,9 +375,20 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			n.recordOnline(n.identity, n.pk, now)
+			n.evaluateSentinels(now)
+			if n.isSentinel && !n.sentinels.Active() {
+				// Sentinels stand down while not needed (spec 5.5): skip
+				// recording ourselves online and broadcasting a heartbeat
+				// entirely, so this node genuinely drops out of every
+				// peer's online set — and therefore out of committee
+				// assignment — until sentinels are next activated, rather
+				// than always participating with "sentinel" only ever
+				// affecting a log line.
+				continue
+			}
+			n.recordOnline(n.identity, n.pk, n.isSentinel, now)
 			env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
-				NFT: n.identity, PubKey: []byte(n.pk), Timestamp: now.UnixMilli(),
+				NFT: n.identity, PubKey: []byte(n.pk), Timestamp: now.UnixMilli(), IsSentinel: n.isSentinel,
 			})
 			if err != nil {
 				n.log("validator: build heartbeat: %v", err)

@@ -33,12 +33,31 @@ func (n *Node) handleMessage(p peer.ID, env shadownet.Envelope) {
 		if len(hb.PubKey) == 0 {
 			return
 		}
-		n.recordOnline(hb.NFT, crypto.DilithiumPublicKey(hb.PubKey), time.Now())
+		n.recordOnline(hb.NFT, crypto.DilithiumPublicKey(hb.PubKey), hb.IsSentinel, time.Now())
 
 	case shadownet.MsgTxOffer:
 		var offer shadownet.TxOfferPayload
 		if err := decode(env, &offer); err != nil {
 			n.log("validator: bad tx offer from %s: %v", p, err)
+			return
+		}
+		if n.outage.Active() {
+			// Outage recovery (spec 5.6): live admission is paused, so
+			// incoming transactions go to the backlog queue instead of
+			// the mempool. They still need the same peer-forwarding a
+			// live TxOffer gets below — otherwise a tx handed to a node
+			// that never ends up building the recovery megabatch would
+			// simply never be included — hence outage.Enqueue's own
+			// duplicate check, mirroring mempool.Submit's, to keep that
+			// forwarding from looping forever.
+			switch err := n.outage.Enqueue(offer.Tx, time.Now()); {
+			case err == nil:
+				n.net.Broadcast(context.Background(), env)
+			case errors.Is(err, consensus.ErrDuplicateBacklogTx):
+				// Already backlogged — nothing to do.
+			default:
+				n.log("validator: tx offer from %s not backlogged: %v", p, err)
+			}
 			return
 		}
 		switch err := n.mempool.Submit(offer.Tx, time.Now()); {
@@ -103,9 +122,42 @@ func (n *Node) roundLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			n.evaluateOutage(time.Now())
 			n.sweepTimeouts()
 			n.maybePropose()
 		}
+	}
+}
+
+// evaluateSentinels applies spec 5.5's activation/withdrawal rule against
+// this node's own real, locally-observed online-civilian count — every
+// node evaluates it independently from its own view, the same way
+// AssignCommittee is a pure function of each node's own online set rather
+// than shared mutable state (see this package's doc for why).
+func (n *Node) evaluateSentinels(now time.Time) {
+	civilians := n.onlineCivilianCount(now)
+	switch n.sentinels.Evaluate(civilians, now.UnixMilli()) {
+	case consensus.ActionActivate:
+		n.log("validator: sentinel manager activating (%d online civilians, below threshold %d)", civilians, consensus.SentinelThreshold)
+	case consensus.ActionWithdraw:
+		n.log("validator: sentinel manager withdrawing (%d online civilians, recovered)", civilians)
+	}
+}
+
+// evaluateOutage applies spec 5.6's detection condition against this
+// node's own real heartbeat history (outageBaseline) and, once triggered,
+// declares the outage — pausing live tx admission (handleMessage's
+// MsgTxOffer case) and switching maybePropose to dual-track recovery
+// batches until MaybeClear (driven from tryFinalizeLocked/
+// handleBlockAnnounce once a clean dual-track cycle commits) lifts it.
+func (n *Node) evaluateOutage(now time.Time) {
+	if n.outage.Active() {
+		return // already declared; DetectOutage only matters for the initial trigger
+	}
+	lastKnown, missing := n.outageBaseline(now)
+	if n.outage.DetectOutage(lastKnown, missing) {
+		n.outage.Declare()
+		n.log("validator: outage declared: %d/%d last-known-online validators missing heartbeats", missing, lastKnown)
 	}
 }
 
@@ -152,13 +204,10 @@ func (n *Node) maybePropose() {
 		return // not our turn to propose
 	}
 
-	entries := n.mempool.DrainBatchBytes(n.cfg.maxBatchSize(), n.cfg.maxBatchBytes())
-	if len(entries) == 0 {
+	dualTrack := n.outage.Active()
+	batch := n.buildProposalBatch(dualTrack)
+	if len(batch) == 0 {
 		return // nothing to propose; avoid empty-block spam
-	}
-	batch := make([]types.ShieldedTx, len(entries))
-	for i, e := range entries {
-		batch[i] = e.Tx
 	}
 
 	prop := shadownet.BlockProposalPayload{
@@ -167,6 +216,7 @@ func (n *Node) maybePropose() {
 		Proposer:  n.identity,
 		Batch:     batch,
 		Timestamp: time.Now().UnixMilli(),
+		DualTrack: dualTrack,
 	}
 	env, err := shadownet.NewEnvelope(shadownet.MsgBlockProposal, prop)
 	if err != nil {
@@ -180,6 +230,81 @@ func (n *Node) maybePropose() {
 	// proposer participates in its own round like any other committee
 	// member.
 	n.handleBlockProposal(prop)
+}
+
+// buildProposalBatch drains Track A (the live mempool, exactly as always)
+// and, during an active outage, tops it up with Track B (drained backlog)
+// — spec 5.6's dual-track recovery batch. The combined result stays
+// bounded by the same MaxBatchBytes budget that protects every ordinary
+// batch: OutageController.BuildMegabatch's own 10x-*count* cap alone isn't
+// a safe bound on serialized *size* — this build already hit exactly that
+// bug once for the live mempool (see Mempool.DrainBatchBytes's own doc: a
+// real post-quantum Dilithium3 signature+pubkey alone is several KB, so a
+// count-only cap can still blow past Badger's 1MB per-value limit).
+// Anything drained from the backlog but trimmed for lack of room is
+// re-enqueued rather than lost.
+func (n *Node) buildProposalBatch(dualTrack bool) []types.ShieldedTx {
+	entries := n.mempool.DrainBatchBytes(n.cfg.maxBatchSize(), n.cfg.maxBatchBytes())
+	batch := make([]types.ShieldedTx, len(entries))
+	for i, e := range entries {
+		batch[i] = e.Tx
+	}
+	if !dualTrack {
+		return batch
+	}
+
+	liveBytes, err := marshaledSize(batch)
+	if err != nil {
+		n.log("validator: measure live batch size: %v", err)
+		return batch
+	}
+	remaining := n.cfg.maxBatchBytes() - liveBytes
+	if remaining <= 0 {
+		return batch // no room left for Track B this round; backlog stays queued
+	}
+
+	mega := n.outage.BuildMegabatch(n.cfg.maxBatchSize())
+	fit, overflow, err := splitByByteBudget(mega, remaining)
+	if err != nil {
+		n.log("validator: measure megabatch size: %v", err)
+		return batch
+	}
+	for _, t := range overflow {
+		// Reinsert, not Enqueue: this is the backlog's own entry coming
+		// back after BuildMegabatch drained it, not a new external
+		// arrival — Enqueue's duplicate check (needed for gossip
+		// forwarding, see handleMessage's MsgTxOffer case) would treat
+		// this exact TxID as a dup of itself and silently drop it.
+		n.outage.Reinsert(t)
+	}
+	return append(batch, fit...)
+}
+
+func marshaledSize(batch []types.ShieldedTx) (int, error) {
+	b, err := json.Marshal(batch)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+// splitByByteBudget greedily takes entries from txs (in order) whose
+// cumulative JSON-marshaled size stays within budget, returning the taken
+// prefix and the remainder — mirrors pkg/tx.Mempool.DrainBatchBytes' own
+// greedy size-bounded selection.
+func splitByByteBudget(txs []types.ShieldedTx, budget int) (fit, overflow []types.ShieldedTx, err error) {
+	total := 0
+	for i, t := range txs {
+		size, serr := marshaledSize([]types.ShieldedTx{t})
+		if serr != nil {
+			return nil, nil, serr
+		}
+		if total+size > budget {
+			return txs[:i], txs[i:], nil
+		}
+		total += size
+	}
+	return txs, nil, nil
 }
 
 // handleBlockProposal runs the pipeline against a proposed batch (whether
@@ -276,6 +401,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	txRoot := txRootOf(prop.Batch)
 	daRoot := daRootOf(prop.Batch)
 	block := n.chn.NextBlock(prop.Epoch, prop.Batch, txRoot, stateRoot, daRoot, prop.Proposer, prop.Timestamp)
+	block.DualTrack = prop.DualTrack
 	candidate := types.HashBlock(block)
 
 	sig, err := crypto.DilithiumSign(n.sk, candidate[:])
@@ -375,6 +501,7 @@ func (n *Node) tryFinalizeLocked(r *round) {
 	delete(n.rounds, r.height)
 
 	n.log("validator: committed height %d (%d votes) state_root=%s", r.height, len(votes), r.block.StateRoot)
+	n.noteCommittedBlock(r.block)
 
 	env, err := shadownet.NewEnvelope(shadownet.MsgBlockAnnounce, shadownet.BlockAnnouncePayload{Block: r.block})
 	if err != nil {
@@ -472,6 +599,26 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	}
 
 	n.log("validator: adopted announced height %d state_root=%s", height, ann.Block.StateRoot)
+	n.noteCommittedBlock(ann.Block)
+}
+
+// noteCommittedBlock updates outage-recovery bookkeeping for a block this
+// node just committed — whether by reaching quorum itself
+// (tryFinalizeLocked) or by adopting an announced one
+// (handleBlockAnnounce), since either path can be how a node first learns
+// a dual-track recovery batch actually made it onto the chain. spec 5.6:
+// "clear OutageFlag once backlog is below threshold and one clean
+// dual-track cycle has committed" — MaybeClear itself checks both
+// conditions, so calling it here is safe even when this particular block
+// wasn't the one that satisfies them.
+func (n *Node) noteCommittedBlock(b types.Block) {
+	if !b.DualTrack {
+		return
+	}
+	n.outage.RecordCleanDualTrackCycle()
+	if n.outage.MaybeClear() {
+		n.log("validator: outage cleared at height %d", b.Height)
+	}
 }
 
 // txRootOf hashes the ordered TxIDs of a batch, giving every honest node

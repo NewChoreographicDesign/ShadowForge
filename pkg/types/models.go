@@ -202,13 +202,17 @@ type Block struct {
 
 // HashBlock computes a block's canonical header hash: everything a
 // validator commits to before voting (Height, Epoch, PrevHash, Timestamp,
-// TxRoot, StateRoot, DARoot, Proposer). Votes and ProposerSig are
-// deliberately excluded — they are produced *over* this hash (a StageVote
-// signs it; ProposerSig authenticates the proposal that led to it), so
-// including them would be circular. Two blocks that differ only in which
-// votes they happened to collect still hash identically, which is exactly
-// what lets independently-computing validators agree on "the candidate"
-// before votes exist.
+// TxRoot, StateRoot, DARoot, Proposer, DualTrack). Votes and ProposerSig
+// are deliberately excluded — they are produced *over* this hash (a
+// StageVote signs it; ProposerSig authenticates the proposal that led to
+// it), so including them would be circular. Two blocks that differ only in
+// which votes they happened to collect still hash identically, which is
+// exactly what lets independently-computing validators agree on "the
+// candidate" before votes exist. DualTrack, by contrast, is included: spec
+// 5.6's outage-recovery bookkeeping (OutageController.RecordCleanDualTrackCycle,
+// gating when OutageFlag may clear) is driven directly by it, so a relay
+// must not be able to flip it on an already-signed block without
+// invalidating every committee signature over the resulting hash.
 func HashBlock(b Block) Hash {
 	var heightBuf, epochBuf, tsBuf [8]byte
 	for i := 0; i < 8; i++ {
@@ -216,9 +220,13 @@ func HashBlock(b Block) Hash {
 		epochBuf[i] = byte(b.Epoch >> (8 * i))
 		tsBuf[i] = byte(uint64(b.Timestamp) >> (8 * i))
 	}
+	dtBuf := [1]byte{0}
+	if b.DualTrack {
+		dtBuf[0] = 1
+	}
 	return SumHash(
 		heightBuf[:], epochBuf[:], b.PrevHash[:], tsBuf[:],
-		b.TxRoot[:], b.StateRoot[:], b.DARoot[:], b.Proposer[:],
+		b.TxRoot[:], b.StateRoot[:], b.DARoot[:], b.Proposer[:], dtBuf[:],
 	)
 }
 

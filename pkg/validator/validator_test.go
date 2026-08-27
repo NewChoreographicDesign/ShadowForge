@@ -78,7 +78,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		OnlineTimeout:     time.Minute,
 		Genesis:           consensus.GenesisTime(genesisMs),
 	}
-	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, mempool, pk, sk, testLogf(t))
+	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, mempool, pk, sk, false, testLogf(t))
 }
 
 type peerKey struct {
@@ -136,7 +136,7 @@ func mustSignVote(t *testing.T, proposalID string, commitment byte) types.Shield
 func registerOnline(n *Node, height uint64, extra ...peerKey) []types.NFTID {
 	now := time.Now()
 	for _, p := range extra {
-		n.recordOnline(p.id, p.pk, now)
+		n.recordOnline(p.id, p.pk, false, now)
 	}
 	online := n.onlineSet(now)
 	return consensus.AssignCommittee(online, height, committeeSize(len(online)))
@@ -649,9 +649,9 @@ func TestHandleBlockAnnounceAdoptsIndependentlyVerifiedBlock(t *testing.T) {
 	}
 	committeeProposer := registerOnline(proposer, height, extra...)
 	// adopter must see the same online set (itself + proposer + the two extras)
-	adopter.recordOnline(proposer.identity, proposer.pk, time.Now())
+	adopter.recordOnline(proposer.identity, proposer.pk, false, time.Now())
 	for _, e := range extra[1:] {
-		adopter.recordOnline(e.id, e.pk, time.Now())
+		adopter.recordOnline(e.id, e.pk, false, time.Now())
 	}
 
 	voteTx := mustSignVote(t, "proposal-7", 7)

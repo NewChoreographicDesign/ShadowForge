@@ -9,11 +9,15 @@
 // 5.7's BFT quorum rule is enforced against genuine network peers, not
 // just unit-tested in isolation).
 //
-// Scope note: outage/megabatch recovery (spec 5.6) and sentinel
-// activation driving committee composition are implemented and
-// unit-tested in pkg/consensus, but not yet wired into pkg/validator's
-// round loop — see pkg/validator's package doc. This entrypoint still
-// emits SilentPad padding traffic in sentinel mode (spec 15.4).
+// Outage/megabatch recovery (spec 5.6) and sentinel activation driving
+// committee composition (spec 5.5) are real and wired into pkg/validator's
+// round loop — see that package's doc for exactly what "wired" means here.
+// -sentinel marks this process as a protocol-run sentinel: it only
+// heartbeats (and therefore only participates in committee assignment)
+// while pkg/validator's own SentinelManager has activated sentinels,
+// determined from real observed online-civilian heartbeat counts, not a
+// flag that merely changes a log line. This entrypoint still emits
+// SilentPad padding traffic in sentinel mode (spec 15.4).
 package main
 
 import (
@@ -167,7 +171,7 @@ func main() {
 	}
 
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, mempool, pk, sk, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, mempool, pk, sk, *sentinelFlag, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {

@@ -52,6 +52,12 @@ type HeartbeatPayload struct {
 	NFT       types.NFTID `json:"nft"`
 	PubKey    []byte      `json:"pub_key"`
 	Timestamp int64       `json:"timestamp"`
+	// IsSentinel marks this heartbeat as coming from a protocol-run
+	// sentinel validator rather than a civilian one (spec 5.5). Peers use
+	// it to count "online civilians" separately from sentinels — the
+	// input consensus.SentinelManager.Evaluate needs to decide whether
+	// sentinels should activate or withdraw.
+	IsSentinel bool `json:"is_sentinel,omitempty"`
 }
 
 // TxOfferPayload carries a shielded transaction into the mempool.
@@ -70,6 +76,10 @@ type BlockProposalPayload struct {
 	Proposer  types.NFTID        `json:"proposer"`
 	Batch     []types.ShieldedTx `json:"batch"`
 	Timestamp int64              `json:"timestamp"`
+	// DualTrack marks this proposal as an outage-recovery batch combining
+	// live traffic (Track A) with drained backlog (Track B) — spec 5.6.
+	// Carried through unchanged into the resulting types.Block.DualTrack.
+	DualTrack bool `json:"dual_track,omitempty"`
 }
 
 // StageVotePayload is one committee member's BFT vote for a candidate

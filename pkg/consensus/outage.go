@@ -10,7 +10,9 @@
 package consensus
 
 import (
+	"errors"
 	"sync"
+	"time"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
@@ -33,6 +35,24 @@ func DefaultOutageThresholds() OutageThresholds {
 	return OutageThresholds{MissingHeartbeatFraction: 0.5, BacklogClearThreshold: 0}
 }
 
+// backlogSeenTTL bounds how long a TxID is remembered for Enqueue's
+// duplicate detection — generous relative to how long a real outage's
+// recovery cycle takes, short enough the seen set doesn't grow unbounded
+// over a long-running node's lifetime. Mirrors pkg/tx.Mempool's own
+// TxTTL-based seenTTL windowed dedup.
+const backlogSeenTTL = 10 * time.Minute
+
+// ErrDuplicateBacklogTx is returned by Enqueue for a TxID already in the
+// backlog. A real validator node wires Enqueue behind the same gossip
+// forwarding a live TxOffer gets (pkg/validator's handleMessage): once
+// live mempool admission is paused for an outage, backlogged transactions
+// still need to propagate to every node so whoever ends up proposing the
+// recovery megabatch has them all. Without this check, that same gossip
+// forwarding would re-enqueue every backlogged tx once per hop forever —
+// exactly the unbounded-duplicate-relay problem Mempool.Submit's own
+// ErrDuplicateTx already exists to prevent on the live path.
+var ErrDuplicateBacklogTx = errors.New("consensus: duplicate transaction already in the outage backlog")
+
 // OutageController is the node-local state machine driving the recovery
 // pipeline. It owns the on-disk-backed backlog queue (spec 5.6: "Incoming
 // user transactions go to an on-disk backlog queue"); this in-memory
@@ -43,10 +63,11 @@ type OutageController struct {
 	flag        bool
 	backlog     []types.ShieldedTx
 	cleanCycles int
+	seen        map[types.Hash]time.Time
 }
 
 func NewOutageController(t OutageThresholds) *OutageController {
-	return &OutageController{thresholds: t}
+	return &OutageController{thresholds: t, seen: map[types.Hash]time.Time{}}
 }
 
 // DetectOutage implements spec 5.6's detection condition: "heartbeats are
@@ -74,13 +95,43 @@ func (o *OutageController) Active() bool {
 	return o.flag
 }
 
-// Enqueue adds an incoming transaction to the backlog queue. Wallets may
-// keep signing offline (spec 5.6); those signed transactions arrive here
-// once connectivity is restored enough to submit.
-func (o *OutageController) Enqueue(tx types.ShieldedTx) {
+// Enqueue adds an incoming transaction to the backlog queue, rejecting a
+// TxID already backlogged within backlogSeenTTL with ErrDuplicateBacklogTx.
+// Wallets may keep signing offline (spec 5.6); those signed transactions
+// arrive here once connectivity is restored enough to submit.
+func (o *OutageController) Enqueue(t types.ShieldedTx, now time.Time) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.backlog = append(o.backlog, tx)
+	o.sweepSeenLocked(now)
+	if seenAt, dup := o.seen[t.TxID]; dup && now.Sub(seenAt) < backlogSeenTTL {
+		return ErrDuplicateBacklogTx
+	}
+	o.seen[t.TxID] = now
+	o.backlog = append(o.backlog, t)
+	return nil
+}
+
+// Reinsert returns a transaction this controller itself drained earlier
+// (via BuildMegabatch, when a proposer then couldn't fit all of it into
+// one byte-bounded recovery batch) back onto the backlog, bypassing
+// Enqueue's duplicate check — this is the backlog's own entry coming
+// back, not an external resubmission gossip forwarding needs defending
+// against. Calling Enqueue here instead would make it indistinguishable
+// from a duplicate and silently drop it for the rest of backlogSeenTTL —
+// exactly mirroring why pkg/tx.Mempool has the identical Submit/Reinsert
+// split.
+func (o *OutageController) Reinsert(t types.ShieldedTx) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.backlog = append(o.backlog, t)
+}
+
+func (o *OutageController) sweepSeenLocked(now time.Time) {
+	for id, seenAt := range o.seen {
+		if now.Sub(seenAt) >= backlogSeenTTL {
+			delete(o.seen, id)
+		}
+	}
 }
 
 func (o *OutageController) BacklogDepth() int {
