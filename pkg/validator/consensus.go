@@ -425,6 +425,13 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 		deadline:        time.Now().Add(n.cfg.RoundTimeout),
 	}
 	n.rounds[prop.Height] = r
+	// prop.Batch is now spoken for by this in-flight round, whether this
+	// node proposed it or only voted on it (see
+	// pruneCommittedFromLocalQueues' own doc for the real multi-node
+	// liveness bug this closes); if the round later rolls back, the
+	// existing sweepTimeouts/tryFinalizeLocked failure paths already
+	// reinsert the whole batch, so pruning here now is safe.
+	n.pruneCommittedFromLocalQueues(prop.Batch)
 
 	voteEnv, err := shadownet.NewEnvelope(shadownet.MsgStageVote, shadownet.StageVotePayload{
 		Height: prop.Height, Validator: n.identity, CandidateHash: candidate, Sig: types.DilithiumSig(sig),
@@ -597,6 +604,10 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 		n.log("validator: FATAL-ish: adopted announced height %d but the state txn failed to commit: %v", height, err)
 		return
 	}
+	// ann.Block.Batch is now durably committed regardless of whether this
+	// node ever locally drained it — see pruneCommittedFromLocalQueues'
+	// own doc.
+	n.pruneCommittedFromLocalQueues(ann.Block.Batch)
 
 	n.log("validator: adopted announced height %d state_root=%s", height, ann.Block.StateRoot)
 	n.noteCommittedBlock(ann.Block)
@@ -619,6 +630,31 @@ func (n *Node) noteCommittedBlock(b types.Block) {
 	if n.outage.MaybeClear() {
 		n.log("validator: outage cleared at height %d", b.Height)
 	}
+}
+
+// pruneCommittedFromLocalQueues removes every tx in batch from this
+// node's own local mempool and outage backlog. batch has just become
+// spoken for by an in-flight or already-committed round; without this, a
+// node that only ever votes (never proposes) keeps a stale local copy of
+// every gossiped tx even after it's durably committed via someone else's
+// proposal, and later drags that stale copy into its own proposal once it
+// *is* the proposer — Stage 4 rejects it outright (its effect is already
+// applied), and the whole-batch-atomicity rule (spec 5.3) then discards
+// every other, individually-valid tx bundled alongside it too. This is a
+// real failure mode this build hit live under sustained multi-node
+// traffic (three real OS processes, real gossip, a rejected-and-reinserted
+// batch count climbing round after round) — not a hypothetical one. If
+// the round this batch belongs to later rolls back (timeout,
+// chain.Append failure), the existing rollback paths (sweepTimeouts,
+// tryFinalizeLocked) already reinsert the whole batch via Mempool.Reinsert/
+// OutageController.Reinsert, so pruning proactively here is safe.
+func (n *Node) pruneCommittedFromLocalQueues(batch []types.ShieldedTx) {
+	ids := make([]types.Hash, len(batch))
+	for i, t := range batch {
+		ids[i] = t.TxID
+	}
+	n.mempool.Remove(ids)
+	n.outage.Remove(ids)
 }
 
 // txRootOf hashes the ordered TxIDs of a batch, giving every honest node

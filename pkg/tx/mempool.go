@@ -207,3 +207,40 @@ func (m *Mempool) Len() int {
 	defer m.mu.Unlock()
 	return len(m.pending)
 }
+
+// Remove drops any pending entries matching the given TxIDs — for a
+// transaction that became committed (or is now being voted on) via a
+// batch this mempool's own node did not itself drain via DrainBatch/
+// DrainBatchBytes, e.g. a proposal built by a different committee member,
+// or a block adopted via BlockAnnounce. Without this, real multi-node
+// testing under sustained traffic showed exactly the failure mode this
+// closes: a node that only ever votes (never proposes) for several
+// rounds keeps a stale local copy of every gossiped tx even after it's
+// durably committed elsewhere, then later drags it into its own
+// proposal once it *is* the proposer — Stage 4 rejects that tx (its
+// effect is already applied), and the whole-batch-atomicity rule (spec
+// 5.3) discards every other, individually-valid tx bundled alongside it
+// too, repeating every round a new otherwise-fine batch happens to
+// include the stale entry.
+//
+// Does not touch seen: a late-arriving duplicate gossip echo for an
+// already-committed TxID should still be recognized and rejected by
+// Submit's existing dedup, not silently re-admitted as if new.
+func (m *Mempool) Remove(ids []types.Hash) {
+	if len(ids) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	drop := make(map[types.Hash]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+	kept := m.pending[:0]
+	for _, e := range m.pending {
+		if !drop[e.Tx.TxID] {
+			kept = append(kept, e)
+		}
+	}
+	m.pending = kept
+}

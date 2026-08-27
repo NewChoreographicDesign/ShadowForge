@@ -231,6 +231,52 @@ func TestOutageReinsertBypassesDuplicateCheck(t *testing.T) {
 	}
 }
 
+// TestOutageRemoveDropsMatchingEntriesOnly proves Remove drops exactly
+// the backlogged entries whose TxID matches, leaving everything else —
+// the outage-backlog equivalent of pkg/tx.Mempool.Remove's own fix for
+// the same real multi-node liveness bug (a node that receives a backlog
+// tx via gossip but never itself drains it into a proposal keeps a stale
+// copy after the tx is durably committed elsewhere).
+func TestOutageRemoveDropsMatchingEntriesOnly(t *testing.T) {
+	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
+	keep := types.ShieldedTx{TxID: types.Hash{1}}
+	drop1 := types.ShieldedTx{TxID: types.Hash{2}}
+	drop2 := types.ShieldedTx{TxID: types.Hash{3}}
+	for _, e := range []types.ShieldedTx{keep, drop1, drop2} {
+		if err := o.Enqueue(e, now); err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+	}
+
+	o.Remove([]types.Hash{drop1.TxID, drop2.TxID})
+
+	if o.BacklogDepth() != 1 {
+		t.Fatalf("expected 1 remaining backlog entry, got %d", o.BacklogDepth())
+	}
+	batch := o.BuildMegabatch(10)
+	if len(batch) != 1 || batch[0].TxID != keep.TxID {
+		t.Fatalf("expected only the untouched entry to remain, got %+v", batch)
+	}
+}
+
+// TestOutageRemoveDoesNotClearDedupRecord mirrors
+// TestMempoolRemoveDoesNotClearDedupRecord: a late-arriving duplicate
+// gossip echo for an already-committed TxID must still be recognized and
+// rejected by Enqueue, not silently re-admitted as new.
+func TestOutageRemoveDoesNotClearDedupRecord(t *testing.T) {
+	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
+	tr := types.ShieldedTx{TxID: types.Hash{9}}
+	if err := o.Enqueue(tr, now); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	o.Remove([]types.Hash{tr.TxID})
+	if err := o.Enqueue(tr, now.Add(time.Second)); err != consensus.ErrDuplicateBacklogTx {
+		t.Fatalf("expected a late duplicate to still be rejected after Remove, got %v", err)
+	}
+}
+
 func TestMegabatchRespectsMultiplierCap(t *testing.T) {
 	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
 	now := time.Now()

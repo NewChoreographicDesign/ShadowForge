@@ -126,6 +126,35 @@ func (o *OutageController) Reinsert(t types.ShieldedTx) {
 	o.backlog = append(o.backlog, t)
 }
 
+// Remove drops any backlogged entries matching the given TxIDs — the
+// outage backlog's equivalent of pkg/tx.Mempool.Remove, for the exact
+// same reason: a node that received a backlog tx via gossip but wasn't
+// the one who drained it into a dual-track proposal (via BuildMegabatch)
+// would otherwise keep a stale local copy forever, and later bundle it
+// into a recovery batch it itself proposes — after the tx's effect is
+// already durably committed, poisoning that batch and every
+// individually-valid entry alongside it. Does not touch seen, for the
+// same reason Mempool.Remove doesn't: a late duplicate gossip echo should
+// still be recognized by Enqueue's existing dedup, not re-admitted fresh.
+func (o *OutageController) Remove(ids []types.Hash) {
+	if len(ids) == 0 {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	drop := make(map[types.Hash]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+	kept := o.backlog[:0]
+	for _, t := range o.backlog {
+		if !drop[t.TxID] {
+			kept = append(kept, t)
+		}
+	}
+	o.backlog = kept
+}
+
 func (o *OutageController) sweepSeenLocked(now time.Time) {
 	for id, seenAt := range o.seen {
 		if now.Sub(seenAt) >= backlogSeenTTL {

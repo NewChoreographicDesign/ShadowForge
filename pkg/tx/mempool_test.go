@@ -127,6 +127,65 @@ func TestMempoolReinsertBypassesDuplicateCheck(t *testing.T) {
 	}
 }
 
+// TestMempoolRemoveDropsMatchingEntriesOnly proves Remove drops exactly
+// the pending entries whose TxID matches, leaving everything else — the
+// real fix for a node that only ever votes (never proposes) keeping a
+// stale local copy of a tx that became committed via someone else's
+// proposal, found via real multi-node testing under sustained traffic.
+func TestMempoolRemoveDropsMatchingEntriesOnly(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	keep := types.ShieldedTx{TxID: types.Hash{1}}
+	drop1 := types.ShieldedTx{TxID: types.Hash{2}}
+	drop2 := types.ShieldedTx{TxID: types.Hash{3}}
+	for _, e := range []types.ShieldedTx{keep, drop1, drop2} {
+		if err := m.Submit(e, now); err != nil {
+			t.Fatalf("submit: %v", err)
+		}
+	}
+
+	m.Remove([]types.Hash{drop1.TxID, drop2.TxID})
+
+	if m.Len() != 1 {
+		t.Fatalf("expected 1 remaining entry, got %d", m.Len())
+	}
+	batch := m.DrainBatch(0)
+	if len(batch) != 1 || batch[0].Tx.TxID != keep.TxID {
+		t.Fatalf("expected only the untouched entry to remain, got %+v", batch)
+	}
+}
+
+// TestMempoolRemoveDoesNotClearDedupRecord proves Remove leaves seen
+// alone: a late-arriving duplicate gossip echo for an already-committed
+// TxID must still be recognized and rejected, not silently re-admitted as
+// if it were new.
+func TestMempoolRemoveDoesNotClearDedupRecord(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	tr := types.ShieldedTx{TxID: types.Hash{9}}
+	if err := m.Submit(tr, now); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	m.Remove([]types.Hash{tr.TxID})
+	if err := m.Submit(tr, now.Add(time.Second)); err != tx.ErrDuplicateTx {
+		t.Fatalf("expected a late duplicate to still be rejected after Remove, got %v", err)
+	}
+}
+
+// TestMempoolRemoveEmptyIsNoop proves Remove(nil) doesn't touch pending —
+// the common case where a batch this node itself proposed (and therefore
+// already drained) is pruned again defensively.
+func TestMempoolRemoveEmptyIsNoop(t *testing.T) {
+	m := tx.NewMempool()
+	if err := m.Submit(types.ShieldedTx{TxID: types.Hash{1}}, time.Now()); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	m.Remove(nil)
+	if m.Len() != 1 {
+		t.Fatalf("expected Remove(nil) to be a no-op, len=%d", m.Len())
+	}
+}
+
 // sizedTx builds a real, distinctly-identified ShieldedTx padded with a
 // Memo of paddingLen bytes, so its JSON-marshaled size is
 // deterministic and controllable — used to test DrainBatchBytes' actual
