@@ -235,8 +235,55 @@ func TestMaybeProposeRespectsMaxBatchSize(t *testing.T) {
 		}
 	}
 
+	// A lone online validator can no longer self-quorum (consensus.
+	// MinCommitteeSize — real fork found live otherwise), so this test
+	// needs a real second committee member whose vote actually reaches
+	// quorum. Retry with a fresh peer until the real, key-derived
+	// committee order puts self at committee[0] (this test is
+	// specifically about maybePropose's own batch-building, which only
+	// runs on this node's proposing turn).
 	height := n.chn.NextHeight()
-	n.maybePropose() // sole online member (self): always its own turn, and quorum of 1 finalizes inline
+	var committee []types.NFTID
+	var peer peerKey
+	for attempt := 0; attempt < 100; attempt++ {
+		n.mu.Lock()
+		for id := range n.online {
+			if id != n.identity {
+				delete(n.online, id)
+				delete(n.everSeen, id)
+			}
+		}
+		n.mu.Unlock()
+		// Refresh self's own online record too — it is stamped once at
+		// construction and can otherwise silently age past OnlineTimeout
+		// during a long-running retry loop, making committee[0] ==
+		// n.identity permanently impossible for the rest of the attempts.
+		n.recordOnline(n.identity, n.pk, n.isSentinel, time.Now())
+		peer = genPeer(t)
+		committee = registerOnline(n, height, peer)
+		if committee[0] == n.identity {
+			break
+		}
+	}
+	if committee[0] != n.identity {
+		t.Fatalf("failed to draw a committee with self as proposer after 100 attempts")
+	}
+
+	n.maybePropose()
+
+	n.roundMu.Lock()
+	r, tracked := n.rounds[height]
+	n.roundMu.Unlock()
+	if !tracked {
+		t.Fatalf("expected maybePropose to start a round at height %d", height)
+	}
+	sig, err := crypto.DilithiumSign(peer.sk, r.candidate[:])
+	if err != nil {
+		t.Fatalf("sign vote: %v", err)
+	}
+	n.handleStageVote(shadownet.StageVotePayload{
+		Height: height, Validator: peer.id, CandidateHash: r.candidate, Sig: types.DilithiumSig(sig),
+	})
 
 	if n.chn.HeadHeight() != height {
 		t.Fatalf("expected maybePropose to commit height %d, still at %d", height, n.chn.HeadHeight())
@@ -746,6 +793,38 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 		t.Fatalf("expected the test to start in epoch 0, got %d", got)
 	}
 
+	// A lone online validator can no longer self-quorum (consensus.
+	// MinCommitteeSize — a real fork found live otherwise); register a
+	// real second committee member whose vote both blocks below actually
+	// need. Retry with a fresh peer until self lands at committee[0] for
+	// height1 specifically (this test hardcodes its Proposer).
+	height1 := n.chn.NextHeight()
+	var committee1 []types.NFTID
+	var peer peerKey
+	for attempt := 0; attempt < 100; attempt++ {
+		n.mu.Lock()
+		for id := range n.online {
+			if id != n.identity {
+				delete(n.online, id)
+				delete(n.everSeen, id)
+			}
+		}
+		n.mu.Unlock()
+		// Refresh self's own online record too — it is stamped once at
+		// construction and can otherwise silently age past OnlineTimeout
+		// during a long-running retry loop, making committee1[0] ==
+		// n.identity permanently impossible for the rest of the attempts.
+		n.recordOnline(n.identity, n.pk, n.isSentinel, time.Now())
+		peer = genPeer(t)
+		committee1 = registerOnline(n, height1, peer)
+		if committee1[0] == n.identity {
+			break
+		}
+	}
+	if committee1[0] != n.identity {
+		t.Fatalf("failed to draw a committee with self as proposer for height1 after 100 attempts")
+	}
+
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate voter key: %v", err)
@@ -764,10 +843,22 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 		},
 	})
 
-	height1 := n.chn.NextHeight()
 	n.handleBlockProposal(shadownet.BlockProposalPayload{
 		Height: height1, Epoch: 0, Proposer: n.identity,
 		Batch: []types.ShieldedTx{commitTx, revealTx}, Timestamp: time.Now().UnixMilli(),
+	})
+	n.roundMu.Lock()
+	r1, tracked1 := n.rounds[height1]
+	n.roundMu.Unlock()
+	if !tracked1 {
+		t.Fatalf("expected a tracked round at height1")
+	}
+	sig1, err := crypto.DilithiumSign(peer.sk, r1.candidate[:])
+	if err != nil {
+		t.Fatalf("sign height1 vote: %v", err)
+	}
+	n.handleStageVote(shadownet.StageVotePayload{
+		Height: height1, Validator: peer.id, CandidateHash: r1.candidate, Sig: types.DilithiumSig(sig1),
 	})
 	if n.chn.HeadHeight() != height1 {
 		t.Fatalf("expected the epoch-0 commit+reveal block to commit, head at %d", n.chn.HeadHeight())
@@ -801,9 +892,33 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 	})
 	nowEpoch := consensus.CurrentEpoch(n.cfg.Genesis, time.Now())
 	height2 := n.chn.NextHeight()
+	// Committee rotation guarantees a DIFFERENT committee[0] than height1
+	// now that a real 2-member committee can't self-quorum (height1's
+	// proposer can't also be height2's under real rotation) — use
+	// whichever the real committee actually assigns rather than
+	// hardcoding self, and have the other real member cast the second
+	// vote quorum needs.
+	onlineNow := n.onlineSet(time.Now())
+	committee2 := consensus.AssignCommittee(onlineNow, height2, committeeSize(len(onlineNow)))
+	if len(committee2) != 2 {
+		t.Fatalf("expected a real 2-member committee at height2, got %v", committee2)
+	}
 	n.handleBlockProposal(shadownet.BlockProposalPayload{
-		Height: height2, Epoch: nowEpoch, Proposer: n.identity,
+		Height: height2, Epoch: nowEpoch, Proposer: committee2[0],
 		Batch: []types.ShieldedTx{dummyTx}, Timestamp: time.Now().UnixMilli(),
+	})
+	n.roundMu.Lock()
+	r2, tracked2 := n.rounds[height2]
+	n.roundMu.Unlock()
+	if !tracked2 {
+		t.Fatalf("expected a tracked round at height2")
+	}
+	sig2, err := crypto.DilithiumSign(peer.sk, r2.candidate[:])
+	if err != nil {
+		t.Fatalf("sign height2 vote: %v", err)
+	}
+	n.handleStageVote(shadownet.StageVotePayload{
+		Height: height2, Validator: peer.id, CandidateHash: r2.candidate, Sig: types.DilithiumSig(sig2),
 	})
 	if n.chn.HeadHeight() != height2 {
 		t.Fatalf("expected the epoch-1 block to commit (epoch reverification must not block a genuinely current epoch), head at %d", n.chn.HeadHeight())

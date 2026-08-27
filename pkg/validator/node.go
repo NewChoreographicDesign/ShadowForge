@@ -379,7 +379,23 @@ func (n *Node) pubKeyLookup(id types.NFTID) (crypto.DilithiumPublicKey, bool) {
 	return info.pubKey, true
 }
 
+// heartbeatLoop broadcasts this node's own heartbeat immediately on
+// entry, then every HeartbeatInterval thereafter. The immediate first
+// broadcast matters for real safety, not just responsiveness: a
+// time.Ticker's first tick only fires *after* one full interval, so
+// without it every node would spend up to a whole HeartbeatInterval
+// (10s by default) believing it is the only validator online. A real
+// live-multi-process test hit exactly that cold-start blind window: two
+// nodes, each still seeing only itself, independently proposed and
+// self-committed *different* blocks for the same height — a real fork.
+// consensus.MinCommitteeSize now refuses a committee below 2 regardless
+// (the actual safety fix, since nothing can otherwise guarantee every
+// node's heartbeat has round-tripped by the time it first proposes), but
+// shrinking the blind window this way is still a real, direct
+// improvement to how long a healthy network takes to safely converge.
 func (n *Node) heartbeatLoop(ctx context.Context) {
+	n.sendHeartbeat(ctx)
+
 	ticker := time.NewTicker(n.cfg.HeartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -387,27 +403,32 @@ func (n *Node) heartbeatLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			now := time.Now()
-			n.evaluateSentinels(now)
-			if n.isSentinel && !n.sentinels.Active() {
-				// Sentinels stand down while not needed (spec 5.5): skip
-				// recording ourselves online and broadcasting a heartbeat
-				// entirely, so this node genuinely drops out of every
-				// peer's online set — and therefore out of committee
-				// assignment — until sentinels are next activated, rather
-				// than always participating with "sentinel" only ever
-				// affecting a log line.
-				continue
-			}
-			n.recordOnline(n.identity, n.pk, n.isSentinel, now)
-			env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
-				NFT: n.identity, PubKey: []byte(n.pk), Timestamp: now.UnixMilli(), IsSentinel: n.isSentinel,
-			})
-			if err != nil {
-				n.log("validator: build heartbeat: %v", err)
-				continue
-			}
-			n.net.Broadcast(ctx, env)
+			n.sendHeartbeat(ctx)
 		}
 	}
+}
+
+// sendHeartbeat records this node online (unless it's a standing-down
+// sentinel — spec 5.5) and broadcasts a real heartbeat to its peers.
+func (n *Node) sendHeartbeat(ctx context.Context) {
+	now := time.Now()
+	n.evaluateSentinels(now)
+	if n.isSentinel && !n.sentinels.Active() {
+		// Sentinels stand down while not needed (spec 5.5): skip
+		// recording ourselves online and broadcasting a heartbeat
+		// entirely, so this node genuinely drops out of every peer's
+		// online set — and therefore out of committee assignment —
+		// until sentinels are next activated, rather than always
+		// participating with "sentinel" only ever affecting a log line.
+		return
+	}
+	n.recordOnline(n.identity, n.pk, n.isSentinel, now)
+	env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
+		NFT: n.identity, PubKey: []byte(n.pk), Timestamp: now.UnixMilli(), IsSentinel: n.isSentinel,
+	})
+	if err != nil {
+		n.log("validator: build heartbeat: %v", err)
+		return
+	}
+	n.net.Broadcast(ctx, env)
 }

@@ -315,6 +315,16 @@ func TestOutageEndToEndDualTrackRoundClearsOnQuorum(t *testing.T) {
 			}
 		}
 		n.mu.Unlock()
+		// Self's own online record must be refreshed on every attempt too:
+		// it is stamped once at construction, and a long-running retry loop
+		// (especially under -race overhead) can otherwise let it silently
+		// age past OnlineTimeout, dropping self out of its own online set
+		// and making committee[0] == n.identity permanently impossible for
+		// the rest of the run — a real flake this test used to hit, not a
+		// probability-model shortfall (empirically self lands at
+		// committee[0] ~35% of the time, so 100 retries should all but
+		// always succeed once self can't silently expire itself).
+		n.recordOnline(n.identity, n.pk, n.isSentinel, time.Now())
 
 		p1, p2, p3 = genPeer(t), genPeer(t), genPeer(t)
 		committee = registerOnline(n, height, p1, p2, p3)

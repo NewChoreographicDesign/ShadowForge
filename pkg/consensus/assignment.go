@@ -6,6 +6,25 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
 
+// MinCommitteeSize is the smallest committee AssignCommittee will ever
+// return a non-empty result for — a real, live-multi-process test found
+// exactly why 1 is unsafe: with only one validator counted as online (the
+// unavoidable state every node starts in for up to one HeartbeatInterval,
+// since the first tick of a Go time.Ticker fires only after the interval
+// elapses, not immediately), a committee of size 1 satisfies
+// BFTQuorumMet(1, 1) — that lone node's own single vote is "quorum" —
+// letting it unilaterally propose and self-commit a block with zero
+// agreement from anyone else. Two nodes independently doing this during
+// the same cold-start window, each seeing only itself, produced a real
+// fork: two different blocks committed at the same height. Requiring at
+// least 2 online, distinct validators means BFTQuorumMet(2, votes) can
+// only pass at votes=2 — genuine two-party agreement, not unilateral
+// action — and callers already treat an empty committee (AssignCommittee's
+// existing n==0 case) as "no one proposes this round," so this reuses
+// that same, already-correct "wait" behavior rather than needing any new
+// handling at every call site.
+const MinCommitteeSize = 2
+
 // AssignCommittee deterministically selects up to count distinct
 // validators from the online set for the batch at height, without
 // requiring a globally-synchronized mutable queue.
@@ -33,7 +52,7 @@ import (
 // agreement to be meaningful.
 func AssignCommittee(onlineSorted []types.NFTID, height uint64, count int) []types.NFTID {
 	n := len(onlineSorted)
-	if n == 0 {
+	if n < MinCommitteeSize {
 		return nil
 	}
 	if count > n {
