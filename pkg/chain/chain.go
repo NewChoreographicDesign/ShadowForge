@@ -153,5 +153,17 @@ func (c *Chain) Append(b types.Block, committee []types.NFTID, lookup PubKeyLook
 	}
 	c.headHeight = b.Height
 	c.headHash = candidate
+
+	// Index every committed transaction by the height that just reached
+	// real quorum, so pkg/query can answer "did this transaction land"
+	// with a direct lookup instead of a linear scan back through the
+	// chain. This runs only after the block above is durably the new
+	// head — the index never records a transaction that didn't actually
+	// commit.
+	for _, t := range b.Batch {
+		if err := c.store.IndexTx(t.TxID, b.Height); err != nil {
+			return fmt.Errorf("chain: index tx %s at height %d: %w", t.TxID, b.Height, err)
+		}
+	}
 	return nil
 }

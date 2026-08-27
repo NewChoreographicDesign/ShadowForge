@@ -186,6 +186,27 @@ func TestMempoolRemoveEmptyIsNoop(t *testing.T) {
 	}
 }
 
+func TestMempoolContainsReflectsPendingState(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	tr := types.ShieldedTx{TxID: types.Hash{4}}
+
+	if m.Contains(tr.TxID) {
+		t.Fatalf("expected Contains to be false before Submit")
+	}
+	if err := m.Submit(tr, now); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if !m.Contains(tr.TxID) {
+		t.Fatalf("expected Contains to be true once pending")
+	}
+
+	m.Remove([]types.Hash{tr.TxID})
+	if m.Contains(tr.TxID) {
+		t.Fatalf("expected Contains to be false after Remove, even though seen still remembers it")
+	}
+}
+
 // sizedTx builds a real, distinctly-identified ShieldedTx padded with a
 // Memo of paddingLen bytes, so its JSON-marshaled size is
 // deterministic and controllable — used to test DrainBatchBytes' actual

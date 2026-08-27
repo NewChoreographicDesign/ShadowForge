@@ -122,3 +122,28 @@ func TestBlockPersistenceRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected head: height=%d found=%v err=%v", height, found, err)
 	}
 }
+
+func TestTxIndexRoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	txid := types.Hash{0x42}
+
+	if _, found, err := s.GetTxHeight(txid); err != nil || found {
+		t.Fatalf("expected unindexed tx to be not found: found=%v err=%v", found, err)
+	}
+
+	if err := s.IndexTx(txid, 7); err != nil {
+		t.Fatalf("index tx: %v", err)
+	}
+
+	height, found, err := s.GetTxHeight(txid)
+	if err != nil || !found {
+		t.Fatalf("expected indexed tx to be found: found=%v err=%v", found, err)
+	}
+	if height != 7 {
+		t.Fatalf("expected height 7, got %d", height)
+	}
+
+	if _, found, err := s.GetTxHeight(types.Hash{0x99}); err != nil || found {
+		t.Fatalf("expected a different tx id to remain unindexed: found=%v err=%v", found, err)
+	}
+}

@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"log"
 	mathrand "math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -39,6 +40,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
+	"github.com/shadowforge/shadowforge-l1/pkg/query"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
@@ -71,6 +73,7 @@ func main() {
 	genesisMs := flag.Int64("genesis-ms", defaultGenesisMs, "chain genesis time, unix milliseconds — every node in a network must use the same value")
 	disableOracle := flag.Bool("disable-oracle", false, "disable real oracle price/ATR verification of BankDeposit/BankWithdraw claims (spec 11.3) — for isolated test networks without internet access")
 	oracleMaxDisagreement := flag.String("oracle-max-disagreement", "0.02", "fractional bound (e.g. 0.02 = 2%) beyond which the oracle quorum's real sources are treated as disagreeing (spec 11.3)")
+	queryListen := flag.String("query-listen", "127.0.0.1:8081", "address for the read-only HTTP query API (chain status, tx status, balances-equivalent lookups) — empty disables it. Binding a non-loopback address deliberately exposes it beyond this machine; see pkg/query's doc for exactly what it does and does not reveal")
 	flag.Parse()
 
 	role := "civilian"
@@ -206,6 +209,20 @@ func main() {
 	vnode.Start(ctx)
 	go epochLoop(ctx, consensus.GenesisTime(*genesisMs))
 	go chainStatusLoop(ctx, vnode)
+
+	if *queryListen != "" {
+		qsrv := query.NewServer(store, chn, mempool, query.Config{
+			ListenAddr: *queryListen,
+			GenesisMs:  *genesisMs,
+			Logf:       log.Printf,
+		})
+		if err := qsrv.Start(ctx); err != nil {
+			log.Fatalf("start query API: %v", err)
+		}
+		if !isLoopback(*queryListen) {
+			log.Printf("WARNING: query API bound to a non-loopback address (%s) — it is now reachable by anyone who can route to this machine. See pkg/query's doc comment for exactly what it does and does not expose.", *queryListen)
+		}
+	}
 	if *sentinelFlag {
 		go silent.RunPadGenerator(ctx, mathrand.New(mathrand.NewSource(time.Now().UnixNano())), silentPadMeanInterval, func() {
 			emitSilentPad(ctx, vnode.Net())
@@ -293,6 +310,20 @@ func writeAddrFile(path, addr string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// isLoopback reports whether addr's host resolves to a loopback address
+// (127.0.0.0/8 or ::1) — used only to decide whether to warn that the
+// query API is now reachable from beyond this machine. An unresolvable
+// or non-IP host (e.g. a bare hostname) is treated as non-loopback: warn
+// rather than silently assume it's safe.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // waitForAddrFile polls for path to appear (another node's writeAddrFile

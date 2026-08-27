@@ -208,6 +208,23 @@ func (m *Mempool) Len() int {
 	return len(m.pending)
 }
 
+// Contains reports whether id is currently waiting in this node's pending
+// queue — a real "still pending" answer for pkg/query, distinct from
+// "already committed" (pkg/state.GetTxHeight) and "never seen at all".
+// It does not consult seen: an entry that was submitted, then already
+// drained/committed and Remove'd, is no longer pending even though seen
+// still remembers its TxID for dedup purposes.
+func (m *Mempool) Contains(id types.Hash) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.pending {
+		if e.Tx.TxID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // Remove drops any pending entries matching the given TxIDs — for a
 // transaction that became committed (or is now being voted on) via a
 // batch this mempool's own node did not itself drain via DrainBatch/

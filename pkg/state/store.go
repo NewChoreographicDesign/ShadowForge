@@ -32,6 +32,7 @@ var (
 	prefixProposal   = []byte("prop:")
 	prefixContainer  = []byte("container:")
 	prefixBlock      = []byte("block:")
+	prefixTxIndex    = []byte("tx:")
 	keyHead          = []byte("head")
 )
 
@@ -445,4 +446,50 @@ func (s *Store) GetHead() (uint64, bool, error) {
 		})
 	})
 	return height, found, err
+}
+
+// --- Transaction index (pkg/query) ---
+
+// IndexTx records that txid was included in the block at height, so a
+// later GetTxHeight can answer "did this transaction land, and where"
+// without scanning every block. pkg/chain.Append calls this for every
+// entry in a block's Batch once that block has genuinely reached BFT
+// quorum and been persisted — the index only ever reflects transactions a
+// real, quorum-verified block actually committed, never a merely-proposed
+// or merely-pending one.
+func (s *Store) IndexTx(txid types.Hash, height uint64) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], height)
+		return txn.Set(withPrefix(prefixTxIndex, txid.String()), b[:])
+	})
+}
+
+// GetTxHeight returns the height of the block that committed txid, or
+// found=false if this node has no record of it (never seen, still only
+// pending, or committed on a block this node hasn't indexed).
+func (s *Store) GetTxHeight(txid types.Hash) (uint64, bool, error) {
+	var height uint64
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(withPrefix(prefixTxIndex, txid.String()))
+		if err == badger.ErrKeyNotFound {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return item.Value(func(val []byte) error {
+			if len(val) != 8 {
+				return fmt.Errorf("state: corrupt tx index record for %s", txid)
+			}
+			height = binary.BigEndian.Uint64(val)
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, false, fmt.Errorf("state: get tx height: %w", err)
+	}
+	return height, found, nil
 }

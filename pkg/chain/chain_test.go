@@ -131,6 +131,49 @@ func TestAppendWithRealQuorumSucceeds(t *testing.T) {
 	}
 }
 
+func TestAppendIndexesCommittedTransactions(t *testing.T) {
+	s := openTestStore(t)
+	c, err := chain.Open(s, 0)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	v := genValidators(t, 3)
+
+	batch := []types.ShieldedTx{
+		{TxID: types.Hash{0xAA}, Kind: types.TxVote},
+		{TxID: types.Hash{0xBB}, Kind: types.TxVote},
+	}
+	b := c.NextBlock(0, batch, types.Hash{9}, types.Hash{1}, types.Hash{}, v.ids[0], 100)
+	candidate := types.HashBlock(b)
+	for i := 0; i < 2; i++ {
+		b.Votes = append(b.Votes, types.Vote{Validator: v.ids[i], StateRoot: candidate, Sig: v.sign(v.ids[i], candidate[:])})
+	}
+
+	// Before Append, nothing is indexed yet — a block that hasn't reached
+	// quorum must never appear to have "landed".
+	if _, found, err := s.GetTxHeight(batch[0].TxID); err != nil || found {
+		t.Fatalf("expected tx not yet indexed before Append: found=%v err=%v", found, err)
+	}
+
+	if err := c.Append(b, v.ids, v.lookup); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	for _, tx := range batch {
+		height, found, err := s.GetTxHeight(tx.TxID)
+		if err != nil || !found {
+			t.Fatalf("expected tx %s indexed after commit: found=%v err=%v", tx.TxID, found, err)
+		}
+		if height != 1 {
+			t.Fatalf("expected tx %s indexed at height 1, got %d", tx.TxID, height)
+		}
+	}
+
+	if _, found, err := s.GetTxHeight(types.Hash{0xCC}); err != nil || found {
+		t.Fatalf("expected an unrelated tx id to remain unindexed: found=%v err=%v", found, err)
+	}
+}
+
 func TestAppendRejectsInsufficientVotes(t *testing.T) {
 	s := openTestStore(t)
 	c, _ := chain.Open(s, 0)
