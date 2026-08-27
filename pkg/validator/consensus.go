@@ -242,12 +242,23 @@ func (n *Node) maybePropose() {
 // real post-quantum Dilithium3 signature+pubkey alone is several KB, so a
 // count-only cap can still blow past Badger's 1MB per-value limit).
 // Anything drained from the backlog but trimmed for lack of room is
-// re-enqueued rather than lost.
+// re-enqueued rather than lost. filterReadyReveals also holds back any
+// TxVoteReveal whose commit hasn't caught up yet — see its own doc for
+// the real network-liveness bug this closes.
 func (n *Node) buildProposalBatch(dualTrack bool) []types.ShieldedTx {
 	entries := n.mempool.DrainBatchBytes(n.cfg.maxBatchSize(), n.cfg.maxBatchBytes())
-	batch := make([]types.ShieldedTx, len(entries))
+	drained := make([]types.ShieldedTx, len(entries))
 	for i, e := range entries {
-		batch[i] = e.Tx
+		drained[i] = e.Tx
+	}
+	batch, deferred := n.filterReadyReveals(drained)
+	if len(deferred) > 0 {
+		now := time.Now()
+		for _, t := range deferred {
+			if err := n.mempool.Reinsert(t, now); err != nil {
+				n.log("validator: re-enqueue not-yet-ready reveal: %v", err)
+			}
+		}
 	}
 	if !dualTrack {
 		return batch
@@ -263,7 +274,11 @@ func (n *Node) buildProposalBatch(dualTrack bool) []types.ShieldedTx {
 		return batch // no room left for Track B this round; backlog stays queued
 	}
 
-	mega := n.outage.BuildMegabatch(n.cfg.maxBatchSize())
+	megaDrained := n.outage.BuildMegabatch(n.cfg.maxBatchSize())
+	mega, megaDeferred := n.filterReadyReveals(megaDrained)
+	for _, t := range megaDeferred {
+		n.outage.Reinsert(t)
+	}
 	fit, overflow, err := splitByByteBudget(mega, remaining)
 	if err != nil {
 		n.log("validator: measure megabatch size: %v", err)
@@ -278,6 +293,70 @@ func (n *Node) buildProposalBatch(dualTrack bool) []types.ShieldedTx {
 		n.outage.Reinsert(t)
 	}
 	return append(batch, fit...)
+}
+
+// filterReadyReveals splits txs into ready (safe to include in a proposal
+// now) and deferred (a TxVoteReveal whose corresponding TxVote commit
+// isn't visible yet — neither durably committed in n.store nor earlier in
+// this same candidate batch). Everything else passes through as ready
+// unconditionally.
+//
+// This closes a real network-liveness bug found live under sustained
+// 3-node TxVote/TxVoteReveal traffic (not hypothetical): gossip delivery
+// over independent libp2p connections gives no ordering guarantee, so a
+// reveal a wallet (or cmd/walletsim) sends moments after its own commit,
+// without waiting for confirmation, can genuinely arrive at a node before
+// that node has admitted or committed the matching commit. Stage 4 then
+// rejects the reveal outright ("has not cast a ballot" / "no such
+// proposal"), and spec 5.3's whole-batch atomicity rule means the ENTIRE
+// proposal — every other, individually valid tx bundled alongside it —
+// gets discarded too; under continuous traffic this can repeat every
+// single round indefinitely; a live 3-node cluster stalled completely
+// (multiple minutes, zero committed heights) hitting exactly this.
+// Deferring the not-yet-ready reveal back to the mempool (via Reinsert,
+// tried again in a later round once its commit has hopefully caught up)
+// fixes it without weakening Stage 4's real cryptographic check for a
+// reveal that's genuinely wrong (bad nonce/approve, already revealed,
+// already tallied) — those still fail hard, exactly as before.
+func (n *Node) filterReadyReveals(txs []types.ShieldedTx) (ready, deferred []types.ShieldedTx) {
+	seenThisBatch := map[types.ID]map[types.NFTID]bool{}
+	for _, t := range txs {
+		switch t.Kind {
+		case types.TxVote:
+			if t.VotePublicInputs != nil {
+				voter := types.NFTID(types.SumHash(t.SignerPubKey))
+				pid := t.VotePublicInputs.ProposalID
+				if seenThisBatch[pid] == nil {
+					seenThisBatch[pid] = map[types.NFTID]bool{}
+				}
+				seenThisBatch[pid][voter] = true
+			}
+			ready = append(ready, t)
+
+		case types.TxVoteReveal:
+			if t.VoteRevealPublicInputs == nil {
+				ready = append(ready, t) // malformed; let Stage 2 reject it normally
+				continue
+			}
+			voter := types.NFTID(types.SumHash(t.SignerPubKey))
+			pid := t.VoteRevealPublicInputs.ProposalID
+			if seenThisBatch[pid][voter] {
+				ready = append(ready, t) // its commit is earlier in this very batch
+				continue
+			}
+			if record, found, err := n.store.GetProposal(string(pid)); err == nil && found {
+				if _, committed := record.Commitments[voter]; committed {
+					ready = append(ready, t) // its commit is already durably committed
+					continue
+				}
+			}
+			deferred = append(deferred, t)
+
+		default:
+			ready = append(ready, t)
+		}
+	}
+	return ready, deferred
 }
 
 func marshaledSize(batch []types.ShieldedTx) (int, error) {
