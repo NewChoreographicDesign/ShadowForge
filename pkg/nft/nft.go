@@ -74,6 +74,12 @@ func UnlockTransfer(nft *types.ValidatorNFT) {
 const (
 	TPPerSuccessfulStage = 1
 	TPPerUptimeSlice     = 1
+
+	// TPGreenEnergyBonus is the extra TP awarded per uptime slice to a
+	// validator with a verified renewable-energy attestation (spec 9.3:
+	// "Verified green hardware / renewable energy oracle: extra Trust
+	// Points").
+	TPGreenEnergyBonus = 1
 )
 
 // AwardStageSuccess increments TP for a successful stage-work turn (spec
@@ -82,9 +88,16 @@ func AwardStageSuccess(nft *types.ValidatorNFT) {
 	nft.TP += TPPerSuccessfulStage
 }
 
-// AwardUptimeSlice increments TP for a continuous-uptime slice (spec 5.4.2).
-func AwardUptimeSlice(nft *types.ValidatorNFT) {
+// AwardUptimeSlice increments TP for a continuous-uptime slice (spec
+// 5.4.2), plus TPGreenEnergyBonus if greenEnergyVerified is true — the
+// caller is expected to have already checked that attestation against a
+// green-energy oracle (spec 3.3: "Oracles ... green-energy attestations"),
+// mirroring how pkg/oracle.Source feeds Bank price/ATR checks.
+func AwardUptimeSlice(nft *types.ValidatorNFT, greenEnergyVerified bool) {
 	nft.TP += TPPerUptimeSlice
+	if greenEnergyVerified {
+		nft.TP += TPGreenEnergyBonus
+	}
 }
 
 // FreezeOnCooldown leaves TP unchanged, implementing the "freeze" half of

@@ -43,9 +43,24 @@ func TestTrustPointsAccrual(t *testing.T) {
 	v := types.ValidatorNFT{}
 	nft.AwardStageSuccess(&v)
 	nft.AwardStageSuccess(&v)
-	nft.AwardUptimeSlice(&v)
+	nft.AwardUptimeSlice(&v, false)
 	if v.TP != 3 {
 		t.Fatalf("expected TP=3, got %d", v.TP)
+	}
+}
+
+func TestAwardUptimeSliceGreenEnergyBonus(t *testing.T) {
+	plain := types.ValidatorNFT{}
+	nft.AwardUptimeSlice(&plain, false)
+	if plain.TP != nft.TPPerUptimeSlice {
+		t.Fatalf("expected TP=%d without green attestation, got %d", nft.TPPerUptimeSlice, plain.TP)
+	}
+
+	green := types.ValidatorNFT{}
+	nft.AwardUptimeSlice(&green, true)
+	want := uint64(nft.TPPerUptimeSlice + nft.TPGreenEnergyBonus)
+	if green.TP != want {
+		t.Fatalf("expected TP=%d with a verified green attestation, got %d", want, green.TP)
 	}
 }
 
