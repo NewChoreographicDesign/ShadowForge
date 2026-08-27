@@ -76,6 +76,14 @@ func (t *Txn) GetProposal(id string) (ProposalRecord, bool, error) {
 	return p, found, err
 }
 
+func (t *Txn) ListProposals() ([]ProposalRecord, error) {
+	return listProposals(t.txn)
+}
+
+func (t *Txn) CountNFTs() (int, error) {
+	return countPrefix(t.txn, prefixNFT)
+}
+
 func (t *Txn) PutContainerRoot(containerID string, root types.Hash) error {
 	return setJSON(t.txn, prefixContainer, containerID, root)
 }

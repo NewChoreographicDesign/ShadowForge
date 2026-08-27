@@ -9,6 +9,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/container"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/governance"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -34,7 +35,13 @@ type Deps struct {
 	// signature-verified transaction against it and rejects one from a
 	// wallet currently under a spike-response hold.
 	Silent *silent.RateMonitor
-	Now    func() time.Time
+	// Epoch is the epoch this batch belongs to (the block's own Epoch —
+	// consensus-critical, since it's hashed into the block a committee
+	// votes on). A new proposal a TxVote references for the first time is
+	// stamped with this Epoch, anchoring when it's due for an
+	// epoch-boundary tally.
+	Epoch types.EpochNumber
+	Now   func() time.Time
 }
 
 func (d Deps) now() time.Time {
@@ -205,11 +212,20 @@ func (p *Pipeline) finalize(t *types.ShieldedTx) {
 // "Well-formedness: kind, fee commitment, circuit public inputs, Dilithium
 // signature, not expired. Writes: Tx admitted to the working batch."
 func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) error {
-	if t.Kind > types.TxContainerSync {
+	if t.Kind > types.TxVoteReveal {
 		return fmt.Errorf("unknown tx kind %d", t.Kind)
 	}
 	if !submittedAt.IsZero() && p.deps.now().Sub(submittedAt) > TxTTL {
 		return fmt.Errorf("transaction expired (submitted %s ago, TTL %s)", p.deps.now().Sub(submittedAt), TxTTL)
+	}
+	// A single oversized transaction (an attacker-supplied huge Memo, for
+	// instance) shouldn't be admissible at all, independent of
+	// Mempool.DrainBatchBytes' batch-level size bound — that bound skips
+	// including a tx that alone would blow the budget rather than
+	// stalling, but a tx too large to EVER fit needs to be rejected here,
+	// not perpetually deferred.
+	if size, err := jsonSize(*t); err == nil && size > MaxTxSize {
+		return fmt.Errorf("transaction is %d bytes serialized, exceeding the %d byte cap", size, MaxTxSize)
 	}
 
 	// Well-formedness: TxID must match its own content (spec 4.1), and the
@@ -262,6 +278,10 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 	case types.TxVote:
 		if t.VotePublicInputs == nil {
 			return fmt.Errorf("vote tx missing public inputs")
+		}
+	case types.TxVoteReveal:
+		if t.VoteRevealPublicInputs == nil {
+			return fmt.Errorf("vote reveal tx missing public inputs")
 		}
 	case types.TxNFTTrait:
 		if t.TraitPublicInputs == nil {
@@ -357,19 +377,66 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		}
 
 	case types.TxVote:
-		// Records this ballot's commitment against its proposal (spec
-		// 17.4: "Votes accumulate as ZKP ballots during the epoch").
-		// Tallying (governance.Tally) and the pass/fail decision happen at
-		// epoch end, outside the per-transaction pipeline, since a
-		// proposal's outcome depends on every ballot cast across the
-		// whole epoch, not on any single transaction.
+		// Records this sealed ballot's commitment against its proposal,
+		// keyed by voter (spec 17.4: "Votes accumulate as ZKP ballots
+		// during the epoch"; one NFT, one vote — spec 9.1). The choice
+		// itself stays hidden until a later TxVoteReveal opens it; a real
+		// epoch-boundary tally (pkg/validator, once this proposal's Epoch
+		// has passed) counts only what got revealed — see
+		// types.ComputeVoteCommitment and the TxVoteReveal case below.
 		pub := t.VotePublicInputs
-		record, _, err := p.deps.Store.GetProposal(string(pub.ProposalID))
+		voter := types.NFTID(types.SumHash(t.SignerPubKey))
+		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
 		if err != nil {
 			return fmt.Errorf("proposal lookup: %w", err)
 		}
-		record.ProposalID = string(pub.ProposalID)
-		record.Commitments = append(record.Commitments, pub.Commitment)
+		if !found {
+			record = state.ProposalRecord{
+				ProposalID:  string(pub.ProposalID),
+				Epoch:       p.deps.Epoch,
+				Commitments: map[types.NFTID]types.Hash{},
+				Reveals:     map[types.NFTID]bool{},
+			}
+		}
+		if record.Tallied {
+			return fmt.Errorf("proposal %s already tallied; voting is closed", pub.ProposalID)
+		}
+		if _, already := record.Commitments[voter]; already {
+			return fmt.Errorf("voter %s has already cast a ballot for proposal %s", voter, pub.ProposalID)
+		}
+		record.Commitments[voter] = pub.Commitment
+		if err := p.deps.Store.PutProposal(record); err != nil {
+			return fmt.Errorf("persist proposal: %w", err)
+		}
+
+	case types.TxVoteReveal:
+		// Opens a sealed TxVote ballot: Approve/Nonce must reproduce the
+		// Commitment that voter's earlier TxVote bound, or the reveal is
+		// rejected outright — this is a real cryptographic check against
+		// stored on-chain state, not a trust-the-caller flag.
+		pub := t.VoteRevealPublicInputs
+		voter := types.NFTID(types.SumHash(t.SignerPubKey))
+		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
+		if err != nil {
+			return fmt.Errorf("proposal lookup: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("no such proposal %s", pub.ProposalID)
+		}
+		if record.Tallied {
+			return fmt.Errorf("proposal %s already tallied; reveals are closed", pub.ProposalID)
+		}
+		commitment, committed := record.Commitments[voter]
+		if !committed {
+			return fmt.Errorf("voter %s has not cast a ballot for proposal %s", voter, pub.ProposalID)
+		}
+		if record.Reveals[voter] {
+			return fmt.Errorf("voter %s has already revealed their ballot for proposal %s", voter, pub.ProposalID)
+		}
+		if want := types.ComputeVoteCommitment(voter, pub.Approve, pub.Nonce); want != commitment {
+			return fmt.Errorf("reveal does not match the earlier commitment for proposal %s", pub.ProposalID)
+		}
+		record.Reveals[voter] = pub.Approve
 		if err := p.deps.Store.PutProposal(record); err != nil {
 			return fmt.Errorf("persist proposal: %w", err)
 		}
@@ -433,4 +500,52 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 	}
 	t.StageHints = t.StageHints.With(5)
 	return nil
+}
+
+// TallyDueProposals runs spec 17.4's epoch-end tally for every untallied
+// proposal whose Epoch is strictly before currentEpoch: real revealed
+// ballots (see the TxVote/TxVoteReveal cases above) are counted via
+// governance.Tally, and the outcome is persisted so the proposal never
+// gets tallied twice. It never mints SFG — that "proposer path chosen in
+// the App" (direct with a fee, or staked for yield) is a wallet/App-layer
+// choice this L1-core build doesn't implement (see README's Scope
+// section); tallying a proposal's pass/fail is the real, complete part of
+// spec 17.4 that belongs at this layer.
+//
+// This runs deterministically off already-committed proposal state plus
+// the caller's own block Epoch, so every honest node reaches the same
+// result when processing the same block content — it does not depend on
+// wall-clock time or on which reveals *this* node happens to have seen
+// outside what the chain itself has committed.
+func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.ProposalRecord, error) {
+	all, err := p.deps.Store.ListProposals()
+	if err != nil {
+		return nil, fmt.Errorf("list proposals: %w", err)
+	}
+	eligibleNFTs, err := p.deps.Store.CountNFTs()
+	if err != nil {
+		return nil, fmt.Errorf("count nfts: %w", err)
+	}
+
+	var tallied []state.ProposalRecord
+	for _, record := range all {
+		if record.Tallied || record.Epoch >= currentEpoch {
+			continue
+		}
+		ballots := make([]governance.Ballot, 0, len(record.Reveals))
+		for voter, approve := range record.Reveals {
+			ballots = append(ballots, governance.Ballot{Voter: voter, Approve: approve})
+		}
+		result := governance.Tally(ballots, eligibleNFTs, decimal.Zero)
+
+		record.Tallied = true
+		record.Approve = result.Approve
+		record.Reject = result.Reject
+		record.Passed = result.Passed
+		if err := p.deps.Store.PutProposal(record); err != nil {
+			return nil, fmt.Errorf("persist tally for proposal %s: %w", record.ProposalID, err)
+		}
+		tallied = append(tallied, record)
+	}
+	return tallied, nil
 }

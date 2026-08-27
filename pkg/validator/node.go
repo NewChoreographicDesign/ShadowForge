@@ -65,6 +65,48 @@ type Config struct {
 	// Genesis is this chain's genesis time, for epoch computation
 	// (consensus.CurrentEpoch).
 	Genesis consensus.GenesisTime
+	// MaxBatchSize caps how many mempool entries maybePropose will ever
+	// consider in one block; <=0 means DefaultMaxBatchSize. This is a
+	// secondary bound — MaxBatchBytes below is the real defense (see its
+	// own doc for why a count alone can't safely bound serialized size).
+	// A rejected batch's valid transactions go back into the mempool
+	// (handleBlockProposal), so an unbounded drain lets one recurring bad
+	// entry force an ever-larger batch to be reattempted every round.
+	MaxBatchSize int
+	// MaxBatchBytes caps the cumulative JSON-marshaled size of the
+	// entries maybePropose drains into one block (Mempool.
+	// DrainBatchBytes); <=0 means DefaultMaxBatchBytes. This is the real
+	// defense: a real post-quantum Dilithium3 signature+pubkey alone is
+	// several KB, so a few hundred otherwise-ordinary transactions can
+	// exceed Badger's 1MB per-value limit well before MaxBatchSize's
+	// count would ever trip — this build hit exactly that for real under
+	// sustained traffic, and the resulting chain.Append failure
+	// (reinserting the same oversized batch every round) formed a
+	// livelock, not just a rejected round.
+	MaxBatchBytes int
+}
+
+// DefaultMaxBatchSize is a conservative secondary cap on entry count.
+const DefaultMaxBatchSize = 200
+
+// DefaultMaxBatchBytes leaves comfortable margin under Badger's default
+// 1MB (1048576 byte) per-value limit for the rest of the block's own
+// fields (header, votes, JSON structure overhead) once the batch is
+// embedded in it.
+const DefaultMaxBatchBytes = 800 * 1024
+
+func (c Config) maxBatchSize() int {
+	if c.MaxBatchSize <= 0 {
+		return DefaultMaxBatchSize
+	}
+	return c.MaxBatchSize
+}
+
+func (c Config) maxBatchBytes() int {
+	if c.MaxBatchBytes <= 0 {
+		return DefaultMaxBatchBytes
+	}
+	return c.MaxBatchBytes
 }
 
 // DefaultConfig returns the spec-22-aligned defaults.
@@ -75,6 +117,8 @@ func DefaultConfig(genesis consensus.GenesisTime) Config {
 		HeartbeatInterval: consensus.HeartbeatInterval,
 		OnlineTimeout:     consensus.OfflineWindow,
 		Genesis:           genesis,
+		MaxBatchSize:      DefaultMaxBatchSize,
+		MaxBatchBytes:     DefaultMaxBatchBytes,
 	}
 }
 

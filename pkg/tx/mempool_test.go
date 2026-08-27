@@ -1,6 +1,7 @@
 package tx_test
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -123,5 +124,83 @@ func TestMempoolReinsertBypassesDuplicateCheck(t *testing.T) {
 	}
 	if m.Len() != 1 {
 		t.Fatalf("expected the reinserted tx to be pending again, len=%d", m.Len())
+	}
+}
+
+// sizedTx builds a real, distinctly-identified ShieldedTx padded with a
+// Memo of paddingLen bytes, so its JSON-marshaled size is
+// deterministic and controllable — used to test DrainBatchBytes' actual
+// size-based behavior without depending on ShieldedTx's exact zero-value
+// JSON overhead.
+func sizedTx(id byte, paddingLen int) types.ShieldedTx {
+	return types.ShieldedTx{TxID: types.Hash{id}, Memo: make([]byte, paddingLen)}
+}
+
+func marshaledSize(t *testing.T, tx types.ShieldedTx) int {
+	t.Helper()
+	b, err := json.Marshal(tx)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return len(b)
+}
+
+// TestMempoolDrainBatchBytesStopsAtSizeLimit proves the drain is bounded
+// by real cumulative serialized size, not just entry count — the actual
+// defense this build needed: a fixed count can't safely bound total size
+// when per-tx size varies (this is exactly what let a count-bounded batch
+// of ordinary transactions blow past Badger's 1MB per-value limit for
+// real, once real Dilithium3 signature/pubkey overhead was accounted for).
+func TestMempoolDrainBatchBytesStopsAtSizeLimit(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	one := sizedTx(0, 1000)
+	sizeOne := marshaledSize(t, one)
+
+	for i := byte(0); i < 5; i++ {
+		if err := m.Submit(sizedTx(i, 1000), now); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+
+	batch := m.DrainBatchBytes(0, sizeOne*2)
+	if len(batch) != 2 {
+		t.Fatalf("expected exactly 2 entries within a %d-byte budget (each ~%d bytes), got %d", sizeOne*2, sizeOne, len(batch))
+	}
+	if m.Len() != 3 {
+		t.Fatalf("expected 3 entries left pending, got %d", m.Len())
+	}
+}
+
+// TestMempoolDrainBatchBytesAlwaysDrainsAtLeastOne proves a single
+// transaction that alone exceeds the byte budget still gets drained
+// (Stage 2's MaxTxSize check is what actually rejects a tx too large to
+// ever fit) rather than wedging the queue forever.
+func TestMempoolDrainBatchBytesAlwaysDrainsAtLeastOne(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	big := sizedTx(0, 10_000)
+	if err := m.Submit(big, now); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	batch := m.DrainBatchBytes(0, 10) // budget far smaller than the entry itself
+	if len(batch) != 1 {
+		t.Fatalf("expected the single oversized entry to still be drained, got %d", len(batch))
+	}
+}
+
+// TestMempoolDrainBatchBytesRespectsCountLimit proves maxCount still
+// applies even when the byte budget alone wouldn't have stopped earlier.
+func TestMempoolDrainBatchBytesRespectsCountLimit(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	for i := byte(0); i < 5; i++ {
+		if err := m.Submit(sizedTx(i, 10), now); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+	batch := m.DrainBatchBytes(2, 10_000_000) // huge byte budget, tight count
+	if len(batch) != 2 {
+		t.Fatalf("expected maxCount=2 to cap the batch regardless of byte budget, got %d", len(batch))
 	}
 }

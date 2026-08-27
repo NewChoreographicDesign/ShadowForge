@@ -31,11 +31,6 @@ func main() {
 	interval := flag.Duration("interval", 3*time.Second, "how often to submit a simulated transaction")
 	flag.Parse()
 
-	pk, sk, err := crypto.GenerateDilithiumKey()
-	if err != nil {
-		log.Fatalf("generate wallet signing key: %v", err)
-	}
-
 	h, err := shadownet.NewHost(*listen)
 	if err != nil {
 		log.Fatalf("create libp2p host: %v", err)
@@ -73,7 +68,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := submitRandomVote(ctx, node, pk, sk); err != nil {
+				if err := submitRandomVote(ctx, node); err != nil {
 					log.Printf("submit failed: %v", err)
 				}
 			}
@@ -108,26 +103,75 @@ func waitForAddrFile(ctx context.Context, path string) (string, error) {
 	}
 }
 
-func submitRandomVote(ctx context.Context, node *shadownet.Node, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey) error {
-	var proposalID [8]byte
-	if _, err := rand.Read(proposalID[:]); err != nil {
+// submitRandomVote simulates one real voter session: a fresh, throwaway
+// Dilithium identity (spec's own privacy design — "Wallets create
+// throw-away 'mirror' addresses for each session and burn them afterward",
+// docs/SPEC_SOURCE.md — not just a workaround for "one NFT, one vote"
+// rejecting a reused identity's second ballot) casts a real sealed
+// TxVote ballot via types.ComputeVoteCommitment, then reveals it with a
+// real TxVoteReveal — the same commit-reveal cycle pkg/tx's pipeline
+// actually enforces, exercised here as one full, real ballot instead of
+// an ever-growing pile of instantly-rejected duplicates from one reused
+// identity.
+func submitRandomVote(ctx context.Context, node *shadownet.Node) error {
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		return fmt.Errorf("generate throwaway voter key: %w", err)
+	}
+	voter := types.NFTID(types.SumHash([]byte(pk)))
+
+	var nonceBytes [32]byte
+	if _, err := rand.Read(nonceBytes[:]); err != nil {
 		return err
 	}
-	t := types.ShieldedTx{
+	nonce := types.Hash(nonceBytes)
+	var approveByte [1]byte
+	if _, err := rand.Read(approveByte[:]); err != nil {
+		return err
+	}
+	approve := approveByte[0]%2 == 0
+	commitment := types.ComputeVoteCommitment(voter, approve, nonce)
+
+	commitTx := types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("sim-proposal"),
-			Commitment: types.SumHash(proposalID[:], []byte("commit")),
+			Commitment: commitment,
 		},
-		// Nullifier here carries no double-spend meaning (that check is
-		// Transfer-only) — it's this simulated ballot's per-submission
-		// uniqueifier, so distinct calls produce distinct TxIDs below
-		// instead of every simulated vote colliding on the same hash.
-		Nullifier: types.SumHash(proposalID[:], []byte("nullifier")),
+		// TxID = Hash(proof || commitments || nullifier) per spec 4.1;
+		// VotePublicInputs isn't part of that hash, so without a
+		// per-submission Nullifier here every commit tx would collide on
+		// the same TxID (fields Proof/Commitments are otherwise unset for
+		// Vote kind). commit and reveal need *distinct* nullifiers too —
+		// reusing one would collide the pair's own TxIDs with each other
+		// and have the mempool's TxID-based dedup silently drop the
+		// second one as a duplicate of the first.
+		Nullifier: types.SumHash(nonce[:], []byte("commit")),
 	}
-	// TxID = Hash(proof || commitments || nullifier) per spec 4.1; a Vote
-	// tx carries neither a ZK proof nor commitments, so this reduces to
-	// Hash(nullifier) — still a real, signature-authenticated identity.
+	if err := signAndSend(ctx, node, pk, sk, commitTx); err != nil {
+		return fmt.Errorf("submit ballot commitment: %w", err)
+	}
+	log.Printf("submitted simulated vote commitment for voter %s (approve=%v)", voter, approve)
+
+	revealTx := types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("sim-proposal"),
+			Approve:    approve,
+			Nonce:      nonce,
+		},
+		Nullifier: types.SumHash(nonce[:], []byte("reveal")), // distinct from commitTx's — see its comment
+	}
+	if err := signAndSend(ctx, node, pk, sk, revealTx); err != nil {
+		return fmt.Errorf("submit ballot reveal: %w", err)
+	}
+	log.Printf("submitted simulated vote reveal for voter %s", voter)
+	return nil
+}
+
+// signAndSend computes t's TxID (spec 4.1), signs it with sk, and
+// broadcasts it as a TxOffer.
+func signAndSend(ctx context.Context, node *shadownet.Node, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, t types.ShieldedTx) error {
 	t.TxID = types.ComputeTxID(t.Proof, t.Commitments, t.Nullifier)
 	sig, err := crypto.DilithiumSign(sk, t.TxID[:])
 	if err != nil {
@@ -144,6 +188,5 @@ func submitRandomVote(ctx context.Context, node *shadownet.Node, pk crypto.Dilit
 	for peerID, sendErr := range errs {
 		log.Printf("send to %s failed: %v", peerID, sendErr)
 	}
-	log.Printf("submitted simulated vote tx %s", t.TxID)
 	return nil
 }

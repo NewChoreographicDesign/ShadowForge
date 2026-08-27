@@ -152,7 +152,7 @@ func (n *Node) maybePropose() {
 		return // not our turn to propose
 	}
 
-	entries := n.mempool.DrainBatch(0)
+	entries := n.mempool.DrainBatchBytes(n.cfg.maxBatchSize(), n.cfg.maxBatchBytes())
 	if len(entries) == 0 {
 		return // nothing to propose; avoid empty-block spam
 	}
@@ -200,6 +200,17 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	if !containsID(committee, n.identity) {
 		return // not our job to vote on this height
 	}
+	// Epoch is trusted nowhere else: it's what TallyDueProposals below
+	// uses to decide a proposal is due, so a proposer who could claim any
+	// Epoch could stall a proposal forever (always claim a past epoch) or
+	// force a premature tally (jump it forward). Independently
+	// recomputing and comparing closes that off — the same real-not-
+	// trusted-caller standard every other consensus input in this
+	// package already gets.
+	if wantEpoch := consensus.CurrentEpoch(n.cfg.Genesis, time.Now()); prop.Epoch != wantEpoch {
+		n.log("validator: rejecting proposal at height %d: claimed epoch %d does not match locally computed epoch %d", prop.Height, prop.Epoch, wantEpoch)
+		return
+	}
 
 	// Every mutation of n.rounds, n.tree, or n.store made while processing
 	// a round is serialized under roundMu — real concurrent network
@@ -221,16 +232,44 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	for i, t := range prop.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Epoch: types.EpochNumber(prop.Epoch), Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 
-	for _, res := range results {
-		if res.Error != nil {
-			n.log("validator: rejecting proposal at height %d: tx %s failed the pipeline: %v", prop.Height, res.Tx.TxID, res.Error)
-			txn.Discard()
-			n.tree.TruncateTo(treeSnapshot)
-			return
+	if failed := firstFailure(results); failed != nil {
+		n.log("validator: rejecting proposal at height %d: tx %s failed the pipeline: %v", prop.Height, failed.Tx.TxID, failed.Error)
+		txn.Discard()
+		n.tree.TruncateTo(treeSnapshot)
+		// The whole candidate is discarded — quorum votes on one
+		// deterministic root, so a batch can't be partially included —
+		// but every OTHER transaction in it was individually valid
+		// (pipeline.ProcessBatch checks each independently) and doesn't
+		// deserve to vanish along with the one that wasn't. Reinsert them
+		// so the next round (this height retried, or wherever they end
+		// up getting proposed) gets a chance to include them instead of
+		// silently losing well-formed transactions to one bad apple.
+		reinserted := 0
+		for _, res := range results {
+			if res.Error == nil {
+				if err := n.mempool.Reinsert(res.Tx, time.Now()); err == nil {
+					reinserted++
+				}
+			}
 		}
+		if reinserted > 0 {
+			n.log("validator: returned %d otherwise-valid tx(es) from the rejected proposal to the mempool", reinserted)
+		}
+		return
+	}
+
+	// Real epoch-boundary governance tally (spec 17.4): deterministic
+	// given this batch's own Epoch plus already-committed proposal state,
+	// so every honest node reaches the same outcome — see
+	// Pipeline.TallyDueProposals' own doc for why.
+	if _, err := pipeline.TallyDueProposals(types.EpochNumber(prop.Epoch)); err != nil {
+		n.log("validator: rejecting proposal at height %d: epoch tally failed: %v", prop.Height, err)
+		txn.Discard()
+		n.tree.TruncateTo(treeSnapshot)
+		return
 	}
 
 	stateRoot := n.tree.Root()
@@ -319,6 +358,14 @@ func (n *Node) tryFinalizeLocked(r *round) {
 		r.rollback()
 		n.tree.TruncateTo(r.treeSnapshotLen)
 		delete(n.rounds, r.height)
+		// Same reasoning as sweepTimeouts' timeout path: quorum was
+		// reached, so every tx in this batch already passed the
+		// pipeline — losing them here (rather than giving them another
+		// round to be included in) would be a real, silent loss, not
+		// just a rejected round.
+		for _, t := range r.batch {
+			_ = n.mempool.Reinsert(t, time.Now())
+		}
 		return
 	}
 	if err := r.txn.Commit(); err != nil {
@@ -357,6 +404,16 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	n.roundMu.Lock()
 	defer n.roundMu.Unlock()
 
+	// Re-check staleness now that roundMu is held: the check above ran
+	// before acquiring it, so a concurrent announce for the same height
+	// (a duplicate broadcast, or two committee members finalizing at
+	// nearly the same time) can pass it before either has advanced the
+	// head, then queue up here — this second check catches that case
+	// before wasting a replay on a height already adopted.
+	if height <= n.chn.HeadHeight() {
+		return
+	}
+
 	if r, hadRound := n.rounds[height]; hadRound {
 		// Whatever this node was tentatively tracking for this height is
 		// superseded by the announced block; discard it before replaying.
@@ -373,7 +430,7 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	for i, t := range ann.Block.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Epoch: types.EpochNumber(ann.Block.Epoch), Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 	for _, res := range results {
 		if res.Error != nil {
@@ -382,6 +439,17 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 			n.tree.TruncateTo(treeSnapshot)
 			return
 		}
+	}
+
+	// Same deterministic epoch tally as handleBlockProposal, replayed here
+	// too — otherwise a node that only ever adopts blocks via announce
+	// would silently disagree with the rest of the network about which
+	// proposals have already been tallied.
+	if _, err := pipeline.TallyDueProposals(types.EpochNumber(ann.Block.Epoch)); err != nil {
+		n.log("validator: rejecting announced block at height %d: epoch tally failed: %v", height, err)
+		txn.Discard()
+		n.tree.TruncateTo(treeSnapshot)
+		return
 	}
 
 	stateRoot := n.tree.Root()
@@ -435,4 +503,15 @@ func containsID(ids []types.NFTID, id types.NFTID) bool {
 		}
 	}
 	return false
+}
+
+// firstFailure returns a pointer to the first failing result, or nil if
+// every entry succeeded.
+func firstFailure(results []tx.Result) *tx.Result {
+	for i := range results {
+		if results[i].Error != nil {
+			return &results[i]
+		}
+	}
+	return nil
 }

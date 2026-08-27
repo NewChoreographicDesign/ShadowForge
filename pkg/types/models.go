@@ -29,6 +29,14 @@ const (
 	TxBankWithdraw
 	TxNFTTrait
 	TxContainerSync
+	// TxVoteReveal opens a sealed TxVote ballot at epoch end: Approve and
+	// Nonce, checked against the Commitment the earlier TxVote bound (see
+	// ComputeVoteCommitment) before the choice counts toward a real tally
+	// (spec 17.4's "Votes accumulate as ZKP ballots during the epoch" —
+	// the spec names the commit step but not a reveal mechanism, so this
+	// commit-reveal scheme is this build's own implementation decision,
+	// documented here rather than left unspecified).
+	TxVoteReveal
 )
 
 func (k TxKind) String() string {
@@ -47,6 +55,8 @@ func (k TxKind) String() string {
 		return "NFTTrait"
 	case TxContainerSync:
 		return "ContainerSync"
+	case TxVoteReveal:
+		return "VoteReveal"
 	default:
 		return "Unknown"
 	}
@@ -85,9 +95,10 @@ type ShieldedTx struct {
 	// Public inputs bound per Kind (spec 4.2: "TxKind determines which
 	// extra public inputs the circuit must bind"). Only the fields
 	// relevant to Kind are populated; the rest stay zero.
-	BankPublicInputs  *BankPublicInputs
-	VotePublicInputs  *VotePublicInputs
-	TraitPublicInputs *TraitPublicInputs
+	BankPublicInputs       *BankPublicInputs
+	VotePublicInputs       *VotePublicInputs
+	VoteRevealPublicInputs *VoteRevealPublicInputs
+	TraitPublicInputs      *TraitPublicInputs
 
 	// TransferPublicInputs carries the exact, fixed-shape public inputs
 	// pkg/zk's TransferCircuit was actually proved and must be verified
@@ -121,9 +132,37 @@ type BankPublicInputs struct {
 }
 
 // VotePublicInputs binds a proposal id and a yes/no commitment for Vote kind.
+// Commitment must equal ComputeVoteCommitment(voterNFTID, approve, nonce)
+// for some (approve, nonce) the voter keeps secret until they later reveal
+// it in a TxVoteReveal — a standard sealed-ballot commit-reveal, not a
+// zero-knowledge circuit: the voter's identity is already public (the
+// TxVote's own Dilithium signature reveals who cast it), only the choice
+// stays hidden until reveal.
 type VotePublicInputs struct {
 	ProposalID ID
 	Commitment Hash
+}
+
+// VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce
+// must reproduce the Commitment the voter's earlier TxVote for the same
+// ProposalID bound, via ComputeVoteCommitment.
+type VoteRevealPublicInputs struct {
+	ProposalID ID
+	Approve    bool
+	Nonce      Hash
+}
+
+// ComputeVoteCommitment is this build's canonical sealed-ballot commit
+// formula (see VotePublicInputs' doc: spec 17.4 names the commit step but
+// not a concrete scheme). voter is the caster's NFTID — binding it into
+// the hash ties a commitment to one specific voter, so a reveal can only
+// open the ballot the same voter actually committed, not anyone else's.
+func ComputeVoteCommitment(voter NFTID, approve bool, nonce Hash) Hash {
+	var approveByte [1]byte
+	if approve {
+		approveByte[0] = 1
+	}
+	return SumHash(voter[:], approveByte[:], nonce[:])
 }
 
 // TraitPublicInputs binds the trait key and a delta commitment for NFTTrait

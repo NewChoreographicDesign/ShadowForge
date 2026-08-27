@@ -355,6 +355,32 @@ func TestPipelineExpiredTxRejected(t *testing.T) {
 	}
 }
 
+// TestPipelineOversizedTxRejected proves Stage 2 real-cryptographically
+// rejects a single transaction too large to ever safely fit in a batch
+// (MaxTxSize), rather than deferring it forever to Mempool.DrainBatchBytes
+// (which drains at least one entry no matter its size, precisely so it
+// never wedges the queue — the actual rejection has to happen here).
+func TestPipelineOversizedTxRejected(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	hugeTx := mustSign(t, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-huge"),
+			Commitment: types.Hash{1},
+		},
+		Memo: make([]byte, tx.MaxTxSize+1),
+	})
+	results := p.ProcessBatch([]tx.Entry{{Tx: hugeTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected an oversized transaction to be rejected at stage 2")
+	}
+	se, ok := results[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 2 {
+		t.Fatalf("expected a stage-2 StageError, got %v (%T)", results[0].Error, results[0].Error)
+	}
+}
+
 func TestPipelineBankDepositBufferMismatchRejected(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
@@ -449,6 +475,7 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 			Commitment: types.Hash{1, 2, 3},
 		},
 	})
+	voter1 := types.NFTID(types.SumHash(voteTx.SignerPubKey))
 	results := p.ProcessBatch([]tx.Entry{{Tx: voteTx, SubmittedAt: time.Now()}})
 	if results[0].Error != nil {
 		t.Fatalf("expected vote to succeed: %v", results[0].Error)
@@ -457,11 +484,11 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("expected a proposal record: found=%v err=%v", found, err)
 	}
-	if len(record.Commitments) != 1 || record.Commitments[0] != (types.Hash{1, 2, 3}) {
+	if len(record.Commitments) != 1 || record.Commitments[voter1] != (types.Hash{1, 2, 3}) {
 		t.Fatalf("unexpected proposal commitments: %+v", record.Commitments)
 	}
 
-	// A second ballot on the same proposal accumulates.
+	// A second ballot from a different voter on the same proposal accumulates.
 	voteTx2 := mustSign(t, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
@@ -479,6 +506,212 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 	}
 	if len(record.Commitments) != 2 {
 		t.Fatalf("expected 2 accumulated commitments, got %d", len(record.Commitments))
+	}
+}
+
+// TestPipelineVoteRejectsDoubleVoteFromSameVoter proves "one NFT, one
+// vote" (spec 9.1) is a real, enforced check, not just documented intent.
+func TestPipelineVoteRejectsDoubleVoteFromSameVoter(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	first := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-double"),
+			Commitment: types.Hash{1},
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: first, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("expected the first ballot to succeed: %v", r[0].Error)
+	}
+
+	second := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-double"),
+			Commitment: types.Hash{2},
+		},
+	})
+	r := p.ProcessBatch([]tx.Entry{{Tx: second, SubmittedAt: time.Now()}})
+	if r[0].Error == nil {
+		t.Fatalf("expected a second ballot from the same voter to be rejected")
+	}
+}
+
+// TestPipelineVoteRevealMatchingCommitmentRecordsChoice proves a reveal
+// that genuinely reproduces its earlier commitment (via
+// types.ComputeVoteCommitment, the real formula, not a stand-in) is
+// accepted and recorded, and that reveal is checked cryptographically:
+// the wrong Approve or the wrong Nonce is rejected, not merely logged.
+func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	voter := types.NFTID(types.SumHash([]byte(pk)))
+	nonce := types.Hash{7, 7, 7}
+	commitment := types.ComputeVoteCommitment(voter, true, nonce)
+
+	commitTx := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-reveal"),
+			Commitment: commitment,
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: commitTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("expected the commit to succeed: %v", r[0].Error)
+	}
+
+	// Wrong Approve: same nonce, flipped choice — must not match.
+	wrongApprove := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("proposal-reveal"),
+			Approve:    false,
+			Nonce:      nonce,
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: wrongApprove, SubmittedAt: time.Now()}}); r[0].Error == nil {
+		t.Fatalf("expected a reveal with the wrong Approve to be rejected")
+	}
+
+	// Wrong nonce: correct choice, wrong nonce — must not match either.
+	wrongNonce := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("proposal-reveal"),
+			Approve:    true,
+			Nonce:      types.Hash{9, 9, 9},
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: wrongNonce, SubmittedAt: time.Now()}}); r[0].Error == nil {
+		t.Fatalf("expected a reveal with the wrong nonce to be rejected")
+	}
+
+	// The genuine reveal succeeds and is recorded.
+	reveal := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("proposal-reveal"),
+			Approve:    true,
+			Nonce:      nonce,
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("expected the genuine reveal to succeed: %v", r[0].Error)
+	}
+
+	record, found, err := deps.Store.GetProposal("proposal-reveal")
+	if err != nil || !found {
+		t.Fatalf("expected a proposal record: found=%v err=%v", found, err)
+	}
+	approve, revealed := record.Reveals[voter]
+	if !revealed || !approve {
+		t.Fatalf("expected the voter's Approve=true reveal to be recorded, got revealed=%v approve=%v", revealed, approve)
+	}
+
+	// A second reveal attempt (even a genuine one) is rejected — a voter
+	// only gets to open their ballot once.
+	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal, SubmittedAt: time.Now()}}); r[0].Error == nil {
+		t.Fatalf("expected a second reveal from the same voter to be rejected")
+	}
+}
+
+// TestTallyDueProposalsCountsRevealedBallots proves the epoch-boundary
+// tally (TallyDueProposals) is real: it counts only genuinely revealed
+// ballots via governance.Tally, decides Passed by real majority, persists
+// the outcome, is idempotent (a second call doesn't re-tally or
+// double-count), and leaves a still-open (same-epoch) proposal alone.
+func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
+	deps := newDeps(t)
+	deps.Epoch = 1
+	p := tx.NewPipeline(deps)
+
+	cast := func(approve bool) {
+		pk, sk, err := crypto.GenerateDilithiumKey()
+		if err != nil {
+			t.Fatalf("generate signer key: %v", err)
+		}
+		voter := types.NFTID(types.SumHash([]byte(pk)))
+		nonce := types.Hash{byte(len(pk))}
+		commitment := types.ComputeVoteCommitment(voter, approve, nonce)
+		commitTx := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+			Kind:             types.TxVote,
+			VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("tally-proposal"), Commitment: commitment},
+		})
+		if r := p.ProcessBatch([]tx.Entry{{Tx: commitTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
+			t.Fatalf("commit: %v", r[0].Error)
+		}
+		revealTx := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+			Kind: types.TxVoteReveal,
+			VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+				ProposalID: types.ID("tally-proposal"), Approve: approve, Nonce: nonce,
+			},
+		})
+		if r := p.ProcessBatch([]tx.Entry{{Tx: revealTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
+			t.Fatalf("reveal: %v", r[0].Error)
+		}
+	}
+	cast(true)
+	cast(true)
+	cast(false)
+
+	// Still epoch 1: not due yet.
+	tallied, err := p.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally at same epoch: %v", err)
+	}
+	if len(tallied) != 0 {
+		t.Fatalf("expected no proposals due while still in their own epoch, got %d", len(tallied))
+	}
+
+	// Epoch has moved on: due now.
+	tallied, err = p.TallyDueProposals(2)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 {
+		t.Fatalf("expected exactly 1 proposal tallied, got %d", len(tallied))
+	}
+	if tallied[0].Approve != 2 || tallied[0].Reject != 1 || !tallied[0].Passed {
+		t.Fatalf("unexpected tally result: %+v", tallied[0])
+	}
+
+	record, found, err := deps.Store.GetProposal("tally-proposal")
+	if err != nil || !found {
+		t.Fatalf("expected a persisted proposal record: found=%v err=%v", found, err)
+	}
+	if !record.Tallied || record.Approve != 2 || record.Reject != 1 || !record.Passed {
+		t.Fatalf("unexpected persisted tally: %+v", record)
+	}
+
+	// Idempotent: tallying again must not re-count or change the result.
+	tallied, err = p.TallyDueProposals(3)
+	if err != nil {
+		t.Fatalf("second tally: %v", err)
+	}
+	if len(tallied) != 0 {
+		t.Fatalf("expected an already-tallied proposal to be skipped, got %d", len(tallied))
+	}
+
+	// Voting/revealing on an already-tallied proposal is closed.
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	lateVote := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind:             types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("tally-proposal"), Commitment: types.Hash{1}},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: lateVote, SubmittedAt: time.Now()}}); r[0].Error == nil {
+		t.Fatalf("expected a vote on an already-tallied proposal to be rejected")
 	}
 }
 

@@ -4,6 +4,7 @@
 package tx
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -29,6 +30,11 @@ const TxTTL = 60 * time.Second
 // Sybil attacker submitting from many peer identities at once — without a
 // cap, unbounded Submit calls are a memory-exhaustion DoS vector.
 const DefaultMaxMempoolSize = 100_000
+
+// MaxTxSize caps one transaction's serialized size (checked at pipeline
+// Stage 2), well under Badger's 1MB per-value limit so a single admitted
+// transaction can never alone risk that limit regardless of batching.
+const MaxTxSize = 256 * 1024
 
 // ErrMempoolFull is returned by Submit once MaxSize entries are pending.
 var ErrMempoolFull = errors.New("tx: mempool is full")
@@ -107,6 +113,67 @@ func (m *Mempool) DrainBatch(max int) []Entry {
 	out := make([]Entry, len(batch))
 	copy(out, batch)
 	return out
+}
+
+// DrainBatchBytes removes and returns up to maxCount pending entries,
+// stopping early once their cumulative JSON-marshaled size would exceed
+// maxBytes — a real, size-based bound, not just an entry count. A fixed
+// count can't safely bound total serialized size when per-tx size varies
+// (a real post-quantum Dilithium3 signature+pubkey alone is several KB;
+// a Memo or ZK proof adds more on top), and this build hit exactly that
+// for real: a count-bounded batch of otherwise-ordinary Vote/VoteReveal
+// transactions serialized past Badger's 1MB per-value limit, and the
+// resulting chain.Append failure (with the whole batch reinserted, per
+// tryFinalizeLocked) formed a livelock — the identical oversized batch
+// got rebuilt and re-rejected every round, forever. maxCount<=0 means no
+// count limit (size alone bounds it); maxBytes<=0 means no size limit
+// (count alone bounds it, i.e. behaves like DrainBatch). At least one
+// entry is always drained if any are pending, even if it alone exceeds
+// maxBytes, so a single oversized transaction can't wedge the queue —
+// pipeline Stage 2 (stage2TxOffer) is what rejects a single tx that's
+// unreasonably large on its own.
+func (m *Mempool) DrainBatchBytes(maxCount, maxBytes int) []Entry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sweepSeenLocked(time.Now())
+
+	limit := len(m.pending)
+	if maxCount > 0 && maxCount < limit {
+		limit = maxCount
+	}
+
+	n := 0
+	total := 0
+	for n < limit {
+		size, err := jsonSize(m.pending[n].Tx)
+		if err != nil {
+			// Unmarshalable content shouldn't be possible for a
+			// well-formed ShieldedTx, but if it ever happens, don't let
+			// it silently wedge the batch — include it (Stage 2 will
+			// reject it for real reasons) and keep going.
+			n++
+			continue
+		}
+		if maxBytes > 0 && n > 0 && total+size > maxBytes {
+			break
+		}
+		total += size
+		n++
+	}
+
+	batch := m.pending[:n]
+	m.pending = m.pending[n:]
+	out := make([]Entry, len(batch))
+	copy(out, batch)
+	return out
+}
+
+func jsonSize(t types.ShieldedTx) (int, error) {
+	b, err := json.Marshal(t)
+	if err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (m *Mempool) sweepSeenLocked(now time.Time) {

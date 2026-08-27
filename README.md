@@ -126,6 +126,25 @@ package — this is not a stub with comments describing intended behavior.
   (fee splits, bonus multiplier) implement spec section 19's formulas
   using exact rational arithmetic (`pkg/decimal`, `math/big.Rat`) rather
   than floats, with tests against the spec's own worked examples.
+- **Real fee collection, spike defense, and governance tallying — not
+  just correct logic sitting unused.** A committed Transfer's real,
+  ZK-proven `FeeAmount` is routed into `vault.CollectFee`'s 20/10/10/60
+  split at Stage 5. Every signature-verified transaction is recorded
+  against a real `pkg/silent.RateMonitor` (keyed off the address the
+  signature check just proved genuine, never an unverified claimed
+  pubkey), which auto-establishes a baseline per wallet and places a
+  real, queryable hold the moment a burst is flagged. Vote-kind
+  transactions implement a real sealed-ballot commit-reveal
+  (`types.ComputeVoteCommitment`, a `TxVoteReveal` kind checked
+  cryptographically against the earlier commitment) feeding a real
+  epoch-boundary tally (`Pipeline.TallyDueProposals`) that's
+  deterministic across every honest node and wired into both
+  `pkg/validator`'s propose and announce-replay paths — proven with a
+  test that waits for a genuine wall-clock epoch boundary to arrive
+  before asserting the tally ran. Actual SFG token minting stays
+  unwired: it needs an App-layer proposer-path choice (direct vs.
+  staked) this L1-core build doesn't implement, a real, documented
+  boundary rather than a fabricated mechanism.
 
 ## Security
 

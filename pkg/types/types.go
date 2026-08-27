@@ -79,6 +79,24 @@ func (n NFTID) MarshalJSON() ([]byte, error) { return marshalHexJSON(n[:]) }
 
 func (n *NFTID) UnmarshalJSON(b []byte) error { return unmarshalHexJSON(b, n[:]) }
 
+// MarshalText/UnmarshalText let NFTID serialize as a JSON object key (e.g.
+// state.ProposalRecord's per-voter Commitments/Reveals maps) —
+// encoding/json requires TextMarshaler for map keys, a distinct interface
+// from the MarshalJSON pair above, which only covers NFTID as a value.
+func (n NFTID) MarshalText() ([]byte, error) { return []byte(n.String()), nil }
+
+func (n *NFTID) UnmarshalText(b []byte) error {
+	decoded, err := hex.DecodeString(string(b))
+	if err != nil {
+		return fmt.Errorf("types: decode NFTID hex: %w", err)
+	}
+	if len(decoded) != len(n) {
+		return fmt.Errorf("types: NFTID must be %d bytes, got %d", len(n), len(decoded))
+	}
+	copy(n[:], decoded)
+	return nil
+}
+
 // TxID is Hash(proof || commitments || nullifier) — spec 4.1.
 type TxID = Hash
 

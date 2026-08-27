@@ -43,10 +43,13 @@ func openTestStore(t *testing.T) *state.Store {
 
 // newTestNode builds one real validator.Node: a real libp2p host, a real
 // Badger-backed store, a real chain, and a real Dilithium identity keypair.
-// genesisMs is the chain's genesis timestamp; tests that construct more
-// than one node meant to converge on the same chain must pass the same
-// genesisMs to each, since the genesis block (and therefore every
-// PrevHash-linked block after it) is timestamp-dependent.
+// genesisMs anchors both the chain's genesis block and the epoch clock's
+// Genesis reference (consensus.CurrentEpoch) to the same moment, matching
+// how a real deployment's genesis time is one coherent value, not two.
+// Tests that construct more than one node meant to converge on the same
+// chain must pass the same genesisMs to each, since the genesis block
+// (and therefore every PrevHash-linked block after it) is
+// timestamp-dependent.
 func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Node {
 	t.Helper()
 	h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
@@ -73,7 +76,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		RoundTimeout:      roundTimeout,
 		HeartbeatInterval: consensus.HeartbeatInterval,
 		OnlineTimeout:     time.Minute,
-		Genesis:           consensus.GenesisTime(time.Now().UnixMilli()),
+		Genesis:           consensus.GenesisTime(genesisMs),
 	}
 	return NewNode(cfg, h, nil, store, tree, chn, nil, v, mempool, pk, sk, testLogf(t))
 }
@@ -109,6 +112,13 @@ func mustSignVote(t *testing.T, proposalID string, commitment byte) types.Shield
 			ProposalID: types.ID(proposalID),
 			Commitment: types.Hash{commitment},
 		},
+		// TxID = Hash(proof || commitments || nullifier); none of those
+		// vary with proposalID/commitment for a Vote tx, so every call
+		// would otherwise collide on the same TxID (this is exactly the
+		// bug this build found for real in cmd/walletsim). Nullifier
+		// here is purely this call's uniqueifier, using the fresh
+		// per-call pk as real, non-attacker-chosen entropy.
+		Nullifier: types.SumHash([]byte(pk), []byte(proposalID), []byte{commitment}),
 	}
 	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
 	sig, err := crypto.DilithiumSign(sk, in.TxID[:])
@@ -203,6 +213,144 @@ func TestFullRoundReachesQuorumAndCommits(t *testing.T) {
 	n.roundMu.Unlock()
 	if stillTracked {
 		t.Fatalf("expected the round to be cleaned up after finalization")
+	}
+}
+
+// TestMaybeProposeRespectsMaxBatchSize proves the mempool drain a
+// proposal is built from is genuinely bounded, not "drain everything":
+// unbounded draining combined with rejected batches returning their valid
+// transactions to the mempool (see the next test) lets one recurring bad
+// entry force an ever-larger batch on every retry — this build hit
+// Badger's real 1MB per-value limit doing exactly that under sustained
+// traffic. A bounded drain keeps each attempt's cost, and worst-case
+// serialized block size, bounded regardless of backlog size.
+func TestMaybeProposeRespectsMaxBatchSize(t *testing.T) {
+	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
+	n.cfg.MaxBatchSize = 3
+
+	const submitted = 10
+	for i := 0; i < submitted; i++ {
+		if err := n.mempool.Submit(mustSignVote(t, "proposal-cap", byte(i)), time.Now()); err != nil {
+			t.Fatalf("submit %d: %v", i, err)
+		}
+	}
+
+	height := n.chn.NextHeight()
+	n.maybePropose() // sole online member (self): always its own turn, and quorum of 1 finalizes inline
+
+	if n.chn.HeadHeight() != height {
+		t.Fatalf("expected maybePropose to commit height %d, still at %d", height, n.chn.HeadHeight())
+	}
+	block, found, err := n.store.GetBlock(height)
+	if err != nil || !found {
+		t.Fatalf("expected a persisted block: found=%v err=%v", found, err)
+	}
+	if len(block.Batch) != 3 {
+		t.Fatalf("expected the committed batch to be capped at MaxBatchSize=3, got %d", len(block.Batch))
+	}
+	if got := n.mempool.Len(); got != submitted-3 {
+		t.Fatalf("expected %d entries left in the mempool, got %d", submitted-3, got)
+	}
+}
+
+// TestTryFinalizeReinsertsBatchOnChainAppendFailure proves that even
+// when a round reaches local quorum but chain.Append itself rejects it
+// (this build observed this for real: a stale round finalizing against
+// an already-advanced head), the batch's transactions are still returned
+// to the mempool — matching sweepTimeouts' timeout path — instead of
+// silently vanishing along with the round.
+func TestTryFinalizeReinsertsBatchOnChainAppendFailure(t *testing.T) {
+	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
+	p1, p2, p3 := genPeer(t), genPeer(t), genPeer(t)
+	height := n.chn.NextHeight()
+	committee := registerOnline(n, height, p1, p2, p3)
+
+	// Advance the head past `height` first, via a real, independent round
+	// — so a second round still targeting `height` is now stale.
+	firstTx := mustSignVote(t, "proposal-first", 1)
+	n.handleBlockProposal(shadownet.BlockProposalPayload{
+		Height: height, Proposer: committee[0], Batch: []types.ShieldedTx{firstTx}, Timestamp: time.Now().UnixMilli(),
+	})
+	n.roundMu.Lock()
+	firstRound, ok := n.rounds[height]
+	n.roundMu.Unlock()
+	if !ok {
+		t.Fatalf("expected the first proposal to start a round")
+	}
+	byPeerFirst := map[types.NFTID]peerKey{p1.id: p1, p2.id: p2, p3.id: p3}
+	votedFirst := 0
+	for _, id := range committee {
+		if id == n.identity || votedFirst == 2 {
+			continue
+		}
+		peer, ok := byPeerFirst[id]
+		if !ok {
+			continue
+		}
+		sig, err := crypto.DilithiumSign(peer.sk, firstRound.candidate[:])
+		if err != nil {
+			t.Fatalf("sign vote: %v", err)
+		}
+		n.handleStageVote(shadownet.StageVotePayload{
+			Height: height, Validator: id, CandidateHash: firstRound.candidate, Sig: types.DilithiumSig(sig),
+		})
+		votedFirst++
+	}
+	if n.chn.HeadHeight() != height {
+		t.Fatalf("expected the first round to commit height %d", height)
+	}
+
+	// Build a second, stale round by hand for the same (now-past) height,
+	// with its own real, distinct, valid transaction, and drive it
+	// straight to tryFinalizeLocked — bypassing handleBlockProposal's own
+	// height check, since this test needs the round to exist so
+	// tryFinalizeLocked's own chain.Append call is what fails.
+	staleTx := mustSignVote(t, "proposal-stale", 2)
+	txn := n.store.BeginTxn()
+	entries := []tx.Entry{{Tx: staleTx, SubmittedAt: time.Now()}}
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, Vault: n.vlt, Now: time.Now})
+	if res := pipeline.ProcessBatch(entries); res[0].Error != nil {
+		t.Fatalf("pipeline: %v", res[0].Error)
+	}
+	block := types.Block{Height: height, Epoch: 0, PrevHash: types.Hash{0xFF}, Batch: []types.ShieldedTx{staleTx}}
+	candidate := types.HashBlock(block)
+	sig, err := crypto.DilithiumSign(n.sk, candidate[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	r := &round{
+		height: height, committee: committee, batch: []types.ShieldedTx{staleTx}, txn: txn,
+		block: block, candidate: candidate,
+		votes:    []types.Vote{{Validator: n.identity, StateRoot: candidate, Sig: types.DilithiumSig(sig)}},
+		deadline: time.Now().Add(time.Minute),
+	}
+	byPeer := map[types.NFTID]peerKey{p1.id: p1, p2.id: p2, p3.id: p3}
+	for _, id := range committee {
+		if id == n.identity || len(r.votes) >= 3 {
+			continue
+		}
+		peer, ok := byPeer[id]
+		if !ok {
+			continue
+		}
+		sig, err := crypto.DilithiumSign(peer.sk, candidate[:])
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		r.votes = append(r.votes, types.Vote{Validator: id, StateRoot: candidate, Sig: types.DilithiumSig(sig)})
+	}
+
+	n.roundMu.Lock()
+	n.rounds[height] = r
+	n.tryFinalizeLocked(r)
+	n.roundMu.Unlock()
+
+	if n.mempool.Len() != 1 {
+		t.Fatalf("expected the stale round's transaction to be recovered into the mempool, got %d entries", n.mempool.Len())
+	}
+	recovered := n.mempool.DrainBatch(0)
+	if len(recovered) != 1 || recovered[0].Tx.TxID != staleTx.TxID {
+		t.Fatalf("expected to recover exactly the stale round's tx, got %+v", recovered)
 	}
 }
 
@@ -366,6 +514,53 @@ func TestHandleBlockProposalRejectsInvalidTx(t *testing.T) {
 	}
 }
 
+// TestHandleBlockProposalRecoversValidTxsFromRejectedBatch proves that
+// when one bad transaction sinks an entire proposal (quorum votes on one
+// deterministic candidate root, so a batch can't be partially included),
+// every OTHER, individually-valid transaction in that same batch is
+// returned to the mempool rather than silently lost — a real network
+// running real traffic hits exactly this (two nodes both admit the same
+// legitimately-committed vote into their own separate mempools before
+// gossip settles; whichever proposes second finds it already committed
+// and must reject that one tx without losing the rest of its batch).
+func TestHandleBlockProposalRecoversValidTxsFromRejectedBatch(t *testing.T) {
+	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
+	p1, p2, p3 := genPeer(t), genPeer(t), genPeer(t)
+	height := n.chn.NextHeight()
+	committee := registerOnline(n, height, p1, p2, p3)
+
+	goodTx := mustSignVote(t, "proposal-recover", 1)
+	badTx := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-bad"),
+			Commitment: types.Hash{2},
+		},
+		// No Sig / SignerPubKey: fails Stage 2's real signature check.
+	}
+	prop := shadownet.BlockProposalPayload{
+		Height: height, Proposer: committee[0], Batch: []types.ShieldedTx{goodTx, badTx}, Timestamp: time.Now().UnixMilli(),
+	}
+	n.handleBlockProposal(prop)
+
+	n.roundMu.Lock()
+	_, ok := n.rounds[height]
+	n.roundMu.Unlock()
+	if ok {
+		t.Fatalf("expected no round to be created: the batch as a whole must still be rejected")
+	}
+	if n.chn.HeadHeight() != height-1 {
+		t.Fatalf("chain must not advance for a rejected proposal")
+	}
+	if n.mempool.Len() != 1 {
+		t.Fatalf("expected the valid transaction to be recovered into the mempool, got %d entries", n.mempool.Len())
+	}
+	recovered := n.mempool.DrainBatch(0)
+	if len(recovered) != 1 || recovered[0].Tx.TxID != goodTx.TxID {
+		t.Fatalf("expected to recover exactly the valid tx, got %+v", recovered)
+	}
+}
+
 // TestHandleBlockProposalRejectsWrongProposer proves a proposal claiming to
 // be from someone other than the deterministically-assigned proposer
 // (committee[0]) is rejected outright, regardless of how well-formed its
@@ -507,5 +702,121 @@ func TestHandleBlockAnnounceAdoptsIndependentlyVerifiedBlock(t *testing.T) {
 	}
 	if want := types.HashBlock(block); adopter.chn.HeadHash() != want {
 		t.Fatalf("expected adopter's head hash to equal the announced block's own hash after independent replay: got %s want %s", adopter.chn.HeadHash(), want)
+	}
+}
+
+// signVoteTx signs a fully-formed ShieldedTx with a caller-supplied
+// keypair, for tests that need control over both the signer identity and
+// the tx's Kind/public inputs (mustSignVote only ever builds a TxVote with
+// a fresh random key).
+func signVoteTx(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, in types.ShieldedTx) types.ShieldedTx {
+	t.Helper()
+	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
+	sig, err := crypto.DilithiumSign(sk, in.TxID[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	in.Sig = types.DilithiumSig(sig)
+	in.SignerPubKey = []byte(pk)
+	return in
+}
+
+// TestEpochBoundaryTallyRunsOnRealProposal proves the epoch-boundary
+// governance tally (spec 17.4) is wired for real into the block-commit
+// path, driven by genuine wall-clock epoch progression (consensus.
+// CurrentEpoch), not a fabricated or injectable clock: a ballot committed
+// and revealed in epoch 0 is untallied until a block genuinely lands in
+// epoch 1, at which point handleBlockProposal's real
+// pipeline.TallyDueProposals call tallies it — and the independent Epoch
+// reverification added alongside this (guarding against a proposer
+// claiming an arbitrary epoch) does not itself block a genuinely
+// epoch-appropriate proposal.
+func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
+	// genesisMs is chosen so epoch 0 (a fixed 1 hour) has just a few
+	// seconds left to run when the test starts, so the real epoch
+	// boundary arrives quickly instead of requiring an actual hour-long
+	// wait. The margin is generous (not e.g. 300ms) because this must
+	// still hold under a loaded `go test ./...` run competing with other
+	// packages' tests for CPU, not just in isolation.
+	const epoch0Remaining = 3 * time.Second
+	genesisMs := time.Now().Add(-(time.Hour - epoch0Remaining)).UnixMilli()
+	n := newTestNode(t, time.Minute, genesisMs)
+
+	if got := consensus.CurrentEpoch(n.cfg.Genesis, time.Now()); got != 0 {
+		t.Fatalf("expected the test to start in epoch 0, got %d", got)
+	}
+
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate voter key: %v", err)
+	}
+	voter := types.NFTID(types.SumHash(pk))
+	nonce := types.Hash{5}
+	commitment := types.ComputeVoteCommitment(voter, true, nonce)
+	commitTx := signVoteTx(t, pk, sk, types.ShieldedTx{
+		Kind:             types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("epoch-tally-proposal"), Commitment: commitment},
+	})
+	revealTx := signVoteTx(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("epoch-tally-proposal"), Approve: true, Nonce: nonce,
+		},
+	})
+
+	height1 := n.chn.NextHeight()
+	n.handleBlockProposal(shadownet.BlockProposalPayload{
+		Height: height1, Epoch: 0, Proposer: n.identity,
+		Batch: []types.ShieldedTx{commitTx, revealTx}, Timestamp: time.Now().UnixMilli(),
+	})
+	if n.chn.HeadHeight() != height1 {
+		t.Fatalf("expected the epoch-0 commit+reveal block to commit, head at %d", n.chn.HeadHeight())
+	}
+	record, found, err := n.store.GetProposal("epoch-tally-proposal")
+	if err != nil || !found {
+		t.Fatalf("expected a persisted proposal record: found=%v err=%v", found, err)
+	}
+	if record.Tallied {
+		t.Fatalf("must not be tallied yet: still in the proposal's own epoch")
+	}
+
+	// Wait for the real epoch boundary to actually pass.
+	deadline := time.Now().Add(15 * time.Second)
+	for consensus.CurrentEpoch(n.cfg.Genesis, time.Now()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("epoch never advanced to 1 within the deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Any further block, now genuinely proposed in epoch 1, triggers the
+	// tally for the epoch-0 proposal as a side effect of being committed.
+	dummyPK, dummySK, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate second signer key: %v", err)
+	}
+	dummyTx := signVoteTx(t, dummyPK, dummySK, types.ShieldedTx{
+		Kind:             types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("unrelated-proposal"), Commitment: types.Hash{9}},
+	})
+	nowEpoch := consensus.CurrentEpoch(n.cfg.Genesis, time.Now())
+	height2 := n.chn.NextHeight()
+	n.handleBlockProposal(shadownet.BlockProposalPayload{
+		Height: height2, Epoch: nowEpoch, Proposer: n.identity,
+		Batch: []types.ShieldedTx{dummyTx}, Timestamp: time.Now().UnixMilli(),
+	})
+	if n.chn.HeadHeight() != height2 {
+		t.Fatalf("expected the epoch-1 block to commit (epoch reverification must not block a genuinely current epoch), head at %d", n.chn.HeadHeight())
+	}
+
+	record, found, err = n.store.GetProposal("epoch-tally-proposal")
+	if err != nil || !found {
+		t.Fatalf("get proposal: found=%v err=%v", found, err)
+	}
+	if !record.Tallied {
+		t.Fatalf("expected the epoch-0 proposal to be tallied once a block genuinely landed in epoch 1")
+	}
+	if record.Approve != 1 || record.Reject != 0 || !record.Passed {
+		t.Fatalf("unexpected tally result: %+v", record)
 	}
 }

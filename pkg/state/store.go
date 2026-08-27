@@ -49,6 +49,8 @@ type Accessor interface {
 	GetHold(id types.Hash) (types.BankHold, bool, error)
 	PutProposal(p ProposalRecord) error
 	GetProposal(id string) (ProposalRecord, bool, error)
+	ListProposals() ([]ProposalRecord, error)
+	CountNFTs() (int, error)
 	PutContainerRoot(containerID string, root types.Hash) error
 	GetContainerRoot(containerID string) (types.Hash, bool, error)
 }
@@ -117,6 +119,18 @@ func getJSON(txn *badger.Txn, prefix []byte, id string, v interface{}) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+// countPrefix returns how many keys carry the given prefix, without
+// unmarshaling their values.
+func countPrefix(txn *badger.Txn, prefix []byte) (int, error) {
+	it := txn.NewIterator(badger.IteratorOptions{Prefix: prefix})
+	defer it.Close()
+	n := 0
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		n++
+	}
+	return n, nil
 }
 
 // --- Notes (encrypted). Only *Store exposes these: notes are written by a
@@ -243,11 +257,37 @@ func (s *Store) GetHold(id types.Hash) (types.BankHold, bool, error) {
 	return hold, found, err
 }
 
-// --- Proposals (vote commitments) ---
+// --- Proposals (sealed-ballot vote commitments + reveals + tally) ---
 
+// ProposalRecord tracks one proposal's ballots and, once tallied, its
+// outcome. Commitments/Reveals are keyed by voter NFTID (one NFT, one
+// vote — spec 9.1): a second TxVote from the same voter is rejected as
+// already-committed rather than silently overwriting the first, and a
+// reveal can only ever open the exact ballot that voter committed (see
+// types.ComputeVoteCommitment).
+//
+// Epoch is stamped from whichever transaction first references this
+// ProposalID (a TxVote's commit, in practice — this build has no
+// separate "open a proposal" transaction kind); it's what a real
+// epoch-boundary tally (pkg/validator) uses to decide a proposal is due.
 type ProposalRecord struct {
 	ProposalID  string
-	Commitments []types.Hash
+	Epoch       types.EpochNumber
+	Commitments map[types.NFTID]types.Hash
+	Reveals     map[types.NFTID]bool
+
+	// Tallied/Approve/Reject/Passed are populated once, by the
+	// epoch-boundary tally that runs when a committed block's Epoch
+	// moves past this proposal's own Epoch. Turnout isn't recorded here:
+	// this build has no enumeration of "eligible" (i.e. entitled to vote)
+	// NFTs distinct from CountNFTs' total minted count, so a turnout
+	// fraction would either double as an eligible-count or be fabricated;
+	// Approve/Reject/Passed (simple majority, spec 17.4 names no turnout
+	// floor) are real and complete without it.
+	Tallied bool
+	Approve int
+	Reject  int
+	Passed  bool
 }
 
 func (s *Store) PutProposal(p ProposalRecord) error {
@@ -263,6 +303,42 @@ func (s *Store) GetProposal(id string) (ProposalRecord, bool, error) {
 		return err
 	})
 	return p, found, err
+}
+
+// listProposals unmarshals every record under prefixProposal.
+func listProposals(txn *badger.Txn) ([]ProposalRecord, error) {
+	it := txn.NewIterator(badger.IteratorOptions{Prefix: prefixProposal})
+	defer it.Close()
+	var out []ProposalRecord
+	for it.Seek(prefixProposal); it.ValidForPrefix(prefixProposal); it.Next() {
+		var p ProposalRecord
+		if err := it.Item().Value(func(val []byte) error { return json.Unmarshal(val, &p) }); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (s *Store) ListProposals() ([]ProposalRecord, error) {
+	var out []ProposalRecord
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		out, err = listProposals(txn)
+		return err
+	})
+	return out, err
+}
+
+// CountNFTs returns how many ValidatorNFTs have ever been minted.
+func (s *Store) CountNFTs() (int, error) {
+	var n int
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		n, err = countPrefix(txn, prefixNFT)
+		return err
+	})
+	return n, err
 }
 
 // --- Containers (subspace roots) ---
