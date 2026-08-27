@@ -4,9 +4,12 @@
 package nft
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
@@ -16,27 +19,136 @@ var (
 	ErrProofOfHumanityRequired = errors.New("nft: proof-of-humanity / CAPTCHA challenge not passed")
 	ErrTransferDisabled        = errors.New("nft: soulbound transfer is disabled until governance unlocks it")
 	ErrNFTSlashed              = errors.New("nft: NFT is slashed and cannot act as a validator")
+
+	// ErrAttestationMismatch means a PoHAttestation was presented for a
+	// different owner or a different mint attempt (Nonce) than the one it
+	// was bound to at signing time — never a generic "not passed" failure,
+	// since the attestation itself may be a perfectly genuine one, just
+	// for the wrong mint.
+	ErrAttestationMismatch = errors.New("nft: proof-of-humanity attestation does not match this mint (owner/nonce mismatch)")
+	// ErrUntrustedAttestor means the attestation's signer is not in the
+	// caller-supplied trusted attestor set — a real signature that simply
+	// isn't from anyone this chain currently recognizes.
+	ErrUntrustedAttestor = errors.New("nft: proof-of-humanity attestation signed by an untrusted attestor")
+	// ErrAttestationExpired means the attestation's IssuedAtMs falls
+	// outside PoHAttestationTTL of Now — a genuine, correctly-signed
+	// attestation that has simply aged out, so it can't be replayed
+	// indefinitely against a later mint attempt.
+	ErrAttestationExpired = errors.New("nft: proof-of-humanity attestation has expired")
 )
+
+// PoHAttestationTTL bounds how long after issuance a PoHAttestation may
+// still be used for a mint — long enough for the App/wallet-UI's
+// CAPTCHA-and-challenge flow (spec 10.1) to hand off to an on-chain mint
+// call, short enough that a captured attestation can't be replayed
+// indefinitely against a different mint attempt later on.
+const PoHAttestationTTL = 15 * time.Minute
+
+// PoHAttestation is a real, signed claim from a trusted attestor that Owner
+// passed a proof-of-humanity/CAPTCHA challenge (spec 10.1: "Mint UI
+// presents CAPTCHA and a proof-of-humanity challenge"). Running the actual
+// challenge is the App/wallet-UI layer's job, explicitly out of this L1
+// core's scope per spec; this package's job is to verify a real
+// cryptographic signature over that claim — matching the codebase's
+// universal "never trust a bare flag, verify a real Dilithium signature"
+// pattern (pkg/crypto.DilithiumVerify, used identically for tx signatures,
+// stage votes, and block proposals) — rather than trusting a caller-supplied
+// bool the way this package used to.
+type PoHAttestation struct {
+	Owner      types.Address
+	Nonce      uint64 // must equal MintParams.Nonce: binds this attestation to one specific mint attempt
+	IssuedAtMs int64
+	Attestor   crypto.DilithiumPublicKey
+	Sig        crypto.DilithiumSignature
+}
+
+// poHAttestationMessage is the exact hash a PoHAttestation.Sig must cover —
+// Owner and Nonce bind it to one mint attempt (so a captured attestation
+// can't be replayed against a different wallet or a different mint attempt
+// by the same wallet), IssuedAtMs anchors PoHAttestationTTL.
+func poHAttestationMessage(owner types.Address, nonce uint64, issuedAtMs int64) types.Hash {
+	var nonceBytes, tsBytes [8]byte
+	binary.LittleEndian.PutUint64(nonceBytes[:], nonce)
+	binary.LittleEndian.PutUint64(tsBytes[:], uint64(issuedAtMs))
+	return types.SumHash(owner[:], nonceBytes[:], tsBytes[:])
+}
+
+// SignPoHAttestation builds and signs a real PoHAttestation with the
+// attestor's Dilithium keypair — the App/wallet-UI-layer attestor service's
+// side of the protocol, used directly by tests and by any real attestor
+// implementation.
+func SignPoHAttestation(attestorPK crypto.DilithiumPublicKey, attestorSK crypto.DilithiumPrivateKey, owner types.Address, nonce uint64, issuedAtMs int64) (PoHAttestation, error) {
+	msg := poHAttestationMessage(owner, nonce, issuedAtMs)
+	sig, err := crypto.DilithiumSign(attestorSK, msg[:])
+	if err != nil {
+		return PoHAttestation{}, fmt.Errorf("nft: sign proof-of-humanity attestation: %w", err)
+	}
+	return PoHAttestation{Owner: owner, Nonce: nonce, IssuedAtMs: issuedAtMs, Attestor: attestorPK, Sig: sig}, nil
+}
+
+// verify checks att is a genuine, fresh, trusted-attestor signature bound
+// to (owner, nonce) — the real check that replaces a bare
+// ProofOfHumanityPassed bool.
+func (att PoHAttestation) verify(owner types.Address, nonce uint64, now time.Time, trustedAttestors []crypto.DilithiumPublicKey) error {
+	if att.Owner != owner || att.Nonce != nonce {
+		return ErrAttestationMismatch
+	}
+	trusted := false
+	for _, a := range trustedAttestors {
+		if string(a) == string(att.Attestor) {
+			trusted = true
+			break
+		}
+	}
+	if !trusted {
+		return ErrUntrustedAttestor
+	}
+	msg := poHAttestationMessage(att.Owner, att.Nonce, att.IssuedAtMs)
+	ok, err := crypto.DilithiumVerify(att.Attestor, msg[:], att.Sig)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrProofOfHumanityRequired, err)
+	}
+	if !ok {
+		return ErrProofOfHumanityRequired
+	}
+	issuedAt := time.UnixMilli(att.IssuedAtMs)
+	age := now.Sub(issuedAt)
+	if age < 0 || age > PoHAttestationTTL {
+		return ErrAttestationExpired
+	}
+	return nil
+}
 
 // MintParams are the inputs to a free mint (spec 10.1: "User requests a
 // micro-drop of SFG... Mint UI presents CAPTCHA and a proof-of-humanity
 // challenge... Contract enforces one NFT per wallet").
 type MintParams struct {
-	Owner                 types.Address
-	AlreadyHasNFT         bool
-	ProofOfHumanityPassed bool
-	MintedAt              types.BlockHeight
-	Nonce                 uint64 // caller-supplied uniqueness salt (e.g. tx counter)
+	Owner         types.Address
+	AlreadyHasNFT bool
+	// Attestation is the real, signed proof-of-humanity claim (replacing
+	// the previous bare ProofOfHumanityPassed bool). It must be signed by
+	// one of the caller-supplied TrustedAttestors, bound to this exact
+	// Owner/Nonce, and fresh (within PoHAttestationTTL of Now).
+	Attestation PoHAttestation
+	// TrustedAttestors is the currently-recognized attestor public key
+	// set — a governance-configured value the caller supplies, mirroring
+	// how pkg/chain.PubKeyLookup and pkg/oracle.Quorum's sources are
+	// caller-supplied rather than hardcoded here.
+	TrustedAttestors []crypto.DilithiumPublicKey
+	MintedAt         types.BlockHeight
+	Now              time.Time
+	Nonce            uint64 // caller-supplied uniqueness salt (e.g. tx counter); must match Attestation.Nonce
 }
 
-// Mint enforces the one-per-wallet and proof-of-humanity gates and returns
-// a fresh soulbound NFT with an empty trait map and zero Trust Points.
+// Mint enforces the one-per-wallet gate and a real, verified
+// proof-of-humanity attestation (spec 10.1), and returns a fresh soulbound
+// NFT with an empty trait map and zero Trust Points.
 func Mint(p MintParams) (types.ValidatorNFT, error) {
 	if p.AlreadyHasNFT {
 		return types.ValidatorNFT{}, ErrAlreadyMinted
 	}
-	if !p.ProofOfHumanityPassed {
-		return types.ValidatorNFT{}, ErrProofOfHumanityRequired
+	if err := p.Attestation.verify(p.Owner, p.Nonce, p.Now, p.TrustedAttestors); err != nil {
+		return types.ValidatorNFT{}, err
 	}
 	var nonceBytes [8]byte
 	for i := 0; i < 8; i++ {
