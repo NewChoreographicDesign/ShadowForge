@@ -1,0 +1,80 @@
+# CI per spec 18.1: "CI: go test ./..., golangci-lint, antlr generation
+# check, Docker multi-node smoke."
+name: CI
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  pull_request:
+
+jobs:
+  build-vet-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet (parser/ is ANTLR-generated; see docs/ARCHITECTURE.md)
+        run: go vet $(go list ./... | grep -v '/parser$')
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: Test (race detector, no cache)
+        run: go test -race ./... -count=1 -timeout 600s
+
+  antlr-generation-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download ANTLR 4.13.1
+        run: curl -sSL -o /tmp/antlr.jar https://repo1.maven.org/maven2/org/antlr/antlr4/4.13.1/antlr4-4.13.1-complete.jar
+
+      - name: Regenerate the parser from grammar/ and diff against committed output
+        run: |
+          rm -rf /tmp/parser_check
+          java -jar /tmp/antlr.jar -Dlanguage=Go -visitor -package parser -o /tmp/parser_check grammar/ShadowRustExt.g4
+          if ! diff -rq parser/ /tmp/parser_check/grammar/ \
+              --exclude="*.interp" --exclude="*.tokens"; then
+            echo "::error::Committed parser/ does not match a fresh ANTLR generation from grammar/ShadowRustExt.g4 — regenerate (see grammar/README section in docs/ARCHITECTURE.md) and commit the result."
+            exit 1
+          fi
+
+  docker-multi-node-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and start the four-node network
+        run: docker compose -f deployments/docker/docker-compose.yml up --build -d
+
+      - name: Wait for the network to bootstrap and exchange traffic
+        run: sleep 15
+
+      - name: Show logs (manual inspection + smoke evidence in CI output)
+        run: docker compose -f deployments/docker/docker-compose.yml logs
+
+      - name: Every service must still be running (none crashed)
+        run: |
+          down=$(docker compose -f deployments/docker/docker-compose.yml ps --status exited --status dead -q)
+          if [ -n "$down" ]; then
+            echo "::error::One or more services exited unexpectedly"
+            docker compose -f deployments/docker/docker-compose.yml ps
+            exit 1
+          fi
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deployments/docker/docker-compose.yml down -v

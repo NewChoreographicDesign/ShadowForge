@@ -86,17 +86,50 @@ package — this is not a stub with comments describing intended behavior.
   real Noise XX handshake between them, and exchanges an encrypted,
   decoded application message — proven in `pkg/net/net_test.go` with two
   live hosts, not mocks.
-- **A real five-stage pipeline with atomicity.** `pkg/tx` runs every
-  transaction through Sender Leave → TX Offer → Receiver Check → Send Exec
-  → Place Final (spec 5.3), verifying the actual ZK proof at Stage 1 and
-  releasing its nullifier reservation if any later stage fails — tested
-  with a real proof, a forced Stage 2 failure, and a check that the
-  nullifier was released, not stuck.
+- **A real five-stage pipeline with atomicity and real signatures.**
+  `pkg/tx` runs every transaction through Sender Leave → TX Offer →
+  Receiver Check → Send Exec → Place Final (spec 5.3), verifying the
+  actual ZK proof and a real Dilithium signature (over a TxID that must
+  itself match `Hash(proof||commitments||nullifier)`, spec 4.1) at
+  Stage 1/2, and releasing its nullifier reservation if any later stage
+  fails — tested with a real proof, a tampered signature, a tampered
+  TxID, and a forced later-stage failure with a check that the nullifier
+  was released, not stuck.
 - **Exact formulas.** `pkg/consensus` (epoch duration, revolver
   insert), `pkg/bank` (deposit/withdraw ATR math), and `pkg/vault`
   (fee splits, bonus multiplier) implement spec section 19's formulas
   using exact rational arithmetic (`pkg/decimal`, `math/big.Rat`) rather
   than floats, with tests against the spec's own worked examples.
+
+## Security
+
+A manual review against spec 8.6's STRIDE threat model found and fixed
+three real, exploitable gaps rather than being a formality:
+
+1. **Spoofing/Tampering.** Stage 2 originally only checked that a
+   signature byte string was non-empty — never that it actually verified.
+   Fixed: every transaction's TxID must match
+   `Hash(proof || commitments || nullifier)` (spec 4.1) and its Dilithium
+   signature must verify against the claimed signer key before Stage 2
+   admits it (`pkg/tx/pipeline.go`, `pkg/types.ComputeTxID`).
+2. **Denial of service.** `pkg/net`'s stream handler had no per-message
+   size cap and no idle timeout (a peer could stream unbounded data, or
+   open a stream and hold a goroutine open forever by sending nothing).
+   `pkg/tx.Mempool` had no capacity cap (a Sybil flood across many peer
+   identities could exhaust memory even with per-peer rate limiting).
+   Both are now bounded, with tests proving the bound actually holds.
+3. **A completeness gap the review surfaced**: Kind Vote transactions
+   passed all five stages but had no Stage 4 effect — cast ballots were
+   silently discarded. Fixed by persisting each ballot's commitment
+   against its proposal (`state.ProposalRecord`); tallying still
+   correctly happens at epoch end, not per-transaction (spec 17.4).
+
+No secrets are logged; encryption keys use `crypto/rand`, never
+`math/rand`; AEAD nonces are fresh per call. See `docs/ARCHITECTURE.md`
+for what's still required before a real deployment (a production ZK
+trusted-setup ceremony, live cross-process BFT vote exchange, and the
+spec 18.6 hardening phase in full — this is a tested reference
+implementation, not an audited production system).
 
 ## Repository layout
 
