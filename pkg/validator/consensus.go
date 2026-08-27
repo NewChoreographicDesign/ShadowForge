@@ -232,7 +232,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	for i, t := range prop.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Epoch: types.EpochNumber(prop.Epoch), Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Epoch: types.EpochNumber(prop.Epoch), Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 
 	if failed := firstFailure(results); failed != nil {
@@ -430,7 +430,7 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	for i, t := range ann.Block.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Epoch: types.EpochNumber(ann.Block.Epoch), Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Epoch: types.EpochNumber(ann.Block.Epoch), Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 	for _, res := range results {
 		if res.Error != nil {

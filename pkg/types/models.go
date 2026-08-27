@@ -124,8 +124,13 @@ type TransferPublicInputs struct {
 }
 
 // BankPublicInputs binds oracle price, ATR, and buffer for BankDeposit /
-// BankWithdraw kinds.
+// BankWithdraw kinds. Asset identifies which external asset (e.g. BTC, ETH)
+// OraclePriceUSD/ATRUSD claim to price — the pipeline's Stage 4 needs it to
+// know which real oracle.Quorum reading to cross-check the claim against;
+// the zero value is only valid when no oracle is wired (Deps.Oracle == nil),
+// which existing single-asset tests rely on.
 type BankPublicInputs struct {
+	Asset          AssetID
 	OraclePriceUSD decimal.Decimal
 	ATRUSD         decimal.Decimal
 	BufferUSD      decimal.Decimal

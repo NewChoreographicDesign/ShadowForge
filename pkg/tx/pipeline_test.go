@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/bank"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
@@ -417,6 +419,136 @@ func TestPipelineBankDepositCorrectBufferAccepted(t *testing.T) {
 	if results[0].Error != nil {
 		t.Fatalf("expected correct buffer to be accepted, got %v", results[0].Error)
 	}
+}
+
+// bankDepositTx builds a self-consistent (buffer = 2.5*ATR) signed
+// BankDeposit tx claiming the given price/ATR for asset, so oracle-check
+// tests exercise Stage 4's oracle cross-check in isolation from its
+// separate internal buffer-consistency check.
+func bankDepositTx(t *testing.T, asset types.AssetID, priceUSD, atrUSD string) types.ShieldedTx {
+	t.Helper()
+	price := decimal.MustFromString(priceUSD)
+	atr := decimal.MustFromString(atrUSD)
+	return mustSign(t, types.ShieldedTx{
+		Kind: types.TxBankDeposit,
+		BankPublicInputs: &types.BankPublicInputs{
+			Asset:          asset,
+			OraclePriceUSD: price,
+			ATRUSD:         atr,
+			BufferUSD:      bank.DepositATRMultiple.Mul(atr),
+		},
+	})
+}
+
+func TestPipelineBankDepositWithinOracleToleranceAccepted(t *testing.T) {
+	deps := newDeps(t)
+	deps.Oracle = oracle.NewQuorum(decimal.MustFromString("0.05"), oracle.StaticSource{
+		Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")},
+	})
+	p := tx.NewPipeline(deps)
+	// 1% off the real 60000/2000 reading, within the default 2% tolerance.
+	bankTx := bankDepositTx(t, types.AssetBTC, "60500", "2010")
+	results := p.ProcessBatch([]tx.Entry{{Tx: bankTx, SubmittedAt: time.Now()}})
+	if results[0].Error != nil {
+		t.Fatalf("expected a within-tolerance claimed price to be accepted, got %v", results[0].Error)
+	}
+}
+
+func TestPipelineBankDepositBeyondOracleToleranceRejected(t *testing.T) {
+	deps := newDeps(t)
+	deps.Oracle = oracle.NewQuorum(decimal.MustFromString("0.05"), oracle.StaticSource{
+		Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")},
+	})
+	p := tx.NewPipeline(deps)
+	// Claims a price 10x the real oracle reading — exactly the exploit
+	// this wiring closes: internally self-consistent (buffer = 2.5*ATR)
+	// but not tied to reality at all.
+	bankTx := bankDepositTx(t, types.AssetBTC, "600000", "20000")
+	results := p.ProcessBatch([]tx.Entry{{Tx: bankTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a claimed price wildly diverging from the real oracle reading to be rejected")
+	}
+	se, ok := results[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 4 {
+		t.Fatalf("expected a stage-4 StageError, got %v", results[0].Error)
+	}
+}
+
+func TestPipelineBankDepositFrozenOnOracleDisagreement(t *testing.T) {
+	deps := newDeps(t)
+	// Two sources that disagree far beyond the quorum's own bound: Quote
+	// itself returns ErrDisagreement, simulating spec 11.3's freeze
+	// condition — a real, live disagreement between independent feeds,
+	// not a single feed simply being unreachable.
+	deps.Oracle = oracle.NewQuorum(decimal.MustFromString("0.02"),
+		oracle.StaticSource{Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")}},
+		oracle.StaticSource{Value: oracle.Quote{PriceUSD: decimal.MustFromString("90000"), ATRUSD: decimal.MustFromString("2000")}},
+	)
+	p := tx.NewPipeline(deps)
+	bankTx := bankDepositTx(t, types.AssetBTC, "60000", "2000")
+	results := p.ProcessBatch([]tx.Entry{{Tx: bankTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a new deposit to be frozen while the oracle quorum disagrees (spec 11.3)")
+	}
+}
+
+func TestPipelineBankWithdrawUsesLastGoodOnOracleDisagreement(t *testing.T) {
+	deps := newDeps(t)
+	agree := oracle.StaticSource{Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")}}
+	// A source whose Quote call itself can be toggled from agreeing to
+	// disagreeing between the two ProcessBatch calls below, so the same
+	// Quorum instance both records a real last-good snapshot and then
+	// genuinely disagrees.
+	toggle := &toggleSource{agree: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")}}
+	q := oracle.NewQuorum(decimal.MustFromString("0.02"), agree, toggle)
+	deps.Oracle = q
+	p := tx.NewPipeline(deps)
+
+	// First: sources agree, priming Quorum's LastGood snapshot for BTC.
+	seed := bankDepositTx(t, types.AssetBTC, "60000", "2000")
+	if res := p.ProcessBatch([]tx.Entry{{Tx: seed, SubmittedAt: time.Now()}}); res[0].Error != nil {
+		t.Fatalf("expected the seeding deposit to be accepted, got %v", res[0].Error)
+	}
+
+	// Now the sources disagree wildly. A new deposit must be frozen...
+	toggle.disagree = true
+	depositTx := bankDepositTx(t, types.AssetBTC, "60000", "2000")
+	if res := p.ProcessBatch([]tx.Entry{{Tx: depositTx, SubmittedAt: time.Now()}}); res[0].Error == nil {
+		t.Fatalf("expected a new deposit to be frozen during disagreement")
+	}
+
+	// ...but a withdrawal pricing against the same pre-disagreement figures
+	// must still be accepted via LastGood (spec 11.3: "use last-good
+	// snapshots for open holds").
+	atr := decimal.MustFromString("2000")
+	withdrawTx := mustSign(t, types.ShieldedTx{
+		Kind: types.TxBankWithdraw,
+		BankPublicInputs: &types.BankPublicInputs{
+			Asset:          types.AssetBTC,
+			OraclePriceUSD: decimal.MustFromString("60000"),
+			ATRUSD:         atr,
+			BufferUSD:      bank.WithdrawATRMultiple.Mul(atr),
+		},
+	})
+	if res := p.ProcessBatch([]tx.Entry{{Tx: withdrawTx, SubmittedAt: time.Now()}}); res[0].Error != nil {
+		t.Fatalf("expected a withdrawal to fall back to the last-good oracle snapshot during disagreement, got %v", res[0].Error)
+	}
+}
+
+// toggleSource lets a test flip one Source from agreeing with another
+// StaticSource to disagreeing with it, so the same oracle.Quorum can be
+// driven through both a real agreement (priming LastGood) and a real
+// disagreement (ErrDisagreement) without rebuilding it.
+type toggleSource struct {
+	agree    oracle.Quote
+	disagree bool
+}
+
+func (s *toggleSource) Quote(types.AssetID) (oracle.Quote, error) {
+	if s.disagree {
+		return oracle.Quote{PriceUSD: decimal.MustFromString("999999"), ATRUSD: decimal.MustFromString("999999")}, nil
+	}
+	return s.agree, nil
 }
 
 func TestPipelineContainerSyncShadowMismatchBlocksCommit(t *testing.T) {

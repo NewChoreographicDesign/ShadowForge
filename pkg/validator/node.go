@@ -37,6 +37,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
+	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
@@ -142,6 +143,12 @@ type Node struct {
 	zkSys   *zk.System
 	vlt     *vault.Vault
 	chn     *chain.Chain
+	// oracleQuorum is the real quorum-verified price/ATR feed the pipeline
+	// cross-checks BankDeposit/BankWithdraw claims against (spec 11.3). Nil
+	// disables the cross-check entirely (e.g. a local test network with no
+	// real oracle configured) — see tx.Deps.Oracle's own doc for what that
+	// means concretely.
+	oracleQuorum *oracle.Quorum
 	// silentMon is spec 15.4's per-wallet rate monitor. Constructed
 	// internally (not a NewNode parameter) since it's this node's own
 	// runtime defense state, not an external dependency a caller owns —
@@ -177,25 +184,26 @@ type Node struct {
 // keypair; the node's consensus identity (types.NFTID) is derived from the
 // public key (types.NFTID(types.SumHash(pk))) — a genuine cryptographic
 // binding, not an arbitrary label.
-func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, logf Logf) *Node {
+func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, logf Logf) *Node {
 	if logf == nil {
 		logf = log.Printf
 	}
 	n := &Node{
-		cfg:       cfg,
-		mempool:   mempool,
-		store:     store,
-		tree:      tree,
-		zkSys:     zkSys,
-		vlt:       vlt,
-		chn:       chn,
-		silentMon: silent.NewRateMonitor(),
-		identity:  types.NFTID(types.SumHash(pk)),
-		pk:        pk,
-		sk:        sk,
-		log:       logf,
-		online:    map[types.NFTID]onlineInfo{},
-		rounds:    map[uint64]*round{},
+		cfg:          cfg,
+		mempool:      mempool,
+		store:        store,
+		tree:         tree,
+		zkSys:        zkSys,
+		vlt:          vlt,
+		chn:          chn,
+		oracleQuorum: oracleQuorum,
+		silentMon:    silent.NewRateMonitor(),
+		identity:     types.NFTID(types.SumHash(pk)),
+		pk:           pk,
+		sk:           sk,
+		log:          logf,
+		online:       map[types.NFTID]onlineInfo{},
+		rounds:       map[uint64]*round{},
 	}
 	n.net = shadownet.NewNode(h, limiter, n.handleMessage)
 	n.recordOnline(n.identity, pk, time.Now())

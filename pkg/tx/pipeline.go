@@ -10,6 +10,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	"github.com/shadowforge/shadowforge-l1/pkg/governance"
+	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -35,6 +36,20 @@ type Deps struct {
 	// signature-verified transaction against it and rejects one from a
 	// wallet currently under a spike-response hold.
 	Silent *silent.RateMonitor
+	// Oracle is the real quorum-verified price/ATR feed (spec 11.3) Stage
+	// 4 cross-checks a BankDeposit/BankWithdraw's claimed
+	// OraclePriceUSD/ATRUSD against. Nil disables the cross-check entirely
+	// (existing tests that bind an arbitrary self-consistent price keep
+	// working unchanged) — without it, a BankDeposit/BankWithdraw's
+	// internal buffer-vs-ATR consistency check alone accepts any claimed
+	// price as long as it's self-consistent, which is exactly the real,
+	// currently-exploitable gap wiring a real Oracle here closes.
+	Oracle *oracle.Quorum
+	// OracleTolerance bounds how far a claimed OraclePriceUSD/ATRUSD may
+	// diverge from Oracle's real reading (a fraction, e.g. 0.02 == 2%)
+	// before Stage 4 rejects the tx. Zero (the default) means
+	// DefaultOracleTolerance.
+	OracleTolerance decimal.Decimal
 	// Epoch is the epoch this batch belongs to (the block's own Epoch —
 	// consensus-critical, since it's hashed into the block a committee
 	// votes on). A new proposal a TxVote references for the first time is
@@ -49,6 +64,18 @@ func (d Deps) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
+}
+
+// DefaultOracleTolerance is how far a BankDeposit/BankWithdraw's claimed
+// OraclePriceUSD/ATRUSD may diverge from Deps.Oracle's real reading before
+// Stage 4 rejects it, when Deps.OracleTolerance is left zero.
+var DefaultOracleTolerance = decimal.MustFromString("0.02") // 2%
+
+func (d Deps) oracleTolerance() decimal.Decimal {
+	if d.OracleTolerance.Sign() <= 0 {
+		return DefaultOracleTolerance
+	}
+	return d.OracleTolerance
 }
 
 // StageError reports which of the five stages (spec 5.3) rejected a
@@ -345,6 +372,11 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		if pub.BufferUSD.Cmp(wantBuffer) != 0 {
 			return fmt.Errorf("bound buffer %s does not match %s * ATR (%s)", pub.BufferUSD, t.Kind, wantBuffer)
 		}
+		if p.deps.Oracle != nil {
+			if err := p.checkOraclePrice(t.Kind, pub); err != nil {
+				return err
+			}
+		}
 		for _, c := range t.Commitments {
 			p.deps.StateTree.Append(c)
 		}
@@ -475,6 +507,53 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 
 	t.StageHints = t.StageHints.With(4)
 	return nil
+}
+
+// checkOraclePrice cross-checks a BankDeposit/BankWithdraw's claimed
+// OraclePriceUSD/ATRUSD against p.deps.Oracle's real quorum-verified
+// reading, implementing spec 11.3's disagreement policy: a deposit is
+// frozen outright if the real oracle itself can't produce an agreed
+// reading (ErrDisagreement or every source failing), while a withdrawal
+// falls back to the last-agreed snapshot so an open hold can still be
+// closed out during a freeze. Either way, once a real reading is in hand,
+// the claimed figures must sit within Deps.oracleTolerance() of it — the
+// internal buffer-vs-ATR consistency check above only proves the tx is
+// self-consistent, not that the price it's self-consistent about is real.
+func (p *Pipeline) checkOraclePrice(kind types.TxKind, pub *types.BankPublicInputs) error {
+	quote, err := p.deps.Oracle.Quote(pub.Asset)
+	if err != nil {
+		if kind != types.TxBankWithdraw {
+			return fmt.Errorf("oracle unavailable for %s, freezing new deposits: %w", pub.Asset, err)
+		}
+		lastGood, ok := p.deps.Oracle.LastGood(pub.Asset)
+		if !ok {
+			return fmt.Errorf("oracle unavailable and no last-good snapshot for %s: %w", pub.Asset, err)
+		}
+		quote = lastGood
+	}
+	tol := p.deps.oracleTolerance()
+	if !withinTolerance(pub.OraclePriceUSD, quote.PriceUSD, tol) {
+		return fmt.Errorf("claimed price %s for %s diverges from oracle reading %s beyond tolerance", pub.OraclePriceUSD, pub.Asset, quote.PriceUSD)
+	}
+	if !withinTolerance(pub.ATRUSD, quote.ATRUSD, tol) {
+		return fmt.Errorf("claimed ATR %s for %s diverges from oracle reading %s beyond tolerance", pub.ATRUSD, pub.Asset, quote.ATRUSD)
+	}
+	return nil
+}
+
+// withinTolerance reports whether claimed is within the fractional bound
+// tol of real (e.g. tol=0.02 means claimed must sit within 2% of real).
+// real<=0 only passes when claimed is also exactly zero, mirroring
+// pkg/oracle's own withinBound treatment of a zero reference price.
+func withinTolerance(claimed, real, tol decimal.Decimal) bool {
+	if real.Sign() <= 0 {
+		return claimed.Sign() == 0
+	}
+	diff := claimed.Sub(real)
+	if diff.IsNeg() {
+		diff = decimal.Zero.Sub(diff)
+	}
+	return diff.Div(real).Cmp(tol) <= 0
 }
 
 // --- Stage 5: Place Final ---

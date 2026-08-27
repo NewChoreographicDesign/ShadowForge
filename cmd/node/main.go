@@ -32,7 +32,9 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
+	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
+	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
@@ -63,6 +65,8 @@ func main() {
 	bootstrapFile := flag.String("bootstrap-file", "", "comma-separated paths to wait for and read bootstrap multiaddrs from (pairs with -announce-file on other nodes) — a full mesh among validators needs one entry per peer, since this reference build doesn't relay heartbeats or messages beyond directly connected peers")
 	keyFile := flag.String("key-file", "", "path to this node's persisted Dilithium identity keypair (empty = generate a fresh, ephemeral identity every start)")
 	genesisMs := flag.Int64("genesis-ms", defaultGenesisMs, "chain genesis time, unix milliseconds — every node in a network must use the same value")
+	disableOracle := flag.Bool("disable-oracle", false, "disable real oracle price/ATR verification of BankDeposit/BankWithdraw claims (spec 11.3) — for isolated test networks without internet access")
+	oracleMaxDisagreement := flag.String("oracle-max-disagreement", "0.02", "fractional bound (e.g. 0.02 = 2%) beyond which the oracle quorum's real sources are treated as disagreeing (spec 11.3)")
 	flag.Parse()
 
 	role := "civilian"
@@ -107,6 +111,25 @@ func main() {
 	v := vault.New(vault.DefaultSplits())
 	mempool := tx.NewMempool()
 
+	// Real oracle quorum (spec 11.3): two independently-operated, real
+	// public price feeds (CoinGecko and Coinbase, each with its own HTTP
+	// client, response parsing, and real ATR computed from real historical
+	// candles — see pkg/oracle). A BankDeposit/BankWithdraw whose claimed
+	// price/ATR diverges from this quorum's agreed reading, or whose
+	// sources genuinely disagree, is rejected/frozen by the pipeline
+	// (pkg/tx's Stage 4) rather than trusted on the transaction's own say-so.
+	var oracleQuorum *oracle.Quorum
+	if *disableOracle {
+		log.Println("oracle verification disabled (-disable-oracle): BankDeposit/BankWithdraw price/ATR claims will NOT be cross-checked against a real feed")
+	} else {
+		maxDisagreement, err := decimal.FromString(*oracleMaxDisagreement)
+		if err != nil {
+			log.Fatalf("parse -oracle-max-disagreement %q: %v", *oracleMaxDisagreement, err)
+		}
+		oracleQuorum = oracle.NewQuorum(maxDisagreement, oracle.CoinGeckoSource{}, oracle.CoinbaseSource{})
+		log.Printf("real oracle quorum enabled: CoinGecko + Coinbase, max disagreement %s", *oracleMaxDisagreement)
+	}
+
 	pk, sk, err := loadOrCreateIdentity(*keyFile)
 	if err != nil {
 		log.Fatalf("load/create validator identity: %v", err)
@@ -144,7 +167,7 @@ func main() {
 	}
 
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, mempool, pk, sk, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, mempool, pk, sk, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {

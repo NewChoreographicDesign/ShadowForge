@@ -69,7 +69,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 		logf := func(format string, args ...interface{}) {
 			t.Logf("node%d: "+format, append([]interface{}{idx}, args...)...)
 		}
-		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, mempool, pk, sk, logf)
+		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, mempool, pk, sk, logf)
 	}
 
 	// Full mesh: every node dials every other node, so Broadcast (which
