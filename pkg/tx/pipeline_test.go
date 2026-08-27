@@ -8,6 +8,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/bank"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/governance"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
@@ -844,6 +845,180 @@ func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: lateVote, SubmittedAt: time.Now()}}); r[0].Error == nil {
 		t.Fatalf("expected a vote on an already-tallied proposal to be rejected")
+	}
+}
+
+// TestTallyDueProposalsAppliesPassedParamChange proves a passed
+// ProposalParamChange vote has a real, live effect — not just a persisted
+// tally outcome: Deps.Governance is mutated in place, and a
+// BankDeposit's Stage 4 buffer check immediately starts enforcing the new
+// multiplier rather than the old one, in the very next batch.
+func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
+	deps := newDeps(t)
+	deps.Epoch = 1
+	govParams := governance.Default()
+	deps.Governance = &govParams
+	p := tx.NewPipeline(deps)
+
+	// First voter's TxVote binds the proposal to a concrete change:
+	// DepositATRMultiple 2.5 -> 4.
+	pk1, sk1, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	voter1 := types.NFTID(types.SumHash([]byte(pk1)))
+	nonce1 := types.Hash{1}
+	commit1 := mustSignWithKey(t, pk1, sk1, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("raise-deposit-atr"),
+			Commitment: types.ComputeVoteCommitment(voter1, true, nonce1),
+			ParamKey:   "DepositATRMultiple",
+			NewValue:   "4",
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: commit1, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("commit1: %v", r[0].Error)
+	}
+	reveal1 := mustSignWithKey(t, pk1, sk1, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("raise-deposit-atr"), Approve: true, Nonce: nonce1,
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal1, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("reveal1: %v", r[0].Error)
+	}
+
+	// A second voter approves too (majority), WITHOUT specifying
+	// ParamKey/NewValue — proving only the first voter's binding sticks,
+	// not a later one silently overriding it.
+	pk2, sk2, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	voter2 := types.NFTID(types.SumHash([]byte(pk2)))
+	nonce2 := types.Hash{2}
+	commit2 := mustSignWithKey(t, pk2, sk2, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("raise-deposit-atr"),
+			Commitment: types.ComputeVoteCommitment(voter2, true, nonce2),
+			ParamKey:   "SomethingElseEntirely",
+			NewValue:   "999",
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: commit2, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("commit2: %v", r[0].Error)
+	}
+	reveal2 := mustSignWithKey(t, pk2, sk2, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("raise-deposit-atr"), Approve: true, Nonce: nonce2,
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal2, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("reveal2: %v", r[0].Error)
+	}
+
+	tallied, err := p.TallyDueProposals(2)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed {
+		t.Fatalf("expected the proposal to pass 2-0, got %+v", tallied)
+	}
+	if !tallied[0].Applied {
+		t.Fatalf("expected the param change to be marked Applied")
+	}
+	if deps.Governance.DepositATRMultiple.Cmp(decimal.MustFromString("4")) != 0 {
+		t.Fatalf("expected live DepositATRMultiple to become 4, got %s", deps.Governance.DepositATRMultiple)
+	}
+	if tallied[0].ParamKey != "DepositATRMultiple" {
+		t.Fatalf("expected the FIRST voter's ParamKey binding to stick, got %q", tallied[0].ParamKey)
+	}
+
+	// The real, live proof: a BankDeposit whose bound buffer matches the
+	// OLD multiplier (2.5) must now be rejected, and one matching the NEW
+	// multiplier (4) must be accepted — Stage 4 is reading the just
+	// -updated governance state, not a stale snapshot.
+	atr := decimal.MustFromString("2000")
+	staleTx := mustSign(t, types.ShieldedTx{
+		Kind: types.TxBankDeposit,
+		BankPublicInputs: &types.BankPublicInputs{
+			OraclePriceUSD: decimal.MustFromString("60000"),
+			ATRUSD:         atr,
+			BufferUSD:      decimal.MustFromString("2.5").Mul(atr),
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: staleTx, SubmittedAt: time.Now()}}); r[0].Error == nil {
+		t.Fatalf("expected a buffer bound to the pre-vote multiplier (2.5) to now be rejected")
+	}
+
+	freshTx := mustSign(t, types.ShieldedTx{
+		Kind: types.TxBankDeposit,
+		BankPublicInputs: &types.BankPublicInputs{
+			OraclePriceUSD: decimal.MustFromString("60000"),
+			ATRUSD:         atr,
+			BufferUSD:      decimal.MustFromString("4").Mul(atr),
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: freshTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("expected a buffer bound to the new, governance-voted multiplier (4) to be accepted, got %v", r[0].Error)
+	}
+}
+
+// TestTallyDueProposalsAppliesVaultShareChange proves a passed
+// VaultEpochBonusShare (etc.) change resyncs Deps.Vault.Splits for real,
+// exercising vault.SplitsFromParams — previously dead code (nothing ever
+// called it outside its own package) — from the live tally path.
+func TestTallyDueProposalsAppliesVaultShareChange(t *testing.T) {
+	deps := newDeps(t)
+	deps.Epoch = 1
+	govParams := governance.Default()
+	deps.Governance = &govParams
+	p := tx.NewPipeline(deps)
+
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	voter := types.NFTID(types.SumHash([]byte(pk)))
+	nonce := types.Hash{3}
+	commit := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("raise-burn-share"),
+			Commitment: types.ComputeVoteCommitment(voter, true, nonce),
+			ParamKey:   "VaultBurnShare",
+			NewValue:   "0.25",
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: commit, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("commit: %v", r[0].Error)
+	}
+	reveal := mustSignWithKey(t, pk, sk, types.ShieldedTx{
+		Kind: types.TxVoteReveal,
+		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
+			ProposalID: types.ID("raise-burn-share"), Approve: true, Nonce: nonce,
+		},
+	})
+	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal, SubmittedAt: time.Now()}}); r[0].Error != nil {
+		t.Fatalf("reveal: %v", r[0].Error)
+	}
+
+	if _, err := p.TallyDueProposals(2); err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+
+	if deps.Vault.Splits.Burn.Cmp(decimal.MustFromString("0.25")) != 0 {
+		t.Fatalf("expected Vault.Splits.Burn to be resynced to 0.25, got %s", deps.Vault.Splits.Burn)
+	}
+
+	// Real live effect: CollectFee now routes the new share to BurnedTotal.
+	deps.Vault.CollectFee(decimal.FromInt(100))
+	if deps.Vault.BurnedTotal.Cmp(decimal.MustFromString("25")) != 0 {
+		t.Fatalf("expected CollectFee(100) to burn 25 (25%%), got %s", deps.Vault.BurnedTotal)
 	}
 }
 

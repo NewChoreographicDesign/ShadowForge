@@ -55,6 +55,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
+	"github.com/shadowforge/shadowforge-l1/pkg/governance"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
@@ -169,6 +170,14 @@ type Node struct {
 	// real oracle configured) — see tx.Deps.Oracle's own doc for what that
 	// means concretely.
 	oracleQuorum *oracle.Quorum
+	// governanceParams is this node's live governance parameter set (spec
+	// 9.1/17.4), starting at governance.Default() and mutated in place by
+	// the pipeline (tx.Deps.Governance) the moment a ProposalParamChange
+	// proposal passes tally — see tx.Deps.Governance's own doc. Constructed
+	// internally, not a NewNode parameter: like silentMon below, it's this
+	// node's own consensus-derived runtime state, not an external
+	// dependency a caller configures.
+	governanceParams *governance.Params
 	// silentMon is spec 15.4's per-wallet rate monitor. Constructed
 	// internally (not a NewNode parameter) since it's this node's own
 	// runtime defense state, not an external dependency a caller owns —
@@ -243,17 +252,21 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		vlt:          vlt,
 		chn:          chn,
 		oracleQuorum: oracleQuorum,
-		silentMon:    silent.NewRateMonitor(),
-		sentinels:    consensus.NewSentinelManager(),
-		outage:       consensus.NewOutageController(consensus.DefaultOutageThresholds()),
-		isSentinel:   isSentinel,
-		identity:     types.NFTID(types.SumHash(pk)),
-		pk:           pk,
-		sk:           sk,
-		log:          logf,
-		online:       map[types.NFTID]onlineInfo{},
-		everSeen:     map[types.NFTID]time.Time{},
-		rounds:       map[uint64]*round{},
+		governanceParams: func() *governance.Params {
+			p := governance.Default()
+			return &p
+		}(),
+		silentMon:  silent.NewRateMonitor(),
+		sentinels:  consensus.NewSentinelManager(),
+		outage:     consensus.NewOutageController(consensus.DefaultOutageThresholds()),
+		isSentinel: isSentinel,
+		identity:   types.NFTID(types.SumHash(pk)),
+		pk:         pk,
+		sk:         sk,
+		log:        logf,
+		online:     map[types.NFTID]onlineInfo{},
+		everSeen:   map[types.NFTID]time.Time{},
+		rounds:     map[uint64]*round{},
 	}
 	n.net = shadownet.NewNode(h, limiter, n.handleMessage)
 	if !isSentinel {

@@ -4,6 +4,7 @@
 package governance
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
@@ -75,5 +76,79 @@ func Default() Params {
 		SilentTxVaultFee:      decimal.MustFromString("0.10"),
 		ContainerHybridSplit:  decimal.MustFromString("0.50"),
 		RefundCap:             decimal.MustFromString("1.0"),
+	}
+}
+
+// ParamKeys are the Params fields ApplyParamChange knows how to set — the
+// decimal.Decimal-typed subset with a real live consumer (pkg/tx Stage 4's
+// ATR-buffer check, pkg/vault's fee split), so a passed
+// ProposalParamChange vote actually changes running protocol behavior
+// rather than only being tallied and forgotten. Every other Params field
+// (durations, ints — spec-fixed protocol timings, not the "governance may
+// tune this ratio" parameters spec 22's table calls out) is intentionally
+// not settable this way; see this package's doc.
+var ParamKeys = map[string]bool{
+	"DepositATRMultiple":   true,
+	"WithdrawATRMultiple":  true,
+	"BankFeeRate":          true,
+	"RefundCap":            true,
+	"CycleSurchargeRate":   true,
+	"VaultEpochBonusShare": true,
+	"VaultBurnShare":       true,
+	"VaultAuditShare":      true,
+	"VaultRemainderShare":  true,
+	"SilentTxSpikePercent": true,
+}
+
+// ApplyParamChange mutates p according to a passed ProposalParamChange
+// proposal's key/rawValue — the real effect a passing governance vote has
+// on the running protocol (spec 9.1's "governance weight" / spec 17.4's
+// epoch-end tally), closing the gap where a proposal's outcome was
+// tallied and persisted but never actually changed anything live. An
+// unrecognized key or an unparseable value is rejected rather than
+// silently ignored or applied partially.
+func ApplyParamChange(p *Params, key, rawValue string) error {
+	if !ParamKeys[key] {
+		return fmt.Errorf("governance: unknown or unsupported param key %q", key)
+	}
+	v, err := decimal.FromString(rawValue)
+	if err != nil {
+		return fmt.Errorf("governance: invalid value %q for param %q: %w", rawValue, key, err)
+	}
+	switch key {
+	case "DepositATRMultiple":
+		p.DepositATRMultiple = v
+	case "WithdrawATRMultiple":
+		p.WithdrawATRMultiple = v
+	case "BankFeeRate":
+		p.BankFeeRate = v
+	case "RefundCap":
+		p.RefundCap = v
+	case "CycleSurchargeRate":
+		p.CycleSurchargeRate = v
+	case "VaultEpochBonusShare":
+		p.VaultEpochBonusShare = v
+	case "VaultBurnShare":
+		p.VaultBurnShare = v
+	case "VaultAuditShare":
+		p.VaultAuditShare = v
+	case "VaultRemainderShare":
+		p.VaultRemainderShare = v
+	case "SilentTxSpikePercent":
+		p.SilentTxSpikePercent = v
+	}
+	return nil
+}
+
+// IsVaultShareKey reports whether key is one of the four Vault allocation
+// shares, so a caller that just applied a passing change (pkg/tx's
+// TallyDueProposals) knows whether it also needs to resync a live
+// *vault.Vault's Splits (vault.SplitsFromParams) to match.
+func IsVaultShareKey(key string) bool {
+	switch key {
+	case "VaultEpochBonusShare", "VaultBurnShare", "VaultAuditShare", "VaultRemainderShare":
+		return true
+	default:
+		return false
 	}
 }

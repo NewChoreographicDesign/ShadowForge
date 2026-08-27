@@ -8,6 +8,20 @@ import (
 // ProposalKind enumerates what a governance vote can do. Slashing requires
 // a vote (spec 10.3: "Slash execution is a governance vote that burns or
 // freezes the NFT. Automatic silent burns are not in spec").
+//
+// Execution status: ProposalParamChange is real end-to-end — a passed
+// proposal actually mutates live Params (see ApplyParamChange, and
+// pkg/tx's TallyDueProposals, which is what calls it). The other four
+// kinds are tallied identically (real ballots, real majority, real
+// persisted Approve/Reject/Passed) but this build wires no execution step
+// for a pass: ProposalSlashNFT still requires a separate, manual call
+// into pkg/nft.ApplySlash; ProposalUnlockNFTTransfer into
+// pkg/nft.UnlockTransfer; ProposalContainerAsset and
+// ProposalUpgradeUnwind have no automated effect at all. A real
+// deployment needs a wallet/App-layer or operator step to read a passed
+// proposal's Kind and act on it for those four, the same "tally is
+// real, automatic execution is a separate later step" split
+// TallyDueProposals' own doc already draws for SFG minting.
 type ProposalKind uint8
 
 const (

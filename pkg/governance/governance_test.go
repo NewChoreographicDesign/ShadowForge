@@ -54,3 +54,46 @@ func TestTallyFailsBelowMinTurnout(t *testing.T) {
 		t.Fatalf("1%% turnout must fail a 20%% minimum-turnout requirement")
 	}
 }
+
+func TestApplyParamChangeUpdatesRecognizedKey(t *testing.T) {
+	p := governance.Default()
+	if err := governance.ApplyParamChange(&p, "DepositATRMultiple", "3.0"); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if p.DepositATRMultiple.Cmp(decimal.MustFromString("3.0")) != 0 {
+		t.Fatalf("expected DepositATRMultiple to become 3.0, got %s", p.DepositATRMultiple)
+	}
+	// Every other field must be untouched.
+	if p.WithdrawATRMultiple.Cmp(decimal.MustFromString("1.5")) != 0 {
+		t.Fatalf("expected WithdrawATRMultiple to stay at its default, got %s", p.WithdrawATRMultiple)
+	}
+}
+
+func TestApplyParamChangeRejectsUnknownKey(t *testing.T) {
+	p := governance.Default()
+	before := p.DepositATRMultiple
+	if err := governance.ApplyParamChange(&p, "NotARealParam", "3.0"); err == nil {
+		t.Fatalf("expected an unrecognized param key to be rejected")
+	}
+	if p.DepositATRMultiple.Cmp(before) != 0 {
+		t.Fatalf("expected params to be untouched after a rejected change")
+	}
+}
+
+func TestApplyParamChangeRejectsUnparseableValue(t *testing.T) {
+	p := governance.Default()
+	if err := governance.ApplyParamChange(&p, "RefundCap", "not-a-number"); err == nil {
+		t.Fatalf("expected an unparseable value to be rejected")
+	}
+}
+
+func TestIsVaultShareKey(t *testing.T) {
+	for _, key := range []string{"VaultEpochBonusShare", "VaultBurnShare", "VaultAuditShare", "VaultRemainderShare"} {
+		if !governance.IsVaultShareKey(key) {
+			t.Fatalf("expected %q to be recognized as a vault share key", key)
+		}
+	}
+	if governance.IsVaultShareKey("DepositATRMultiple") {
+		t.Fatalf("expected a non-vault key to not be recognized as a vault share key")
+	}
+}

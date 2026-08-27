@@ -50,6 +50,15 @@ type Deps struct {
 	// before Stage 4 rejects the tx. Zero (the default) means
 	// DefaultOracleTolerance.
 	OracleTolerance decimal.Decimal
+	// Governance is this node's live, per-node governance parameter set
+	// (spec 9.1/17.4). Nil means Stage 4 falls back to pkg/bank's static
+	// genesis-default ATR multiples (existing tests keep working
+	// unchanged). When set, TallyDueProposals mutates it in place the
+	// moment a ProposalParamChange proposal passes — the real effect a
+	// governance vote passing has on the running protocol, closing the
+	// gap where a proposal's tally outcome was persisted but never
+	// actually changed anything live.
+	Governance *governance.Params
 	// Epoch is the epoch this batch belongs to (the block's own Epoch —
 	// consensus-critical, since it's hashed into the block a committee
 	// votes on). A new proposal a TxVote references for the first time is
@@ -363,11 +372,20 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		// the ATR-derived figure bound into the proof's public inputs is
 		// internally consistent before any state changes).
 		pub := t.BankPublicInputs
+		depositMult, withdrawMult := bank.DepositATRMultiple, bank.WithdrawATRMultiple
+		if p.deps.Governance != nil {
+			// A passed ProposalParamChange vote (TallyDueProposals) has
+			// already mutated Deps.Governance in place — reading it here
+			// live, rather than the static pkg/bank defaults, is what
+			// makes that vote's effect real for every subsequent
+			// BankDeposit/BankWithdraw rather than just persisted trivia.
+			depositMult, withdrawMult = p.deps.Governance.DepositATRMultiple, p.deps.Governance.WithdrawATRMultiple
+		}
 		var wantBuffer decimal.Decimal
 		if t.Kind == types.TxBankDeposit {
-			wantBuffer = bank.DepositATRMultiple.Mul(pub.ATRUSD)
+			wantBuffer = depositMult.Mul(pub.ATRUSD)
 		} else {
-			wantBuffer = bank.WithdrawATRMultiple.Mul(pub.ATRUSD)
+			wantBuffer = withdrawMult.Mul(pub.ATRUSD)
 		}
 		if pub.BufferUSD.Cmp(wantBuffer) != 0 {
 			return fmt.Errorf("bound buffer %s does not match %s * ATR (%s)", pub.BufferUSD, t.Kind, wantBuffer)
@@ -428,6 +446,13 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				Epoch:       p.deps.Epoch,
 				Commitments: map[types.NFTID]types.Hash{},
 				Reveals:     map[types.NFTID]bool{},
+				// Only the first vote to reference this ProposalID binds
+				// what it does (types.VotePublicInputs' own doc) — a
+				// later voter's own ParamKey/NewValue are never
+				// consulted, since record is only mutated here on
+				// creation.
+				ParamKey: pub.ParamKey,
+				NewValue: pub.NewValue,
 			}
 		}
 		if record.Tallied {
@@ -585,11 +610,20 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 // proposal whose Epoch is strictly before currentEpoch: real revealed
 // ballots (see the TxVote/TxVoteReveal cases above) are counted via
 // governance.Tally, and the outcome is persisted so the proposal never
-// gets tallied twice. It never mints SFG — that "proposer path chosen in
+// gets tallied twice. A passed proposal that's bound to a ParamKey (see
+// state.ProposalRecord's own doc) has that change actually applied to
+// Deps.Governance — and, for a Vault allocation share, resynced into
+// Deps.Vault.Splits too — the real effect a governance vote passing has
+// on the running protocol (closing the gap where a tally's outcome was
+// persisted but never changed anything live); Deps.Governance == nil
+// skips this step entirely (existing tests that don't wire it up keep
+// working unchanged). It never mints SFG — that "proposer path chosen in
 // the App" (direct with a fee, or staked for yield) is a wallet/App-layer
 // choice this L1-core build doesn't implement (see README's Scope
-// section); tallying a proposal's pass/fail is the real, complete part of
-// spec 17.4 that belongs at this layer.
+// section); slashing/unlock-transfer/container-asset proposal kinds are
+// tallied like any other but have no execution wired here either — see
+// governance.ProposalKind's own doc for the remaining kinds this build
+// does not yet apply.
 //
 // This runs deterministically off already-committed proposal state plus
 // the caller's own block Epoch, so every honest node reaches the same
@@ -621,6 +655,21 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 		record.Approve = result.Approve
 		record.Reject = result.Reject
 		record.Passed = result.Passed
+
+		if record.Passed && record.ParamKey != "" && p.deps.Governance != nil {
+			// A malformed/unrecognized claim from whoever cast the first
+			// vote must not block tallying every other due proposal in
+			// this same call — it only leaves this one's own Applied
+			// false, which is the durable, auditable signal that the
+			// vote passed but its bound change never took effect.
+			if err := governance.ApplyParamChange(p.deps.Governance, record.ParamKey, record.NewValue); err == nil {
+				record.Applied = true
+				if governance.IsVaultShareKey(record.ParamKey) && p.deps.Vault != nil {
+					p.deps.Vault.Splits = vault.SplitsFromParams(*p.deps.Governance)
+				}
+			}
+		}
+
 		if err := p.deps.Store.PutProposal(record); err != nil {
 			return nil, fmt.Errorf("persist tally for proposal %s: %w", record.ProposalID, err)
 		}

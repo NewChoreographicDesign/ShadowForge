@@ -146,6 +146,19 @@ type BankPublicInputs struct {
 type VotePublicInputs struct {
 	ProposalID ID
 	Commitment Hash
+
+	// ParamKey/NewValue optionally bind this proposal to a concrete
+	// governance.Params field change (spec 9.1/17.4), taking effect via
+	// governance.ApplyParamChange once the proposal is tallied and
+	// passes. They are only meaningful on the first TxVote to reference a
+	// given ProposalID (see state.ProposalRecord's own doc: that first
+	// vote is what creates the proposal record at all) — every
+	// subsequent voter's own ParamKey/NewValue are ignored, so a later
+	// voter cannot silently redefine what an earlier voter thought they
+	// were voting on. Empty ParamKey means this proposal carries no
+	// direct protocol effect (a plain up/down vote).
+	ParamKey string
+	NewValue string // decimal literal, e.g. "0.03" — see governance.ApplyParamChange
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

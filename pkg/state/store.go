@@ -276,6 +276,15 @@ type ProposalRecord struct {
 	Commitments map[types.NFTID]types.Hash
 	Reveals     map[types.NFTID]bool
 
+	// ParamKey/NewValue optionally bind this proposal to a concrete
+	// governance.Params field change, taken from whichever TxVote first
+	// referenced ProposalID (types.VotePublicInputs' own doc explains why
+	// only the first voter's claim sticks). Empty ParamKey means this
+	// proposal carries no direct protocol effect for TallyDueProposals to
+	// apply.
+	ParamKey string
+	NewValue string
+
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch
 	// moves past this proposal's own Epoch. Turnout isn't recorded here:
@@ -288,6 +297,14 @@ type ProposalRecord struct {
 	Approve int
 	Reject  int
 	Passed  bool
+	// Applied records whether a passed ParamKey change was actually
+	// applied to live governance state. Kept distinct from Passed since
+	// application can fail independently (an unrecognized ParamKey or
+	// unparseable NewValue from a malformed first vote) without that
+	// failure retroactively meaning the vote itself didn't pass, and so
+	// TallyDueProposals — which only ever visits an untallied proposal
+	// once — has a durable record of whether the apply step already ran.
+	Applied bool
 }
 
 func (s *Store) PutProposal(p ProposalRecord) error {
