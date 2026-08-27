@@ -4,6 +4,7 @@
 package tx
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -22,20 +23,48 @@ type Entry struct {
 // expired.
 const TxTTL = 60 * time.Second
 
+// DefaultMaxMempoolSize bounds how many entries Submit will accept before
+// refusing new ones. Per-peer rate limiting (pkg/net.RateLimiter) slows a
+// single flooding peer; this is the second, independent brake against a
+// Sybil attacker submitting from many peer identities at once — without a
+// cap, unbounded Submit calls are a memory-exhaustion DoS vector.
+const DefaultMaxMempoolSize = 100_000
+
+// ErrMempoolFull is returned by Submit once MaxSize entries are pending.
+var ErrMempoolFull = errors.New("tx: mempool is full")
+
 // Mempool holds admitted-but-not-yet-batched transactions (spec 3.1:
 // "mempool, 1-second batcher").
 type Mempool struct {
+	// MaxSize caps Len(); zero means DefaultMaxMempoolSize. Exported so a
+	// node can raise or lower it (e.g. lower for a resource-constrained
+	// enterprise container per spec 15.3).
+	MaxSize int
+
 	mu      sync.Mutex
 	pending []Entry
 }
 
 func NewMempool() *Mempool { return &Mempool{} }
 
-// Submit admits tx to the mempool, timestamped now.
-func (m *Mempool) Submit(t types.ShieldedTx, now time.Time) {
+func (m *Mempool) maxSize() int {
+	if m.MaxSize <= 0 {
+		return DefaultMaxMempoolSize
+	}
+	return m.MaxSize
+}
+
+// Submit admits tx to the mempool, timestamped now. It returns
+// ErrMempoolFull without admitting tx once MaxSize entries are already
+// pending.
+func (m *Mempool) Submit(t types.ShieldedTx, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if len(m.pending) >= m.maxSize() {
+		return ErrMempoolFull
+	}
 	m.pending = append(m.pending, Entry{Tx: t, SubmittedAt: now})
+	return nil
 }
 
 // DrainBatch removes and returns up to max pending entries, implementing

@@ -149,6 +149,64 @@ func TestRateLimiterIgnoresUnthrottledTypes(t *testing.T) {
 	}
 }
 
+// TestOversizedMessageRejected proves the MaxEnvelopeSize guard actually
+// stops an oversized payload rather than buffering it into memory: a raw
+// stream (bypassing Send/Envelope framing) writes well past the cap, and
+// the receiving handler must never fire.
+func TestOversizedMessageRejected(t *testing.T) {
+	hostA, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("host A: %v", err)
+	}
+	defer func() { _ = hostA.Close() }()
+	hostB, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("host B: %v", err)
+	}
+	defer func() { _ = hostB.Close() }()
+
+	handlerFired := make(chan struct{}, 1)
+	shadownet.NewNode(hostB, nil, func(p peer.ID, env shadownet.Envelope) {
+		handlerFired <- struct{}{}
+	})
+	shadownet.NewNode(hostA, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	addrs := shadownet.FullAddr(hostB)
+	if err := shadownet.Connect(ctx, hostA, addrs[0]); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	s, err := hostA.NewStream(ctx, hostB.ID(), shadownet.ProtocolID)
+	if err != nil {
+		t.Fatalf("open raw stream: %v", err)
+	}
+	// A well-formed-looking JSON envelope whose payload alone exceeds
+	// MaxEnvelopeSize, sent as one big write.
+	oversized := append([]byte(`{"type":"Heartbeat","payload":"`), make([]byte, shadownet.MaxEnvelopeSize+1024)...)
+	oversized = append(oversized, []byte(`"}`)...)
+	for i := range oversized[len(`{"type":"Heartbeat","payload":"`):] {
+		// fill with a harmless ASCII byte so it's still syntactically
+		// plausible up to the point the reader gives up
+		idx := len(`{"type":"Heartbeat","payload":"`) + i
+		if idx >= len(oversized)-2 {
+			break
+		}
+		oversized[idx] = 'a'
+	}
+	_, writeErr := s.Write(oversized)
+	_ = s.CloseWrite()
+	_ = writeErr // a write error here (e.g. reset by peer) is an acceptable outcome too
+
+	select {
+	case <-handlerFired:
+		t.Fatalf("handler must not fire for a message exceeding MaxEnvelopeSize")
+	case <-time.After(2 * time.Second):
+		// expected: nothing delivered
+	}
+}
+
 func TestConnectFailsForUnreachableAddr(t *testing.T) {
 	h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
 	if err != nil {

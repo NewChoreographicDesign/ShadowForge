@@ -7,6 +7,7 @@ import (
 
 	"github.com/shadowforge/shadowforge-l1/pkg/bank"
 	"github.com/shadowforge/shadowforge-l1/pkg/container"
+	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -198,9 +199,27 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 	if !submittedAt.IsZero() && p.deps.now().Sub(submittedAt) > TxTTL {
 		return fmt.Errorf("transaction expired (submitted %s ago, TTL %s)", p.deps.now().Sub(submittedAt), TxTTL)
 	}
-	if len(t.Sig) == 0 {
-		return fmt.Errorf("missing signature")
+
+	// Well-formedness: TxID must match its own content (spec 4.1), and the
+	// Dilithium signature must actually verify against the signer's public
+	// key (spec 5.3 Stage 2: "Dilithium signature"; spec 8.5: "Dilithium
+	// signs: wallet authorizations..."). A non-empty Sig byte string alone
+	// proves nothing — it must cryptographically bind to this exact TxID.
+	wantTxID := types.ComputeTxID(t.Proof, t.Commitments, t.Nullifier)
+	if t.TxID != wantTxID {
+		return fmt.Errorf("TxID does not match Hash(proof || commitments || nullifier)")
 	}
+	if len(t.Sig) == 0 || len(t.SignerPubKey) == 0 {
+		return fmt.Errorf("missing signature or signer public key")
+	}
+	ok, err := crypto.DilithiumVerify(crypto.DilithiumPublicKey(t.SignerPubKey), t.TxID[:], crypto.DilithiumSignature(t.Sig))
+	if err != nil {
+		return fmt.Errorf("signature check: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("signature does not verify against the claimed signer key")
+	}
+
 	switch t.Kind {
 	case types.TxTransfer:
 		if t.FeeCommit.IsZero() {
@@ -306,6 +325,31 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		if err := p.deps.Store.PutNFT(nftRec); err != nil {
 			return fmt.Errorf("persist nft: %w", err)
 		}
+
+	case types.TxVote:
+		// Records this ballot's commitment against its proposal (spec
+		// 17.4: "Votes accumulate as ZKP ballots during the epoch").
+		// Tallying (governance.Tally) and the pass/fail decision happen at
+		// epoch end, outside the per-transaction pipeline, since a
+		// proposal's outcome depends on every ballot cast across the
+		// whole epoch, not on any single transaction.
+		pub := t.VotePublicInputs
+		record, _, err := p.deps.Store.GetProposal(string(pub.ProposalID))
+		if err != nil {
+			return fmt.Errorf("proposal lookup: %w", err)
+		}
+		record.ProposalID = string(pub.ProposalID)
+		record.Commitments = append(record.Commitments, pub.Commitment)
+		if err := p.deps.Store.PutProposal(record); err != nil {
+			return fmt.Errorf("persist proposal: %w", err)
+		}
+
+	case types.TxMint:
+		// A mint proposal is accepted into the pipeline (its
+		// well-formedness was already checked at Stage 2) but, like Vote,
+		// its effect — actually minting SFG — is an epoch-boundary
+		// decision (spec 17.4: "At epoch end, if votes pass ... SFG is
+		// minted"), not a per-transaction one. Nothing to apply here.
 
 	case types.TxContainerSync:
 		if t.ContainerID == nil || len(t.Commitments) == 0 {

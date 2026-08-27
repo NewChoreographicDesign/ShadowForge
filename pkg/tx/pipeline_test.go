@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
@@ -51,9 +52,29 @@ func newDeps(t *testing.T) tx.Deps {
 	}
 }
 
-// buildValidTransfer produces a fully valid, provable Transfer ShieldedTx:
-// two spent notes (60+40) split into a 70 payment + 25 change note with a
-// fee of 5.
+// mustSign computes t's TxID from Hash(proof || commitments || nullifier)
+// (spec 4.1) and produces a real Dilithium signature over it, so every
+// test transaction passes Stage 2's actual cryptographic checks rather
+// than a placeholder byte string.
+func mustSign(t *testing.T, in types.ShieldedTx) types.ShieldedTx {
+	t.Helper()
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
+	sig, err := crypto.DilithiumSign(sk, in.TxID[:])
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	in.Sig = types.DilithiumSig(sig)
+	in.SignerPubKey = []byte(pk)
+	return in
+}
+
+// buildValidTransfer produces a fully valid, provable, correctly-signed
+// Transfer ShieldedTx: two spent notes (60+40) split into a 70 payment +
+// 25 change note with a fee of 5.
 func buildValidTransfer(t *testing.T) types.ShieldedTx {
 	t.Helper()
 	sys := getZKSystem(t)
@@ -117,16 +138,14 @@ func buildValidTransfer(t *testing.T) types.ShieldedTx {
 		txPub.OutCommits = append(txPub.OutCommits, types.Hash(zk.ToBytes32(c)))
 	}
 
-	return types.ShieldedTx{
-		TxID:                 types.SumHash(proofBytes),
+	return mustSign(t, types.ShieldedTx{
 		Nullifier:            txPub.Nullifiers[0],
 		Commitments:          txPub.OutCommits,
 		Proof:                proofBytes,
 		FeeCommit:            types.SumHash([]byte("fee")),
-		Sig:                  types.DilithiumSig("test-sig"),
 		Kind:                 types.TxTransfer,
 		TransferPublicInputs: txPub,
-	}
+	})
 }
 
 func TestPipelineHappyPathTransfer(t *testing.T) {
@@ -193,17 +212,18 @@ func TestPipelineAtomicityReleasesNullifierOnLaterStageFailure(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
 	shieldedTx := buildValidTransfer(t)
-	shieldedTx.Sig = nil // forces a Stage 2 well-formedness failure
+	shieldedTx.FeeCommit = types.Hash{} // forces a Stage 2 well-formedness failure (missing fee commitment) without touching the signature
 
 	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
 	if results[0].Error == nil {
-		t.Fatalf("expected stage 2 rejection for a missing signature")
+		t.Fatalf("expected stage 2 rejection for a missing fee commitment")
+	}
+	se, ok := results[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 2 {
+		t.Fatalf("expected a stage-2 StageError, got %v", results[0].Error)
 	}
 
-	// The nullifier must have been released, not stuck pending: a
-	// corrected resubmission should now succeed.
-	fixed := buildValidTransferFromSameTx(t, shieldedTx)
-	_ = fixed // not used further; the important assertion is on spent-state below
+	// The nullifier must have been released, not stuck pending.
 	spent, err := deps.Store.IsNullifierSpent(shieldedTx.TransferPublicInputs.Nullifiers[0])
 	if err != nil {
 		t.Fatalf("spent lookup: %v", err)
@@ -213,12 +233,44 @@ func TestPipelineAtomicityReleasesNullifierOnLaterStageFailure(t *testing.T) {
 	}
 }
 
-// buildValidTransferFromSameTx is a no-op helper kept for readability at
-// the call site above; it documents that a fresh, correctly-signed
-// resubmission is what a real wallet would do next.
-func buildValidTransferFromSameTx(t *testing.T, original types.ShieldedTx) types.ShieldedTx {
-	t.Helper()
-	return original
+func TestPipelineTamperedSignatureRejected(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+	shieldedTx.Sig[0] ^= 0xFF // flip a bit: signature no longer verifies
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a tampered signature to be rejected")
+	}
+	se, ok := results[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 2 {
+		t.Fatalf("expected a stage-2 StageError, got %v", results[0].Error)
+	}
+}
+
+func TestPipelineTamperedTxIDRejected(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+	shieldedTx.TxID[0] ^= 0xFF // no longer matches Hash(proof||commitments||nullifier)
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a tampered TxID to be rejected")
+	}
+}
+
+func TestPipelineMissingSignerPubKeyRejected(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+	shieldedTx.SignerPubKey = nil
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a missing signer public key to be rejected")
+	}
 }
 
 func TestPipelineExpiredTxRejected(t *testing.T) {
@@ -239,16 +291,14 @@ func TestPipelineExpiredTxRejected(t *testing.T) {
 func TestPipelineBankDepositBufferMismatchRejected(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
-	bankTx := types.ShieldedTx{
-		TxID: types.Hash{1},
+	bankTx := mustSign(t, types.ShieldedTx{
 		Kind: types.TxBankDeposit,
-		Sig:  types.DilithiumSig("sig"),
 		BankPublicInputs: &types.BankPublicInputs{
 			OraclePriceUSD: decimal.MustFromString("60000"),
 			ATRUSD:         decimal.MustFromString("2000"),
 			BufferUSD:      decimal.MustFromString("999"), // wrong: should be 2.5*2000=5000
 		},
-	}
+	})
 	results := p.ProcessBatch([]tx.Entry{{Tx: bankTx, SubmittedAt: time.Now()}})
 	if results[0].Error == nil {
 		t.Fatalf("expected buffer-mismatch rejection at stage 4")
@@ -262,16 +312,14 @@ func TestPipelineBankDepositBufferMismatchRejected(t *testing.T) {
 func TestPipelineBankDepositCorrectBufferAccepted(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
-	bankTx := types.ShieldedTx{
-		TxID: types.Hash{2},
+	bankTx := mustSign(t, types.ShieldedTx{
 		Kind: types.TxBankDeposit,
-		Sig:  types.DilithiumSig("sig"),
 		BankPublicInputs: &types.BankPublicInputs{
 			OraclePriceUSD: decimal.MustFromString("60000"),
 			ATRUSD:         decimal.MustFromString("2000"),
 			BufferUSD:      decimal.MustFromString("5000"), // 2.5 * 2000
 		},
-	}
+	})
 	results := p.ProcessBatch([]tx.Entry{{Tx: bankTx, SubmittedAt: time.Now()}})
 	if results[0].Error != nil {
 		t.Fatalf("expected correct buffer to be accepted, got %v", results[0].Error)
@@ -283,38 +331,87 @@ func TestPipelineContainerSyncShadowMismatchBlocksCommit(t *testing.T) {
 	p := tx.NewPipeline(deps)
 	id := types.ID("acme-container")
 
-	first := types.ShieldedTx{
-		TxID: types.Hash{3}, Kind: types.TxContainerSync, Sig: types.DilithiumSig("sig"),
-		ContainerID: &id, Commitments: []types.Hash{{9, 9, 9}},
-	}
+	first := mustSign(t, types.ShieldedTx{
+		Kind: types.TxContainerSync, ContainerID: &id, Commitments: []types.Hash{{9, 9, 9}},
+	})
 	r1 := p.ProcessBatch([]tx.Entry{{Tx: first, SubmittedAt: time.Now()}})
 	if r1[0].Error != nil {
 		t.Fatalf("first sync should succeed: %v", r1[0].Error)
 	}
 
 	claimedShadow := types.Hash{5, 5, 5}
-	second := types.ShieldedTx{
-		TxID: types.Hash{4}, Kind: types.TxContainerSync, Sig: types.DilithiumSig("sig"),
-		ContainerID: &id, Commitments: []types.Hash{{1, 1, 1}},
+	second := mustSign(t, types.ShieldedTx{
+		Kind: types.TxContainerSync, ContainerID: &id, Commitments: []types.Hash{{1, 1, 1}},
 		Memo: claimedShadow[:], // claims a duplicate-server digest that won't match {1,1,1}
-	}
+	})
 	r2 := p.ProcessBatch([]tx.Entry{{Tx: second, SubmittedAt: time.Now()}})
 	if r2[0].Error == nil {
 		t.Fatalf("expected shadow-verification mismatch to block commit")
+	}
+	se, ok := r2[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 4 {
+		t.Fatalf("expected a stage-4 StageError, got %v", r2[0].Error)
 	}
 }
 
 func TestPipelineNFTTraitMissingTargetRejected(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
-	traitTx := types.ShieldedTx{
-		TxID: types.Hash{6}, Kind: types.TxNFTTrait, Sig: types.DilithiumSig("sig"),
+	traitTx := mustSign(t, types.ShieldedTx{
+		Kind:              types.TxNFTTrait,
 		Commitments:       []types.Hash{{7}},
 		TraitPublicInputs: &types.TraitPublicInputs{Key: "balance", DeltaCommitment: types.Hash{8}},
-	}
+	})
 	results := p.ProcessBatch([]tx.Entry{{Tx: traitTx, SubmittedAt: time.Now()}})
 	if results[0].Error == nil {
 		t.Fatalf("expected rejection for a trait update against a non-existent NFT")
+	}
+	se, ok := results[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 4 {
+		t.Fatalf("expected a stage-4 StageError (NFT not found), got %v", results[0].Error)
+	}
+}
+
+func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	voteTx := mustSign(t, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-42"),
+			Commitment: types.Hash{1, 2, 3},
+		},
+	})
+	results := p.ProcessBatch([]tx.Entry{{Tx: voteTx, SubmittedAt: time.Now()}})
+	if results[0].Error != nil {
+		t.Fatalf("expected vote to succeed: %v", results[0].Error)
+	}
+	record, found, err := deps.Store.GetProposal("proposal-42")
+	if err != nil || !found {
+		t.Fatalf("expected a proposal record: found=%v err=%v", found, err)
+	}
+	if len(record.Commitments) != 1 || record.Commitments[0] != (types.Hash{1, 2, 3}) {
+		t.Fatalf("unexpected proposal commitments: %+v", record.Commitments)
+	}
+
+	// A second ballot on the same proposal accumulates.
+	voteTx2 := mustSign(t, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("proposal-42"),
+			Commitment: types.Hash{4, 5, 6},
+		},
+	})
+	results2 := p.ProcessBatch([]tx.Entry{{Tx: voteTx2, SubmittedAt: time.Now()}})
+	if results2[0].Error != nil {
+		t.Fatalf("expected second vote to succeed: %v", results2[0].Error)
+	}
+	record, _, err = deps.Store.GetProposal("proposal-42")
+	if err != nil {
+		t.Fatalf("get proposal: %v", err)
+	}
+	if len(record.Commitments) != 2 {
+		t.Fatalf("expected 2 accumulated commitments, got %d", len(record.Commitments))
 	}
 }
 
@@ -325,11 +422,11 @@ func TestPipelineNFTTraitAppliesToExistingNFT(t *testing.T) {
 	if err := deps.Store.PutNFT(types.ValidatorNFT{ID: nftID, Traits: map[string]string{}}); err != nil {
 		t.Fatalf("seed nft: %v", err)
 	}
-	traitTx := types.ShieldedTx{
-		TxID: types.Hash{9}, Kind: types.TxNFTTrait, Sig: types.DilithiumSig("sig"),
+	traitTx := mustSign(t, types.ShieldedTx{
+		Kind:              types.TxNFTTrait,
 		Commitments:       []types.Hash{types.Hash(nftID)},
 		TraitPublicInputs: &types.TraitPublicInputs{Key: "balance", DeltaCommitment: types.Hash{8}},
-	}
+	})
 	results := p.ProcessBatch([]tx.Entry{{Tx: traitTx, SubmittedAt: time.Now()}})
 	if results[0].Error != nil {
 		t.Fatalf("expected trait update against an existing NFT to succeed: %v", results[0].Error)

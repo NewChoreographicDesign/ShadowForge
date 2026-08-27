@@ -2,6 +2,22 @@ package types
 
 import "github.com/shadowforge/shadowforge-l1/pkg/decimal"
 
+// ComputeTxID implements spec 4.1 exactly: "TxID: Hash of the shielded
+// transaction blob (proof + commitments + nullifier)." Both the sender
+// (when building a transaction) and a validator (when checking one, per
+// spec 5.3 Stage 2's "well-formedness" check) must compute this the same
+// way, so a submitted TxID that doesn't match its own proof/commitments/
+// nullifier is detectably tampered with.
+func ComputeTxID(proof []byte, commitments []Hash, nullifier Hash) Hash {
+	parts := make([][]byte, 0, len(commitments)+2)
+	parts = append(parts, proof)
+	for _, c := range commitments {
+		parts = append(parts, c[:])
+	}
+	parts = append(parts, nullifier[:])
+	return SumHash(parts...)
+}
+
 // TxKind enumerates the kinds a ShieldedTx can be (spec 4.2).
 type TxKind uint8
 
@@ -54,16 +70,17 @@ type DilithiumSig []byte
 
 // ShieldedTx is the persisted, never-cleartext transaction object (spec 4.2).
 type ShieldedTx struct {
-	TxID        Hash
-	Nullifier   Hash   // prevents double-spend of the note
-	Commitments []Hash // new notes created
-	Proof       []byte // gnark proof bytes
-	FeeCommit   Hash   // fee paid to Vault, also shielded
-	Memo        []byte // optional encrypted memo for receiver
-	Sig         DilithiumSig
-	Kind        TxKind
-	StageHints  StageSet
-	ContainerID *ID // nil unless originated in an enterprise container
+	TxID         Hash
+	Nullifier    Hash   // prevents double-spend of the note
+	Commitments  []Hash // new notes created
+	Proof        []byte // gnark proof bytes
+	FeeCommit    Hash   // fee paid to Vault, also shielded
+	Memo         []byte // optional encrypted memo for receiver
+	Sig          DilithiumSig
+	SignerPubKey []byte // Dilithium public key the wallet signed Sig with (spec 8.5)
+	Kind         TxKind
+	StageHints   StageSet
+	ContainerID  *ID // nil unless originated in an enterprise container
 
 	// Public inputs bound per Kind (spec 4.2: "TxKind determines which
 	// extra public inputs the circuit must bind"). Only the fields

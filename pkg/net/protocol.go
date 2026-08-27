@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
@@ -11,6 +12,22 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 )
+
+// MaxEnvelopeSize caps the total bytes handleStream will read from one
+// stream. Send opens a fresh stream per Envelope, so in practice this caps
+// one message's wire size; without it, a peer streaming an unbounded JSON
+// payload could exhaust this node's memory. go-libp2p's default resource
+// manager provides a coarser, connection-level backstop, but this is the
+// direct defense (the rate limiter is the first DoS brake spec 6 calls
+// for, against many small messages; this is the second, against one
+// oversized one).
+const MaxEnvelopeSize = 4 << 20 // 4 MiB
+
+// StreamIdleTimeout bounds how long handleStream will wait for the next
+// message on an open stream before giving up. Without this, a peer that
+// opens a stream and then sends nothing (or trickles bytes) ties up a
+// goroutine indefinitely — a slow-loris-style resource exhaustion attack.
+const StreamIdleTimeout = 30 * time.Second
 
 // Handler processes one received Envelope from peer p.
 type Handler func(p peer.ID, env Envelope)
@@ -38,11 +55,14 @@ func NewNode(h host.Host, limiter *RateLimiter, handler Handler) *Node {
 func (n *Node) handleStream(s network.Stream) {
 	defer func() { _ = s.Close() }()
 	remote := s.Conn().RemotePeer()
-	dec := json.NewDecoder(s)
+	dec := json.NewDecoder(io.LimitReader(s, MaxEnvelopeSize))
 	for {
+		if err := s.SetReadDeadline(time.Now().Add(StreamIdleTimeout)); err != nil {
+			return // stream doesn't support deadlines or is already closed
+		}
 		var env Envelope
 		if err := dec.Decode(&env); err != nil {
-			return // EOF or malformed stream: nothing more to do
+			return // EOF, malformed stream, oversized message, or idle timeout
 		}
 		if !n.Limiter.Allow(remote, env.Type, time.Now()) {
 			return // rate-limited: drop the rest of this stream too

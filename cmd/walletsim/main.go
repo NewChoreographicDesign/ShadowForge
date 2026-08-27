@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
@@ -30,6 +31,11 @@ func main() {
 	bootstrapFile := flag.String("bootstrap-file", "", "read a bootstrap multiaddr from this path, waiting for it to appear")
 	interval := flag.Duration("interval", 3*time.Second, "how often to submit a simulated transaction")
 	flag.Parse()
+
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		log.Fatalf("generate wallet signing key: %v", err)
+	}
 
 	h, err := shadownet.NewHost(*listen)
 	if err != nil {
@@ -68,7 +74,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := submitRandomVote(ctx, node); err != nil {
+				if err := submitRandomVote(ctx, node, pk, sk); err != nil {
 					log.Printf("submit failed: %v", err)
 				}
 			}
@@ -103,20 +109,29 @@ func waitForAddrFile(ctx context.Context, path string) (string, error) {
 	}
 }
 
-func submitRandomVote(ctx context.Context, node *shadownet.Node) error {
+func submitRandomVote(ctx context.Context, node *shadownet.Node, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey) error {
 	var proposalID [8]byte
 	if _, err := rand.Read(proposalID[:]); err != nil {
 		return err
 	}
 	t := types.ShieldedTx{
-		TxID: types.SumHash(proposalID[:]),
 		Kind: types.TxVote,
-		Sig:  types.DilithiumSig("walletsim"),
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("sim-proposal"),
 			Commitment: types.SumHash(proposalID[:], []byte("commit")),
 		},
 	}
+	// TxID = Hash(proof || commitments || nullifier) per spec 4.1; a Vote
+	// tx carries neither a ZK proof nor commitments, so this reduces to
+	// Hash(nullifier) — still a real, signature-authenticated identity.
+	t.TxID = types.ComputeTxID(t.Proof, t.Commitments, t.Nullifier)
+	sig, err := crypto.DilithiumSign(sk, t.TxID[:])
+	if err != nil {
+		return fmt.Errorf("sign: %w", err)
+	}
+	t.Sig = types.DilithiumSig(sig)
+	t.SignerPubKey = []byte(pk)
+
 	blob, err := json.Marshal(t)
 	if err != nil {
 		return err

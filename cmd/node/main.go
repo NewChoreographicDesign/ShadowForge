@@ -128,7 +128,9 @@ func main() {
 				log.Printf("bad tx blob from %s: %v", p, err)
 				return
 			}
-			mempool.Submit(t, time.Now())
+			if err := mempool.Submit(t, time.Now()); err != nil {
+				log.Printf("tx offer from %s not admitted: %v", p, err)
+			}
 
 		default:
 			// BlockAnnounce, StageVote, MegabatchPart, ContainerSync,
