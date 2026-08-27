@@ -154,6 +154,7 @@ pkg/vault/           fee treasury and splits
 pkg/nft/             soulbound mint/traits/Trust Points/slashing
 pkg/governance/       genesis parameters, NFT-weighted voting
 pkg/container/        enterprise L1 container subspace
+pkg/silent/            Poisson silent-TX padding + wallet spike detection (spec 15.4)
 deployments/docker/   Dockerfile + docker-compose.yml (4-node network)
 docs/                 architecture notes, spec source, scope decisions
 examples/             sample .sr programs

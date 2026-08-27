@@ -20,11 +20,12 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	mathrand "math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -35,12 +36,17 @@ import (
 
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
+	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/vault"
 	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
+
+// silentPadMeanInterval is the mean inter-arrival time for sentinel-emitted
+// SilentPad padding traffic (spec 15.4).
+const silentPadMeanInterval = 5 * time.Second
 
 const batchInterval = time.Second // spec 22 governance default
 
@@ -61,7 +67,7 @@ func main() {
 	log.Printf("ShadowForge node starting: listen=%s role=%s", *listen, role)
 
 	var encKey [32]byte
-	if _, err := rand.Read(encKey[:]); err != nil {
+	if _, err := cryptorand.Read(encKey[:]); err != nil {
 		log.Fatalf("generate state encryption key: %v", err)
 	}
 	store, err := state.Open(*dataDir, *dataDir == "", encKey)
@@ -168,6 +174,11 @@ func main() {
 	go heartbeatLoop(ctx, node)
 	go batchLoop(ctx, mempool, pipeline)
 	go epochLoop(ctx, genesis, revolver, sentinels)
+	if *sentinelFlag {
+		go silent.RunPadGenerator(ctx, mathrand.New(mathrand.NewSource(time.Now().UnixNano())), silentPadMeanInterval, func() {
+			emitSilentPad(ctx, node)
+		})
+	}
 
 	for _, a := range shadownet.FullAddr(h) {
 		log.Printf("listening: %s", a)
@@ -249,6 +260,26 @@ func heartbeatLoop(ctx context.Context, node *shadownet.Node) {
 			node.Broadcast(ctx, env)
 		}
 	}
+}
+
+// emitSilentPad broadcasts one null ZK padding message (spec 15.4:
+// sentinels/Vault keep circuits warm and absorb burst load). The nonce is
+// cosmetic — SilentPad carries no proof or value, so it never touches the
+// pipeline — but it is still drawn from crypto/rand rather than the
+// generator's math/rand source, since it becomes wire content other nodes
+// observe.
+func emitSilentPad(ctx context.Context, node *shadownet.Node) {
+	var nonce [16]byte
+	if _, err := cryptorand.Read(nonce[:]); err != nil {
+		log.Printf("silent pad nonce: %v", err)
+		return
+	}
+	env, err := shadownet.NewEnvelope(shadownet.MsgSilentPad, shadownet.SilentPadPayload{Nonce: nonce[:]})
+	if err != nil {
+		log.Printf("build silent pad: %v", err)
+		return
+	}
+	node.Broadcast(ctx, env)
 }
 
 func batchLoop(ctx context.Context, mempool *tx.Mempool, pipeline *tx.Pipeline) {
