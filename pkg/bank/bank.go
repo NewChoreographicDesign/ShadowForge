@@ -54,6 +54,19 @@ type DepositParams struct {
 	DailyUsedUSD  decimal.Decimal
 	DailyCapUSD   decimal.Decimal
 	CycleCount30d uint
+
+	// CustodyAddress/TxID/Watcher/MinConfirmations gate ExternalAmount
+	// against a real independent on-chain observation instead of trusting
+	// it as a bare caller-supplied number. Watcher nil skips verification
+	// entirely (existing tests, and any asset with no configured watcher,
+	// keep working unchanged); when set, Deposit rejects a claim whose
+	// real confirmed on-chain amount is less than ExternalAmount or whose
+	// transaction doesn't yet have MinConfirmations (<=0 means
+	// DefaultMinConfirmations).
+	CustodyAddress   string
+	TxID             string
+	Watcher          DepositWatcher
+	MinConfirmations int
 }
 
 // Deposit implements spec 11.1 / 19.3 exactly:
@@ -69,6 +82,23 @@ type DepositParams struct {
 // EntryFee. The returned hold's Status is Locked24h (spec 11.1: "24-hour
 // lock: Status = Locked24h").
 func Deposit(p DepositParams) (types.BankHold, error) {
+	if p.Watcher != nil {
+		minConf := p.MinConfirmations
+		if minConf <= 0 {
+			minConf = DefaultMinConfirmations
+		}
+		obs, err := p.Watcher.VerifyDeposit(p.Asset, p.CustodyAddress, p.TxID)
+		if err != nil {
+			return types.BankHold{}, fmt.Errorf("%w: %v", ErrDepositVerificationFailed, err)
+		}
+		if obs.Confirmations < minConf {
+			return types.BankHold{}, ErrDepositNotConfirmed
+		}
+		if obs.ConfirmedAmount.Cmp(p.ExternalAmount) < 0 {
+			return types.BankHold{}, ErrDepositAmountMismatch
+		}
+	}
+
 	grossUSD := p.ExternalAmount.Mul(p.PriceUSD)
 
 	cap := p.DailyCapUSD
