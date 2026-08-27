@@ -40,15 +40,23 @@ go run ./cmd/shadowc gen    examples/sample_transfer.sr
 
 Run a four-node network (two civilian validators, one sentinel, one wallet
 simulator — the exact topology spec section 6 calls for) as local
-processes, without Docker:
+processes, without Docker. The three validator-role nodes are wired as a
+full mesh (see `deployments/docker/docker-compose.yml`'s comment for why
+this reference build needs that, not a star, for every node's committee
+view to agree):
 
 ```sh
 mkdir -p /tmp/shared
 go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15001 -announce-file /tmp/shared/v1.addr -skip-zk-setup &
-go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15002 -bootstrap-file /tmp/shared/v1.addr -announce-file /tmp/shared/v2.addr -skip-zk-setup &
-go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15003 -bootstrap-file /tmp/shared/v1.addr -sentinel -skip-zk-setup &
-go run ./cmd/walletsim -listen /ip4/127.0.0.1/tcp/15010 -bootstrap-file /tmp/shared/v2.addr
+go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15003 -bootstrap-file /tmp/shared/v1.addr -announce-file /tmp/shared/s1.addr -sentinel -skip-zk-setup &
+go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15002 -bootstrap-file /tmp/shared/v1.addr,/tmp/shared/s1.addr -announce-file /tmp/shared/v2.addr -skip-zk-setup &
+go run ./cmd/walletsim -listen /ip4/127.0.0.1/tcp/15010 -bootstrap-file /tmp/shared/v2.addr -interval 1s
 ```
+
+Watch any node's log for `chain height=N hash=...` — all three should
+converge on the same height and hash as `walletsim`'s transactions get
+proposed, voted on, and committed via real cross-node BFT consensus
+(`pkg/validator`).
 
 Or with Docker (see [deployments/docker](deployments/docker)):
 
@@ -59,8 +67,12 @@ docker compose -f deployments/docker/docker-compose.yml up --build
 > The Docker Compose file and Dockerfile were authored and reviewed but
 > could not be built or run in the sandbox this repository was produced in
 > (no Docker daemon was available there). The exact topology and bootstrap
-> mechanism it uses were verified working via direct process execution —
-> the transcript is reproducible with the local-process command above.
+> mechanism it uses — including the full-mesh validator wiring real BFT
+> consensus requires — were verified working via direct process execution:
+> all three validator-role nodes reached identical chain height and head
+> hash after real signed transactions, real Dilithium-signed votes, and
+> real quorum-gated commits, growing the chain to height 12 in one run.
+> The transcript is reproducible with the local-process command above.
 
 ## What's real here
 
@@ -86,6 +98,20 @@ package — this is not a stub with comments describing intended behavior.
   real Noise XX handshake between them, and exchanges an encrypted,
   decoded application message — proven in `pkg/net/net_test.go` with two
   live hosts, not mocks.
+- **Real cross-node BFT consensus.** `pkg/validator` runs a genuine
+  propose/vote/commit state machine across independent nodes: a
+  deterministically-assigned proposer (`pkg/consensus.AssignCommittee`, a
+  pure function every honest node computes identically), real
+  Dilithium-signed `StageVote`s exchanged over libp2p, and a quorum-gated,
+  independently-reverifying `pkg/chain.Append` — a node never counts a
+  vote it hasn't itself checked against a real public key and real
+  committee membership. `TestFourNodesConvergeOnSameChain`
+  (`pkg/validator/integration_test.go`) proves four fully independent
+  `validator.Node`s, wired only by real TCP/Noise sockets, converge on
+  byte-identical chain height and head hash; the same real `cmd/node`
+  binary was separately verified as three full-mesh OS processes plus a
+  wallet simulator, growing a real chain to height 12 (see the Quickstart
+  section above).
 - **A real five-stage pipeline with atomicity and real signatures.**
   `pkg/tx` runs every transaction through Sender Leave → TX Offer →
   Receiver Check → Send Exec → Place Final (spec 5.3), verifying the
@@ -127,9 +153,8 @@ three real, exploitable gaps rather than being a formality:
 No secrets are logged; encryption keys use `crypto/rand`, never
 `math/rand`; AEAD nonces are fresh per call. See `docs/ARCHITECTURE.md`
 for what's still required before a real deployment (a production ZK
-trusted-setup ceremony, live cross-process BFT vote exchange, and the
-spec 18.6 hardening phase in full — this is a tested reference
-implementation, not an audited production system).
+trusted-setup ceremony and the spec 18.6 hardening phase in full — this
+is a tested reference implementation, not an audited production system).
 
 ## Repository layout
 
@@ -146,8 +171,10 @@ pkg/decimal/         exact rational arithmetic
 pkg/crypto/          Dilithium3 (PQC) signatures, AEAD encryption
 pkg/zk/              Groth16 shielded-transfer circuit + prover/verifier
 pkg/state/           encrypted Badger KV store + Merkle tree
-pkg/consensus/       epoch clock, revolver, BFT, sentinels, outage/megabatch
+pkg/consensus/       epoch clock, revolver, BFT quorum rule, deterministic committee assignment, sentinels, outage/megabatch
 pkg/net/             libp2p + Noise, message protocol, rate limiter
+pkg/chain/           block assembly, PrevHash-linked growth, genesis, quorum-gated Append
+pkg/validator/       cross-node propose/vote/commit state machine (real network BFT consensus)
 pkg/tx/              mempool + five-stage pipeline
 pkg/bank/ pkg/oracle/  ATR deposit/withdraw math, oracle quorum, hashed-IP correlation
 pkg/vault/           fee treasury and splits
@@ -188,13 +215,27 @@ down, documented at the point of decision in code:
   the explicit Year-1 mitigation for "gnark / circuit bugs" — this
   follows that directive. Raising it is a one-constant change plus a new
   trusted setup.
-- **Cross-process BFT finality.** `pkg/consensus` fully implements and
-  tests the BFT quorum rule (spec 5.7); `cmd/node` does not yet exchange
-  `StageVote` messages over the network to gate commit on a live quorum
-  across physical machines — each node finalizes its own admitted batch
-  locally today. Wiring the already-tested quorum logic into the
-  already-working message protocol is the natural next step, not a
-  redesign.
+- **Outage/megabatch recovery not yet wired into live consensus.**
+  `pkg/consensus` implements and tests spec 5.6's outage detection and
+  megabatch recovery logic, but `pkg/validator`'s round loop doesn't yet
+  call into it — a validator that misses blocks while offline currently
+  has no automated catch-up path beyond the single-block replay-adoption
+  `handleBlockAnnounce` already does. Wiring the already-tested recovery
+  logic into the round loop is the natural next step, not a redesign.
+
+Cross-process BFT finality (spec 5.7) is fully wired and network-tested:
+`pkg/validator` runs a real propose/vote/commit state machine — genuine
+Dilithium-signed `StageVote` messages exchanged over libp2p, independently
+re-verified signatures and committee membership on every node
+(`pkg/chain.Append`), and rollback of any round that doesn't reach quorum.
+`pkg/validator`'s package doc and its `TestFourNodesConvergeOnSameChain`
+integration test cover this end to end across real, independently-driven
+network peers, and `deployments/docker/docker-compose.yml`'s three
+validator-role nodes run it as a genuine multi-process network (see that
+file's comment for why they're wired as a full mesh, not a star: this
+reference build doesn't relay heartbeats or messages beyond directly
+connected peers, so every validator needs a direct connection to every
+other validator for their committee views to agree).
 
 Every other statement kind, formula, and safeguard named in the spec —
 Bank deposit/withdraw math, Vault splits, epoch clock, revolver scatter

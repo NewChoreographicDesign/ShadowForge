@@ -6,11 +6,21 @@
 # Peer discovery: libp2p peer IDs are generated fresh per container start,
 # so bootstrap addresses can't be hardcoded. Each node/simulator that
 # listens writes its dialable multiaddr to a shared volume
-# (-announce-file); everyone else waits for that file (-bootstrap-file)
-# before dialing. validator1 is the anchor every other service bootstraps
-# from; validator2 and the sentinel also announce their own addresses so
-# the wallet simulator (and any future node) has more than one peer to
-# discover through.
+# (-announce-file, published as soon as the host starts listening, before
+# it waits on anyone else's file — see cmd/node/main.go); everyone else
+# waits for that file (-bootstrap-file, comma-separated for more than one)
+# before dialing.
+#
+# The three validator-role nodes (validator1, validator2, sentinel1) are
+# wired as a full mesh, not a star through validator1: pkg/validator's
+# real BFT consensus (spec 5.7) needs every node to agree on the same
+# observed online set to compute the same deterministic committee
+# (pkg/consensus.AssignCommittee), and this reference build does not
+# relay heartbeats, proposals, or votes beyond directly connected peers —
+# a star topology would let each node's online view permanently diverge,
+# and committees (and therefore quorum) would never agree. Wallet clients
+# like walletsim are not part of the validator committee and only need
+# one entry point, so they stay star-connected to a single validator.
 #
 # Run: docker compose -f deployments/docker/docker-compose.yml up --build
 services:
@@ -33,13 +43,14 @@ services:
     entrypoint: ["/usr/local/bin/node"]
     command:
       - -listen=/ip4/0.0.0.0/tcp/4001
-      - -bootstrap-file=/shared/validator1.addr
+      - -bootstrap-file=/shared/validator1.addr,/shared/sentinel1.addr
       - -announce-file=/shared/validator2.addr
       - -skip-zk-setup
     volumes:
       - shared:/shared
     depends_on:
       - validator1
+      - sentinel1
 
   sentinel1:
     build:

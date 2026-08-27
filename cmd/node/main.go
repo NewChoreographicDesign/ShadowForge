@@ -1,27 +1,24 @@
 // Command node is the ShadowForge L1 validator node entrypoint (spec
-// 18.1's cmd/node). It wires together the state, consensus, transaction
+// 18.1's cmd/node). It wires together the state, chain, transaction
 // pipeline, and networking layers into a runnable process: a libp2p host
-// gossiping heartbeats and transaction offers, a 1-second batcher running
-// every admitted transaction through the five-stage pipeline, and the
-// epoch/revolver/sentinel bookkeeping described in spec section 5.
+// exchanging heartbeats, transaction offers, and real BFT consensus
+// messages (block proposals, stage votes, block announces) with its
+// peers, gated through pkg/validator's propose/vote/commit state machine
+// (spec section 5, including real Groth16 proof verification for Kind
+// Transfer and real Dilithium-signed cross-node vote collection — spec
+// 5.7's BFT quorum rule is enforced against genuine network peers, not
+// just unit-tested in isolation).
 //
-// Scope note: this wires up everything through Stage 5 commit for
-// transactions this node itself received and validated (spec 5.3's five
-// stages, including real Groth16 proof verification for Kind Transfer).
-// Cross-process BFT vote collection — gathering StageVote signatures from
-// other physical validators over the wire and only committing once
-// consensus.BFTQuorumMet holds across them (spec 5.7) — is implemented and
-// unit-tested in pkg/consensus, but this entrypoint does not yet wire that
-// exchange over the network; each node currently finalizes its own
-// admitted batch locally. That network-vote-collection wiring is the next
-// integration step beyond this reference build, not a gap in the
-// consensus logic itself.
+// Scope note: outage/megabatch recovery (spec 5.6) and sentinel
+// activation driving committee composition are implemented and
+// unit-tested in pkg/consensus, but not yet wired into pkg/validator's
+// round loop — see pkg/validator's package doc. This entrypoint still
+// emits SilentPad padding traffic in sentinel mode (spec 15.4).
 package main
 
 import (
 	"context"
 	cryptorand "crypto/rand"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -32,14 +29,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/peer"
-
+	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
+	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
-	"github.com/shadowforge/shadowforge-l1/pkg/types"
+	"github.com/shadowforge/shadowforge-l1/pkg/validator"
 	"github.com/shadowforge/shadowforge-l1/pkg/vault"
 	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
@@ -48,7 +45,13 @@ import (
 // SilentPad padding traffic (spec 15.4).
 const silentPadMeanInterval = 5 * time.Second
 
-const batchInterval = time.Second // spec 22 governance default
+// defaultGenesisMs is this reference deployment's fixed genesis timestamp
+// (2025-01-01T00:00:00Z, unix ms). Every node in a given network must
+// agree on the exact same genesis time: it is hashed into the genesis
+// block (pkg/chain.Open), and PrevHash-linked chain growth means nodes
+// with different genesis blocks can never converge. -genesis-ms overrides
+// this for a custom deployment or test network.
+const defaultGenesisMs int64 = 1735689600000
 
 func main() {
 	listen := flag.String("listen", "/ip4/0.0.0.0/tcp/4001", "libp2p listen multiaddr")
@@ -57,7 +60,9 @@ func main() {
 	sentinelFlag := flag.Bool("sentinel", false, "run as a protocol sentinel validator")
 	skipZK := flag.Bool("skip-zk-setup", false, "skip the Groth16 trusted setup (Kind Transfer proofs will be rejected)")
 	announceFile := flag.String("announce-file", "", "write this node's dialable multiaddr to this path once listening (for peer discovery over a shared volume, e.g. Docker Compose)")
-	bootstrapFile := flag.String("bootstrap-file", "", "read a bootstrap multiaddr from this path, waiting for it to appear (pairs with -announce-file on another node)")
+	bootstrapFile := flag.String("bootstrap-file", "", "comma-separated paths to wait for and read bootstrap multiaddrs from (pairs with -announce-file on other nodes) — a full mesh among validators needs one entry per peer, since this reference build doesn't relay heartbeats or messages beyond directly connected peers")
+	keyFile := flag.String("key-file", "", "path to this node's persisted Dilithium identity keypair (empty = generate a fresh, ephemeral identity every start)")
+	genesisMs := flag.Int64("genesis-ms", defaultGenesisMs, "chain genesis time, unix milliseconds — every node in a network must use the same value")
 	flag.Parse()
 
 	role := "civilian"
@@ -70,7 +75,7 @@ func main() {
 	if _, err := cryptorand.Read(encKey[:]); err != nil {
 		log.Fatalf("generate state encryption key: %v", err)
 	}
-	store, err := state.Open(*dataDir, *dataDir == "", encKey)
+	store, err := state.Open(*dataDir, *dataDir == "", crypto.EncryptionKey(encKey))
 	if err != nil {
 		log.Fatalf("open state store: %v", err)
 	}
@@ -80,6 +85,11 @@ func main() {
 		}
 	}()
 	stateTree := state.NewMerkleTree()
+
+	chn, err := chain.Open(store, *genesisMs)
+	if err != nil {
+		log.Fatalf("open chain: %v", err)
+	}
 
 	var zkSys *zk.System
 	if !*skipZK {
@@ -95,10 +105,12 @@ func main() {
 	}
 
 	v := vault.New(vault.DefaultSplits())
-	pipeline := tx.NewPipeline(tx.Deps{Store: store, StateTree: stateTree, ZK: zkSys, Vault: v, Now: time.Now})
 	mempool := tx.NewMempool()
-	revolver := consensus.NewRevolver()
-	sentinels := consensus.NewSentinelManager()
+
+	pk, sk, err := loadOrCreateIdentity(*keyFile)
+	if err != nil {
+		log.Fatalf("load/create validator identity: %v", err)
+	}
 
 	h, err := shadownet.NewHost(*listen)
 	if err != nil {
@@ -113,33 +125,27 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	node := shadownet.NewNode(h, nil, func(p peer.ID, env shadownet.Envelope) {
-		switch env.Type {
-		case shadownet.MsgHeartbeat:
-			var hb shadownet.HeartbeatPayload
-			if err := json.Unmarshal(env.Payload, &hb); err != nil {
-				log.Printf("bad heartbeat from %s: %v", p, err)
-				return
-			}
-			handleHeartbeat(revolver, hb)
+	for _, a := range shadownet.FullAddr(h) {
+		log.Printf("listening: %s", a)
+	}
+	log.Printf("node ready: peer id=%s", h.ID())
 
-		case shadownet.MsgTxOffer:
-			var offer shadownet.TxOfferPayload
-			if err := json.Unmarshal(env.Payload, &offer); err != nil {
-				log.Printf("bad tx offer from %s: %v", p, err)
-				return
+	// Published before waiting on any -bootstrap-file: the listen address
+	// is already known as soon as the host exists, independent of who
+	// this node still needs to connect to. Two nodes each waiting on the
+	// other's announce file (a full mesh's mutual bootstrapping) would
+	// deadlock if this instead happened after the bootstrap wait below.
+	if *announceFile != "" {
+		if addrs := shadownet.FullAddr(h); len(addrs) > 0 {
+			if err := writeAddrFile(*announceFile, addrs[0]); err != nil {
+				log.Printf("write announce file %s: %v", *announceFile, err)
 			}
-			if err := mempool.Submit(offer.Tx, time.Now()); err != nil {
-				log.Printf("tx offer from %s not admitted: %v", p, err)
-			}
-
-		default:
-			// BlockAnnounce, StageVote, MegabatchPart, ContainerSync,
-			// SilentPad: accepted on the wire (rate-limited like every
-			// other message type) but not yet acted on by this
-			// entrypoint — see the package doc's cross-process BFT note.
 		}
-	})
+	}
+
+	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, mempool, pk, sk, log.Printf)
+	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {
 		addr = strings.TrimSpace(addr)
@@ -153,45 +159,102 @@ func main() {
 		log.Printf("connected to bootstrap peer %s", addr)
 	}
 
-	if *bootstrapFile != "" {
-		addr, err := waitForAddrFile(ctx, *bootstrapFile)
-		if err != nil {
-			log.Printf("waiting for bootstrap file %s: %v", *bootstrapFile, err)
-		} else if err := shadownet.Connect(ctx, h, addr); err != nil {
-			log.Printf("bootstrap connect via file to %s failed: %v", addr, err)
-		} else {
-			log.Printf("connected to bootstrap peer %s (via %s)", addr, *bootstrapFile)
+	for _, path := range strings.Split(*bootstrapFile, ",") {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
 		}
+		addr, err := waitForAddrFile(ctx, path)
+		if err != nil {
+			log.Printf("waiting for bootstrap file %s: %v", path, err)
+			continue
+		}
+		if err := shadownet.Connect(ctx, h, addr); err != nil {
+			log.Printf("bootstrap connect via file to %s failed: %v", addr, err)
+			continue
+		}
+		log.Printf("connected to bootstrap peer %s (via %s)", addr, path)
 	}
 
-	genesis := consensus.GenesisTime(time.Now().UnixMilli())
-
-	go heartbeatLoop(ctx, node)
-	go batchLoop(ctx, mempool, pipeline)
-	go epochLoop(ctx, genesis, revolver, sentinels)
+	vnode.Start(ctx)
+	go epochLoop(ctx, consensus.GenesisTime(*genesisMs))
+	go chainStatusLoop(ctx, vnode)
 	if *sentinelFlag {
 		go silent.RunPadGenerator(ctx, mathrand.New(mathrand.NewSource(time.Now().UnixNano())), silentPadMeanInterval, func() {
-			emitSilentPad(ctx, node)
+			emitSilentPad(ctx, vnode.Net())
 		})
-	}
-
-	for _, a := range shadownet.FullAddr(h) {
-		log.Printf("listening: %s", a)
-	}
-	log.Printf("node ready: peer id=%s", h.ID())
-
-	if *announceFile != "" {
-		if addrs := shadownet.FullAddr(h); len(addrs) > 0 {
-			if err := writeAddrFile(*announceFile, addrs[0]); err != nil {
-				log.Printf("write announce file %s: %v", *announceFile, err)
-			}
-		}
 	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 	log.Println("shutting down")
+}
+
+// loadOrCreateIdentity loads a persisted Dilithium identity keypair from
+// path, or generates a fresh one (persisting it to path, if path is
+// non-empty) if none exists yet. A node's consensus identity
+// (types.NFTID) is derived from its public key, so restarting with a
+// different identity each time would make every one of its peers'
+// committee assignments disagree about who it is — path lets a
+// long-running node keep the same identity across restarts.
+func loadOrCreateIdentity(path string) (crypto.DilithiumPublicKey, crypto.DilithiumPrivateKey, error) {
+	if path != "" {
+		if b, err := os.ReadFile(path); err == nil {
+			pk, sk, err := decodeIdentity(b)
+			if err != nil {
+				return nil, nil, fmt.Errorf("decode identity file %s: %w", path, err)
+			}
+			return pk, sk, nil
+		} else if !os.IsNotExist(err) {
+			return nil, nil, fmt.Errorf("read identity file %s: %w", path, err)
+		}
+	}
+
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate identity: %w", err)
+	}
+	if path != "" {
+		if err := writeIdentityFile(path, pk, sk); err != nil {
+			return nil, nil, fmt.Errorf("persist identity file %s: %w", path, err)
+		}
+	}
+	return pk, sk, nil
+}
+
+// identity files are [4-byte big-endian pubkey length][pubkey][privkey];
+// the private key fills the remainder of the file, since Dilithium3's key
+// sizes are fixed per mode but this avoids hard-coding them here.
+func decodeIdentity(b []byte) (crypto.DilithiumPublicKey, crypto.DilithiumPrivateKey, error) {
+	if len(b) < 4 {
+		return nil, nil, fmt.Errorf("identity file too short (%d bytes)", len(b))
+	}
+	pkLen := int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+	if pkLen < 0 || 4+pkLen > len(b) {
+		return nil, nil, fmt.Errorf("identity file has an invalid public key length %d", pkLen)
+	}
+	pk := crypto.DilithiumPublicKey(b[4 : 4+pkLen])
+	sk := crypto.DilithiumPrivateKey(b[4+pkLen:])
+	if len(sk) == 0 {
+		return nil, nil, fmt.Errorf("identity file has no private key material")
+	}
+	return pk, sk, nil
+}
+
+func writeIdentityFile(path string, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey) error {
+	buf := make([]byte, 4+len(pk)+len(sk))
+	buf[0] = byte(len(pk) >> 24)
+	buf[1] = byte(len(pk) >> 16)
+	buf[2] = byte(len(pk) >> 8)
+	buf[3] = byte(len(pk))
+	copy(buf[4:], pk)
+	copy(buf[4+len(pk):], sk)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // writeAddrFile atomically publishes this node's dialable multiaddr so a
@@ -226,35 +289,6 @@ func waitForAddrFile(ctx context.Context, path string) (string, error) {
 	}
 }
 
-func handleHeartbeat(revolver *consensus.Revolver, hb shadownet.HeartbeatPayload) {
-	revolver.RequestJoin(types.QueueItem{
-		NFT:      hb.NFT,
-		JoinedAt: hb.Timestamp,
-		LastBeat: hb.Timestamp,
-	}, time.Now())
-}
-
-func heartbeatLoop(ctx context.Context, node *shadownet.Node) {
-	ticker := time.NewTicker(consensus.HeartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
-				NFT:       types.NFTID(types.SumHash([]byte(node.Host.ID().String()))),
-				Timestamp: time.Now().UnixMilli(),
-			})
-			if err != nil {
-				log.Printf("build heartbeat: %v", err)
-				continue
-			}
-			node.Broadcast(ctx, env)
-		}
-	}
-}
-
 // emitSilentPad broadcasts one null ZK padding message (spec 15.4:
 // sentinels/Vault keep circuits warm and absorb burst load). The nonce is
 // cosmetic — SilentPad carries no proof or value, so it never touches the
@@ -275,30 +309,7 @@ func emitSilentPad(ctx context.Context, node *shadownet.Node) {
 	node.Broadcast(ctx, env)
 }
 
-func batchLoop(ctx context.Context, mempool *tx.Mempool, pipeline *tx.Pipeline) {
-	ticker := time.NewTicker(batchInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			entries := mempool.DrainBatch(0)
-			if len(entries) == 0 {
-				continue
-			}
-			for _, r := range pipeline.ProcessBatch(entries) {
-				if r.Error != nil {
-					log.Printf("tx %s rejected: %v", r.Tx.TxID, r.Error)
-				} else {
-					log.Printf("tx %s committed (kind=%s)", r.Tx.TxID, r.Tx.Kind)
-				}
-			}
-		}
-	}
-}
-
-func epochLoop(ctx context.Context, genesis consensus.GenesisTime, revolver *consensus.Revolver, sentinels *consensus.SentinelManager) {
+func epochLoop(ctx context.Context, genesis consensus.GenesisTime) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	var lastEpoch = ^uint64(0)
@@ -307,18 +318,31 @@ func epochLoop(ctx context.Context, genesis consensus.GenesisTime, revolver *con
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			now := time.Now()
-			epoch := consensus.CurrentEpoch(genesis, now)
+			epoch := consensus.CurrentEpoch(genesis, time.Now())
 			if epoch != lastEpoch {
 				log.Printf("epoch %d (duration %s)", epoch, consensus.EpochDuration(epoch))
 				lastEpoch = epoch
 			}
-			online := revolver.Online(now)
-			switch sentinels.Evaluate(online, now.UnixMilli()) {
-			case consensus.ActionActivate:
-				log.Printf("SENTINELS ACTIVATED: only %d online civilian validators (threshold %d)", online, consensus.SentinelThreshold)
-			case consensus.ActionWithdraw:
-				log.Printf("sentinels withdrawing: %d online civilian validators recovered", online)
+		}
+	}
+}
+
+// chainStatusLoop periodically logs this node's real chain head, so an
+// operator (or the Docker multi-node smoke test) can observe consensus
+// genuinely advancing rather than trusting it silently.
+func chainStatusLoop(ctx context.Context, vnode *validator.Node) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	lastHeight := ^uint64(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h := vnode.Chain().HeadHeight()
+			if h != lastHeight {
+				log.Printf("chain height=%d hash=%s", h, vnode.Chain().HeadHash())
+				lastHeight = h
 			}
 		}
 	}

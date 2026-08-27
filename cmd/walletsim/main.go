@@ -119,6 +119,11 @@ func submitRandomVote(ctx context.Context, node *shadownet.Node, pk crypto.Dilit
 			ProposalID: types.ID("sim-proposal"),
 			Commitment: types.SumHash(proposalID[:], []byte("commit")),
 		},
+		// Nullifier here carries no double-spend meaning (that check is
+		// Transfer-only) — it's this simulated ballot's per-submission
+		// uniqueifier, so distinct calls produce distinct TxIDs below
+		// instead of every simulated vote colliding on the same hash.
+		Nullifier: types.SumHash(proposalID[:], []byte("nullifier")),
 	}
 	// TxID = Hash(proof || commitments || nullifier) per spec 4.1; a Vote
 	// tx carries neither a ZK proof nor commitments, so this reduces to

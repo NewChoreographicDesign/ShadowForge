@@ -104,12 +104,38 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 	// conflicting candidates for the same height.
 	time.Sleep(10 * cfg.HeartbeatInterval)
 
+	// Submitted like a real wallet would: one TxOffer, sent to exactly one
+	// node (node 0), over a connection none of the other three nodes are
+	// party to. Whichever node ends up deterministically assigned
+	// proposer for height 1 needs this transaction in ITS OWN mempool to
+	// propose it — so this also exercises pkg/validator's TxOffer gossip
+	// forwarding (handleMessage's MsgTxOffer case rebroadcasting a newly
+	// admitted offer to its own peers), not just a shortcut that seeds
+	// every node's mempool directly.
+	walletHost, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("wallet host: %v", err)
+	}
+	t.Cleanup(func() { _ = walletHost.Close() })
+	walletNode := shadownet.NewNode(walletHost, nil, nil)
+	addrs := shadownet.FullAddr(hosts[0])
+	if len(addrs) == 0 {
+		t.Fatalf("node 0 has no listen addresses")
+	}
+	connectCtx, connectCancel := context.WithTimeout(ctx, 5*time.Second)
+	if err := shadownet.Connect(connectCtx, walletHost, addrs[0]); err != nil {
+		connectCancel()
+		t.Fatalf("wallet connect to node 0: %v", err)
+	}
+	connectCancel()
+
 	voteTx := mustSignIntegrationVote(t, "integration-proposal")
-	now := time.Now()
-	for i, node := range nodes {
-		if err := node.Mempool().Submit(voteTx, now); err != nil {
-			t.Fatalf("node %d: submit tx: %v", i, err)
-		}
+	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: voteTx})
+	if err != nil {
+		t.Fatalf("build tx offer: %v", err)
+	}
+	if err := walletNode.Send(ctx, hosts[0].ID(), env); err != nil {
+		t.Fatalf("send tx offer to node 0: %v", err)
 	}
 
 	deadline := time.Now().Add(15 * time.Second)

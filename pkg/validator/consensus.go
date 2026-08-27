@@ -3,6 +3,7 @@ package validator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -40,7 +41,20 @@ func (n *Node) handleMessage(p peer.ID, env shadownet.Envelope) {
 			n.log("validator: bad tx offer from %s: %v", p, err)
 			return
 		}
-		if err := n.mempool.Submit(offer.Tx, time.Now()); err != nil {
+		switch err := n.mempool.Submit(offer.Tx, time.Now()); {
+		case err == nil:
+			// Newly admitted: forward to our own peers so this
+			// transaction propagates beyond whichever single node it
+			// happened to be submitted to. Without this, a tx a wallet
+			// hands to a non-proposer node would sit in that node's
+			// mempool forever — proposals only ever come from whoever
+			// is deterministically assigned proposer for a height, and
+			// that node only ever drains its own local mempool.
+			n.net.Broadcast(context.Background(), env)
+		case errors.Is(err, tx.ErrDuplicateTx):
+			// Already circulating (our own earlier forward looping back,
+			// or two peers relaying the same offer) — nothing to do.
+		default:
 			n.log("validator: tx offer from %s not admitted: %v", p, err)
 		}
 
@@ -117,7 +131,7 @@ func (n *Node) sweepTimeouts() {
 	// roundMu rather than extending its critical section.
 	for _, r := range expired {
 		for _, t := range r.batch {
-			_ = n.mempool.Submit(t, time.Now()) // best-effort retry; a full mempool just drops it
+			_ = n.mempool.Reinsert(t, time.Now()) // best-effort retry; a full mempool just drops it
 		}
 	}
 }
