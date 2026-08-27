@@ -104,9 +104,21 @@ type Node struct {
 
 	log Logf
 
-	mu     sync.Mutex
+	mu     sync.Mutex // guards online only
 	online map[types.NFTID]onlineInfo
-	rounds map[uint64]*round
+
+	// roundMu guards rounds and every mutation of tree/store/txn state
+	// made while processing a round (handleBlockProposal, handleStageVote,
+	// tryFinalizeLocked, sweepTimeouts, handleBlockAnnounce). Real
+	// network delivery means these can fire concurrently from multiple
+	// libp2p stream goroutines at once; without a single lock serializing
+	// them, concurrent handlers race on the same *state.MerkleTree and
+	// round bookkeeping. A separate mutex from mu (rather than reusing
+	// it) avoids self-deadlock: this package's round-processing methods
+	// call onlineSet/pubKeyLookup, which lock mu, while already holding
+	// roundMu.
+	roundMu sync.Mutex
+	rounds  map[uint64]*round
 }
 
 // NewNode builds a validator.Node, constructing its own net.Node on h so

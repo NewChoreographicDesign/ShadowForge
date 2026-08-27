@@ -97,7 +97,7 @@ func (n *Node) roundLoop(ctx context.Context) {
 
 func (n *Node) sweepTimeouts() {
 	now := time.Now()
-	n.mu.Lock()
+	n.roundMu.Lock()
 	var expired []*round
 	for h, r := range n.rounds {
 		if now.After(r.deadline) {
@@ -105,12 +105,17 @@ func (n *Node) sweepTimeouts() {
 			delete(n.rounds, h)
 		}
 	}
-	n.mu.Unlock()
-
 	for _, r := range expired {
 		n.log("validator: round at height %d timed out with %d/%d votes, rolling back", r.height, len(r.votes), len(r.committee))
 		r.rollback()
 		n.tree.TruncateTo(r.treeSnapshotLen)
+	}
+	n.roundMu.Unlock()
+
+	// Mempool has its own internal locking and isn't touched by any other
+	// roundMu-guarded path, so resubmission can happen after releasing
+	// roundMu rather than extending its critical section.
+	for _, r := range expired {
 		for _, t := range r.batch {
 			_ = n.mempool.Submit(t, time.Now()) // best-effort retry; a full mempool just drops it
 		}
@@ -120,9 +125,9 @@ func (n *Node) sweepTimeouts() {
 func (n *Node) maybePropose() {
 	nextHeight := n.chn.NextHeight()
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	_, inFlight := n.rounds[nextHeight]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if inFlight {
 		return // already proposed or voting on this height
 	}
@@ -172,13 +177,6 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 		return // stale or premature: doesn't chain onto our current head
 	}
 
-	n.mu.Lock()
-	if _, exists := n.rounds[prop.Height]; exists {
-		n.mu.Unlock()
-		return // already processing this height
-	}
-	n.mu.Unlock()
-
 	online := n.onlineSet(time.Now())
 	committee := consensus.AssignCommittee(online, prop.Height, committeeSize(len(online)))
 	if len(committee) == 0 || committee[0] != prop.Proposer {
@@ -187,6 +185,18 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	}
 	if !containsID(committee, n.identity) {
 		return // not our job to vote on this height
+	}
+
+	// Every mutation of n.rounds, n.tree, or n.store made while processing
+	// a round is serialized under roundMu — real concurrent network
+	// delivery (a proposal and a vote, or two votes, arriving on
+	// different libp2p streams at once) would otherwise race on the same
+	// *state.MerkleTree.
+	n.roundMu.Lock()
+	defer n.roundMu.Unlock()
+
+	if _, exists := n.rounds[prop.Height]; exists {
+		return // already processing this height
 	}
 
 	treeSnapshot := n.tree.Len()
@@ -235,9 +245,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 		votes:           []types.Vote{ownVote},
 		deadline:        time.Now().Add(n.cfg.RoundTimeout),
 	}
-	n.mu.Lock()
 	n.rounds[prop.Height] = r
-	n.mu.Unlock()
 
 	voteEnv, err := shadownet.NewEnvelope(shadownet.MsgStageVote, shadownet.StageVotePayload{
 		Height: prop.Height, Validator: n.identity, CandidateHash: candidate, Sig: types.DilithiumSig(sig),
@@ -248,13 +256,14 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	}
 	n.net.Broadcast(context.Background(), voteEnv)
 
-	n.tryFinalize(r)
+	n.tryFinalizeLocked(r)
 }
 
 func (n *Node) handleStageVote(v shadownet.StageVotePayload) {
-	n.mu.Lock()
+	n.roundMu.Lock()
+	defer n.roundMu.Unlock()
+
 	r, ok := n.rounds[v.Height]
-	n.mu.Unlock()
 	if !ok || r.candidate != v.CandidateHash {
 		return // not tracking this round, or vote is for a different candidate than ours
 	}
@@ -269,23 +278,21 @@ func (n *Node) handleStageVote(v shadownet.StageVotePayload) {
 		return
 	}
 
-	n.mu.Lock()
 	r.votes = append(r.votes, types.Vote{Validator: v.Validator, StateRoot: v.CandidateHash, Sig: v.Sig})
-	n.mu.Unlock()
 
-	n.tryFinalize(r)
+	n.tryFinalizeLocked(r)
 }
 
-// tryFinalize checks whether r's votes now meet BFT quorum and, if so,
-// commits the tentatively-applied batch and grows the chain.
-func (n *Node) tryFinalize(r *round) {
-	n.mu.Lock()
-	_, endorsed := n.rounds[r.height]
-	votes := append([]types.Vote(nil), r.votes...)
-	n.mu.Unlock()
-	if !endorsed {
+// tryFinalizeLocked checks whether r's votes now meet BFT quorum and, if
+// so, commits the tentatively-applied batch and grows the chain. Callers
+// must already hold roundMu; this never locks it itself, since it's
+// invoked from within both handleBlockProposal's and handleStageVote's
+// own roundMu-held sections.
+func (n *Node) tryFinalizeLocked(r *round) {
+	if _, endorsed := n.rounds[r.height]; !endorsed {
 		return // already finalized (or rolled back) by a concurrent path
 	}
+	votes := append([]types.Vote(nil), r.votes...)
 
 	_, quorum := consensus.TallyVotes(r.committee, r.candidate, votes)
 	if !quorum {
@@ -297,18 +304,14 @@ func (n *Node) tryFinalize(r *round) {
 		n.log("validator: quorum reached locally but chain.Append rejected height %d: %v", r.height, err)
 		r.rollback()
 		n.tree.TruncateTo(r.treeSnapshotLen)
-		n.mu.Lock()
 		delete(n.rounds, r.height)
-		n.mu.Unlock()
 		return
 	}
 	if err := r.txn.Commit(); err != nil {
 		n.log("validator: FATAL-ish: chain accepted height %d but the state txn failed to commit: %v", r.height, err)
 	}
 
-	n.mu.Lock()
 	delete(n.rounds, r.height)
-	n.mu.Unlock()
 
 	n.log("validator: committed height %d (%d votes) state_root=%s", r.height, len(votes), r.block.StateRoot)
 
@@ -334,19 +337,19 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 		return // stale, or too far ahead for this build's single-block adoption
 	}
 
-	n.mu.Lock()
-	r, hadRound := n.rounds[height]
-	delete(n.rounds, height)
-	n.mu.Unlock()
-	if hadRound {
+	online := n.onlineSet(time.Now())
+	committee := consensus.AssignCommittee(online, height, committeeSize(len(online)))
+
+	n.roundMu.Lock()
+	defer n.roundMu.Unlock()
+
+	if r, hadRound := n.rounds[height]; hadRound {
 		// Whatever this node was tentatively tracking for this height is
 		// superseded by the announced block; discard it before replaying.
+		delete(n.rounds, height)
 		r.rollback()
 		n.tree.TruncateTo(r.treeSnapshotLen)
 	}
-
-	online := n.onlineSet(time.Now())
-	committee := consensus.AssignCommittee(online, height, committeeSize(len(online)))
 
 	treeSnapshot := n.tree.Len()
 	txn := n.store.BeginTxn()

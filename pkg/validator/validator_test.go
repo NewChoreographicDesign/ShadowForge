@@ -157,9 +157,9 @@ func TestFullRoundReachesQuorumAndCommits(t *testing.T) {
 	}
 	n.handleBlockProposal(prop)
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	r, ok := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if !ok {
 		t.Fatalf("expected a tracked round at height %d after a valid proposal", height)
 	}
@@ -198,9 +198,9 @@ func TestFullRoundReachesQuorumAndCommits(t *testing.T) {
 	if n.chn.HeadHash() != r.candidate {
 		t.Fatalf("expected chain head hash to equal the finalized candidate")
 	}
-	n.mu.Lock()
+	n.roundMu.Lock()
 	_, stillTracked := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if stillTracked {
 		t.Fatalf("expected the round to be cleaned up after finalization")
 	}
@@ -223,9 +223,9 @@ func TestForgedVoteDoesNotCountTowardQuorum(t *testing.T) {
 	}
 	n.handleBlockProposal(prop)
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	r, ok := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if !ok {
 		t.Fatalf("expected a tracked round")
 	}
@@ -252,10 +252,10 @@ func TestForgedVoteDoesNotCountTowardQuorum(t *testing.T) {
 		Height: height, Validator: target, CandidateHash: r.candidate, Sig: types.DilithiumSig(forgedSig),
 	})
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	r2, ok := n.rounds[height]
 	votes := len(r2.votes)
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if !ok {
 		t.Fatalf("round should still be pending (quorum not reached)")
 	}
@@ -285,14 +285,14 @@ func TestRoundRollsBackOnTimeout(t *testing.T) {
 	}
 	n.handleBlockProposal(prop)
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	r, ok := n.rounds[height]
 	if !ok {
-		n.mu.Unlock()
+		n.roundMu.Unlock()
 		t.Fatalf("expected a tracked round")
 	}
 	r.deadline = time.Now().Add(-time.Second) // force expiry
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 
 	// The tentative write must not be visible on the real store yet — it
 	// only exists inside the round's still-open, uncommitted state.Txn.
@@ -308,9 +308,9 @@ func TestRoundRollsBackOnTimeout(t *testing.T) {
 
 	n.sweepTimeouts()
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	_, stillTracked := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if stillTracked {
 		t.Fatalf("expected the timed-out round to be removed")
 	}
@@ -352,9 +352,9 @@ func TestHandleBlockProposalRejectsInvalidTx(t *testing.T) {
 	}
 	n.handleBlockProposal(prop)
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	_, ok := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if ok {
 		t.Fatalf("expected no round to be created for a proposal containing an invalid tx")
 	}
@@ -390,9 +390,9 @@ func TestHandleBlockProposalRejectsWrongProposer(t *testing.T) {
 	}
 	n.handleBlockProposal(prop)
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	_, ok := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 	if ok {
 		t.Fatalf("expected the proposal from a non-assigned proposer to be rejected")
 	}
@@ -416,9 +416,9 @@ func TestMaybeProposeOnlySelfProposesOnItsOwnTurn(t *testing.T) {
 
 	n.maybePropose()
 
-	n.mu.Lock()
+	n.roundMu.Lock()
 	_, ok := n.rounds[height]
-	n.mu.Unlock()
+	n.roundMu.Unlock()
 
 	if committee[0] == n.identity {
 		if !ok {
