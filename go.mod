@@ -11,6 +11,7 @@ require (
 	github.com/libp2p/go-libp2p v0.49.0
 	github.com/multiformats/go-multiaddr v0.16.1
 	golang.org/x/crypto v0.54.0
+	golang.org/x/term v0.45.0
 	golang.org/x/time v0.15.0
 )
 
