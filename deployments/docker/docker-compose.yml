@@ -1,0 +1,75 @@
+# Phase 2 multi-node verification network (spec 6: "Multi-node
+# verification in Phase 2 of the development plan is a Docker compose of
+# at least four nodes: two civilian validators, one sentinel candidate,
+# one client wallet simulator.")
+#
+# Peer discovery: libp2p peer IDs are generated fresh per container start,
+# so bootstrap addresses can't be hardcoded. Each node/simulator that
+# listens writes its dialable multiaddr to a shared volume
+# (-announce-file); everyone else waits for that file (-bootstrap-file)
+# before dialing. validator1 is the anchor every other service bootstraps
+# from; validator2 and the sentinel also announce their own addresses so
+# the wallet simulator (and any future node) has more than one peer to
+# discover through.
+#
+# Run: docker compose -f deployments/docker/docker-compose.yml up --build
+services:
+  validator1:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/node"]
+    command:
+      - -listen=/ip4/0.0.0.0/tcp/4001
+      - -announce-file=/shared/validator1.addr
+      - -skip-zk-setup # keep the 4-node smoke test fast; omit to exercise real Transfer proofs
+    volumes:
+      - shared:/shared
+
+  validator2:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/node"]
+    command:
+      - -listen=/ip4/0.0.0.0/tcp/4001
+      - -bootstrap-file=/shared/validator1.addr
+      - -announce-file=/shared/validator2.addr
+      - -skip-zk-setup
+    volumes:
+      - shared:/shared
+    depends_on:
+      - validator1
+
+  sentinel1:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/node"]
+    command:
+      - -listen=/ip4/0.0.0.0/tcp/4001
+      - -bootstrap-file=/shared/validator1.addr
+      - -announce-file=/shared/sentinel1.addr
+      - -sentinel
+      - -skip-zk-setup
+    volumes:
+      - shared:/shared
+    depends_on:
+      - validator1
+
+  walletsim:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/walletsim"]
+    command:
+      - -listen=/ip4/0.0.0.0/tcp/4010
+      - -bootstrap-file=/shared/validator2.addr
+      - -interval=3s
+    volumes:
+      - shared:/shared
+    depends_on:
+      - validator2
+
+volumes:
+  shared:
