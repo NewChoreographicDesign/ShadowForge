@@ -336,6 +336,36 @@ func (b *Builder) ProposeSlash(proposalID types.ID, approve bool, target types.N
 	return b.finalize(t)
 }
 
+// ProposeUnlockTransfer casts a real sealed ballot for proposalID exactly
+// like ProposeSlash does, and binds it to a real spec-10.1 "unlock a
+// transfer trait" request against target (see types.VotePublicInputs.
+// UnlockTransferTarget's own doc). Like ProposeSlash, this needs no
+// Groth16 proof of its own — pkg/tx's Stage 4 checks target really
+// exists at the moment this binds, and the actual unlock runs once, at
+// tally, if the proposal passes.
+func (b *Builder) ProposeUnlockTransfer(proposalID types.ID, approve bool, target types.NFTID, eligibility types.VoteEligibilityProof) (types.ShieldedTx, error) {
+	if proposalID == "" {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: proposal id must not be empty")
+	}
+	if target.IsZero() {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: unlock-transfer target must not be empty")
+	}
+	nonce := voteNonce(proposalID, eligibility.Nullifier)
+	commitment := types.ComputeVoteCommitment(eligibility.Nullifier, approve, nonce)
+
+	t := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID:           proposalID,
+			Commitment:           commitment,
+			UnlockTransferTarget: target,
+		},
+		VoteEligibility: &eligibility,
+		Nullifier:       types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("unlock-transfer-commit")),
+	}
+	return b.finalize(t)
+}
+
 // VoteReveal opens the sealed ballot Vote(proposalID, approve, ...)
 // earlier committed, by recomputing the same deterministic nonce and
 // handing back the (approve, nonce) pair the pipeline checks against the

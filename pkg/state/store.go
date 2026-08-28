@@ -50,6 +50,10 @@ type Accessor interface {
 	// outcome (governance.SlashBurn). See deleteNFT's own doc for why
 	// both index entries must go together.
 	DeleteNFT(nft types.ValidatorNFT) error
+	// TransferNFTOwner moves nft (already carrying its new Owner) away
+	// from oldOwner's index entry — the real spec-10.1 ownership-change
+	// counterpart of PutNFT. See transferNFTOwner's own doc.
+	TransferNFTOwner(oldOwner types.Address, nft types.ValidatorNFT) error
 	GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error)
 	// GetNFTByOwner looks up the (at most one, real "one per wallet")
 	// ValidatorNFT record for owner — the real check TxNFTMint's Stage 4
@@ -274,6 +278,22 @@ func deleteNFT(txn *badger.Txn, nft types.ValidatorNFT) error {
 	return txn.Delete(withPrefix(prefixNFTByOwner, nft.Owner.String()))
 }
 
+// transferNFTOwner moves nft (already carrying its new Owner) to a fresh
+// owner-index entry and removes the old one — the real spec-10.1
+// ownership-change bookkeeping putNFT alone cannot do, since it only
+// ever writes the CURRENT Owner's index entry and has no way to know a
+// previous one needs clearing. Without this, a wallet that transferred
+// its NFT away would keep resolving via GetNFTByOwner to an NFT it no
+// longer holds — a real Sybil-resistance bug (spec 10.1's "one per
+// wallet" would silently stop being enforced for that wallet), not
+// merely stale bookkeeping.
+func transferNFTOwner(txn *badger.Txn, oldOwner types.Address, nft types.ValidatorNFT) error {
+	if err := txn.Delete(withPrefix(prefixNFTByOwner, oldOwner.String())); err != nil {
+		return err
+	}
+	return putNFT(txn, nft)
+}
+
 func (s *Store) PutNFT(nft types.ValidatorNFT) error {
 	return s.db.Update(func(txn *badger.Txn) error { return putNFT(txn, nft) })
 }
@@ -281,6 +301,12 @@ func (s *Store) PutNFT(nft types.ValidatorNFT) error {
 // DeleteNFT permanently removes nft — see deleteNFT's own doc.
 func (s *Store) DeleteNFT(nft types.ValidatorNFT) error {
 	return s.db.Update(func(txn *badger.Txn) error { return deleteNFT(txn, nft) })
+}
+
+// TransferNFTOwner moves nft (already carrying its new Owner) to oldOwner's
+// successor — see transferNFTOwner's own doc.
+func (s *Store) TransferNFTOwner(oldOwner types.Address, nft types.ValidatorNFT) error {
+	return s.db.Update(func(txn *badger.Txn) error { return transferNFTOwner(txn, oldOwner, nft) })
 }
 
 func (s *Store) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
@@ -384,6 +410,15 @@ type ProposalRecord struct {
 	SlashTargetNFT types.NFTID
 	SlashBurn      bool
 	SlashApplied   bool
+
+	// UnlockTransferTarget/UnlockTransferApplied are a real spec-10.1
+	// transfer-unlock proposal's bound claim and execution status — see
+	// types.VotePublicInputs.UnlockTransferTarget's own doc.
+	// UnlockTransferTarget's zero value means this proposal requests no
+	// unlock. UnlockTransferApplied mirrors SlashApplied: the durable
+	// record of whether pkg/nft.UnlockTransfer already ran.
+	UnlockTransferTarget  types.NFTID
+	UnlockTransferApplied bool
 
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch

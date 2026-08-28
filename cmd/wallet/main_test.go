@@ -822,6 +822,108 @@ func TestCLIProposeSlashEndToEnd(t *testing.T) {
 	}
 }
 
+// TestCLIProposeUnlockTransferAndNFTTransferEndToEnd proves the real
+// spec-10.1 transfer-unlock-then-transfer path end to end through the
+// actual CLI: a real minted NFT gives a voter real anonymous
+// eligibility, 'wallet propose-unlock-transfer' builds and submits a
+// real unlock request against a second, separately-minted target NFT, a
+// matching 'wallet vote-reveal' opens the sealed ballot, the test drives
+// the same real TallyDueProposals a live validator runs at epoch end
+// (see TestCLIProposeMintEndToEnd's identical doc for why), and only
+// THEN does 'wallet nft-transfer', signed by the target's own real
+// keystore identity, actually move the NFT to a new owner.
+func TestCLIProposeUnlockTransferAndNFTTransferEndToEnd(t *testing.T) {
+	backend := newTestBackend(t, 0x09, nil, nil, nil)
+
+	voterPath, voterKS := newTestKeystore(t, "unlock-voter-passphrase")
+	mintNFTViaCLI(t, backend, voterKS.PublicKey(), voterPath, "unlock-voter-passphrase")
+
+	targetPath, targetKS := newTestKeystore(t, "unlock-target-passphrase")
+	mintNFTViaCLI(t, backend, targetKS.PublicKey(), targetPath, "unlock-target-passphrase")
+	targetOwner := types.AddressFromPubkey(targetKS.PublicKey())
+	targetNFT, found, err := backend.store.GetNFTByOwner(targetOwner)
+	if err != nil || !found {
+		t.Fatalf("expected the target's real minted NFT to be found: found=%v err=%v", found, err)
+	}
+
+	withStdin(t, "unlock-voter-passphrase")
+	out, err := captureStdout(t, func() error {
+		return runProposeUnlockTransfer([]string{
+			"-keystore", voterPath, "-passphrase-stdin",
+			"-proposal", "cli-unlock-1", "-approve", "-target", targetNFT.ID.String(),
+			"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runProposeUnlockTransfer: %v", err)
+	}
+	if !strings.Contains(out, "real transfer-unlock proposal built") {
+		t.Fatalf("expected propose-unlock-transfer output to describe the real proposal, got:\n%s", out)
+	}
+
+	withStdin(t, "unlock-voter-passphrase")
+	err = runVoteReveal([]string{
+		"-keystore", voterPath, "-passphrase-stdin",
+		"-proposal", "cli-unlock-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runVoteReveal: %v", err)
+	}
+
+	tallied, err := backend.pipeline.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed || !tallied[0].UnlockTransferApplied {
+		t.Fatalf("expected the real proposal to pass and the real unlock to be applied, got %+v", tallied)
+	}
+
+	unlocked, found, err := backend.store.GetNFT(targetNFT.ID)
+	if err != nil || !found {
+		t.Fatalf("get target nft: found=%v err=%v", found, err)
+	}
+	if unlocked.Traits["transferable"] != "true" {
+		t.Fatalf("expected the real transferable trait to be set, got %+v", unlocked.Traits)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runProposal([]string{"-query", backend.queryURL, "-id", "cli-unlock-1"})
+	})
+	if err != nil {
+		t.Fatalf("runProposal: %v", err)
+	}
+	if !strings.Contains(out, "unlock transfer applied: true") {
+		t.Fatalf("expected 'wallet proposal' to report the real unlock as applied, got:\n%s", out)
+	}
+
+	newOwner := types.Address{0x42}
+	withStdin(t, "unlock-target-passphrase")
+	err = runNFTTransfer([]string{
+		"-keystore", targetPath, "-passphrase-stdin",
+		"-target", targetNFT.ID.String(), "-new-owner", newOwner.String(),
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runNFTTransfer: %v", err)
+	}
+
+	moved, found, err := backend.store.GetNFT(targetNFT.ID)
+	if err != nil || !found {
+		t.Fatalf("get transferred nft: found=%v err=%v", found, err)
+	}
+	if moved.Owner != newOwner {
+		t.Fatalf("expected Owner %s, got %s", newOwner, moved.Owner)
+	}
+	if _, found, err := backend.store.GetNFTByOwner(targetOwner); err != nil {
+		t.Fatalf("get by old owner: %v", err)
+	} else if found {
+		t.Fatalf("expected the old owner's index entry to be removed after a real CLI transfer")
+	}
+}
+
 // TestCLIProposeMintStakedAndUnstakeEndToEnd proves the real spec-17.4
 // staked-yield path end to end through the actual CLI: 'wallet
 // propose-mint -staked' builds and submits a real, Groth16-proven staked

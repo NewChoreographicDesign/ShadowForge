@@ -295,6 +295,36 @@ package — this is not a stub with comments describing intended behavior.
   re-registration) `requireEligibleVoterZK`'s own doc already named; this
   work makes the slash itself real without claiming to have closed that
   older, deeper gap.
+- **Real spec-10.1 NFT transfer-unlock and a real transfer mechanism to
+  unlock — closing a gap where the trait existed but nothing could ever
+  use it.** `pkg/nft.CanTransfer`/`UnlockTransfer`/`ErrTransferDisabled`
+  have existed since this build's NFT lifecycle work, but nothing ever
+  called `UnlockTransfer` from a real governance outcome, and no
+  transaction kind could ever move an NFT's `Owner` at all — unlocking
+  alone would have set a trait nothing checked or acted on. This build
+  closes both halves. `types.VotePublicInputs` gained
+  `UnlockTransferTarget`, bound at proposal time via the same "first
+  `TxVote` wins" mechanism `SlashTargetNFT` already established;
+  `TallyDueProposals` calls the real `pkg/nft.UnlockTransfer` on a pass.
+  A genuinely new transaction kind, `Kind NFTTransfer`, is the real
+  ownership move: Stage 4 requires the transaction's own real Dilithium
+  signature to resolve to the NFT's *current* owner (`pkg/nft.
+  TransferOwnership`, mirroring `Mint`'s pure-validation shape), the
+  target to actually carry the real `"transferable"` trait, and — the
+  security-critical check — the receiving wallet to not already hold a
+  different NFT, so spec 10.1's "one per wallet" Sybil-resistance
+  invariant survives a transfer rather than only holding at mint time.
+  A new `state.Store.TransferNFTOwner` (added to `Accessor`) atomically
+  moves the owner-index entry rather than merely writing a new one —
+  `PutNFT` alone would have left a stale entry under the old owner,
+  which would have silently kept letting them pass "already has an
+  NFT" checks for an NFT they no longer held. `pkg/txbuilder.
+  Builder.ProposeUnlockTransfer`/`NFTTransfer` and `cmd/wallet
+  propose-unlock-transfer`/`nft-transfer` are the real CLI;
+  `nft-transfer` signs with the caller's own real identity rather than
+  a throwaway key, since the transaction's signature *is* the real
+  authorization check here, unlike `vote`/`propose-mint`'s anonymity
+  requirement.
 
 ## Security
 

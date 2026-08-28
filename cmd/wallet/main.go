@@ -58,6 +58,10 @@ func main() {
 		err = runUnstake(args)
 	case "propose-slash":
 		err = runProposeSlash(args)
+	case "propose-unlock-transfer":
+		err = runProposeUnlockTransfer(args)
+	case "nft-transfer":
+		err = runNFTTransfer(args)
 	case "mint":
 		err = runMint(args)
 	case "nft-trait":
@@ -151,6 +155,22 @@ disclosed limitation this does not fix: anonymous voter eligibility
 still cannot re-check whether the NFT behind a valid vote has since
 been slashed, since a membership proof never reveals which leaf it
 opens — see types.VotePublicInputs.SlashTargetNFT's own doc.
+
+Real spec-10.1 transfer-unlock proposal and real NFT transfer — a
+soulbound NFT cannot change hands until a governance vote unlocks it,
+and once unlocked, a genuine ownership move actually exists (before
+this, unlocking set a trait nothing ever checked or acted on):
+  wallet propose-unlock-transfer -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -target <hex> -eligibility-zk-params <file>
+Once tallied, check 'wallet proposal -id <id>' for real Passed/
+UnlockTransferApplied status, then the current owner moves it:
+  wallet nft-transfer -keystore <file> -bootstrap <addr> -query <url> -target <hex> -new-owner <hex-address>
+'nft-transfer' signs with the keystore's own real identity (not a
+throwaway key): the transaction's signature IS the real authorization
+pkg/tx's pipeline checks, resolved against the NFT's current owner, and
+is rejected outright for anyone else, for an NFT that isn't unlocked,
+or if the receiving wallet already holds a different NFT — spec 10.1's
+"one per wallet" invariant must survive a transfer, not just hold at
+mint time.
 
 Real spec-17.4 epoch mint — both proposer paths spec 13.1/17.4 name are
 implemented: submitting a proposal both casts its own first ballot and

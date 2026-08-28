@@ -102,6 +102,19 @@ const (
 	// chooses, entirely independent of any proposal's own vote/tally
 	// lifecycle.
 	TxUnstake
+	// TxNFTTransfer moves a real, already-minted ValidatorNFT to a new
+	// owner (spec 10.1/4.5: "Trading stays disabled until a governance
+	// vote unlocks a transfer trait"). Real, not a formality: pkg/tx's
+	// pipeline requires the transaction's own real Dilithium signature to
+	// resolve to the NFT's CURRENT owner (only the current owner may
+	// initiate a transfer), the target NFT to actually carry the
+	// governance-set "transferable" trait (pkg/nft.CanTransfer — see
+	// VotePublicInputs.UnlockTransferTarget for how that trait becomes
+	// real), and the receiving wallet to not already hold a different
+	// NFT — spec 10.1's "one per wallet" invariant must survive a
+	// transfer, not just hold at mint time, or it would stop being real
+	// Sybil resistance the moment any NFT could freely change hands.
+	TxNFTTransfer
 )
 
 func (k TxKind) String() string {
@@ -126,6 +139,8 @@ func (k TxKind) String() string {
 		return "NFTMint"
 	case TxUnstake:
 		return "Unstake"
+	case TxNFTTransfer:
+		return "NFTTransfer"
 	default:
 		return "Unknown"
 	}
@@ -203,6 +218,21 @@ type ShieldedTx struct {
 	// pkg/zk's UnstakeCircuit was actually proved and must be verified
 	// against, for Kind Unstake — see that type's own doc.
 	UnstakePublicInputs *UnstakePublicInputs
+
+	// NFTTransferPublicInputs binds the real ownership move for Kind
+	// NFTTransfer — see that type's own doc.
+	NFTTransferPublicInputs *NFTTransferPublicInputs
+}
+
+// NFTTransferPublicInputs names which real, already-minted NFT moves to
+// NewOwner (Kind NFTTransfer). No ZK proof: real authorization here is
+// the transaction's own Dilithium signature (Stage 2) resolving to the
+// NFT's current owner, checked at Stage 4 against the real, live NFT
+// record — see types.TxNFTTransfer's own doc for the full real-check
+// list pkg/tx's pipeline enforces.
+type NFTTransferPublicInputs struct {
+	Target   NFTID
+	NewOwner Address
 }
 
 // UnstakePublicInputs binds a real spec-17.4 staked-yield position
@@ -357,6 +387,20 @@ type VotePublicInputs struct {
 	// re-registration).
 	SlashTargetNFT NFTID
 	SlashBurn      bool
+
+	// UnlockTransferTarget optionally binds this proposal to a real
+	// spec-10.1 "unlock a transfer trait" vote against a specific,
+	// already-minted ValidatorNFT — the same "first TxVote wins"/
+	// target-must-really-exist pattern SlashTargetNFT already
+	// establishes just above, applied to the opposite governance
+	// action: making a soulbound NFT transferable instead of freezing or
+	// burning it. On a pass, TallyDueProposals calls the real
+	// pkg/nft.UnlockTransfer, and Kind NFTTransfer (types.TxNFTTransfer's
+	// own doc) is what actually lets the now-unlocked NFT change hands
+	// afterward — unlocking alone was, before this, a trait nothing ever
+	// checked or acted on. The zero value means this proposal carries no
+	// unlock request.
+	UnlockTransferTarget NFTID
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

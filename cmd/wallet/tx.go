@@ -442,6 +442,90 @@ func runMint(args []string) error {
 	return submitTx(context.Background(), &nf, txn)
 }
 
+// runProposeUnlockTransfer drives the real spec-10.1 transfer-unlock
+// proposer path (txbuilder.Builder.ProposeUnlockTransfer): submitting a
+// proposal both casts its own first ballot and binds a real request to
+// unlock -target's soulbound "transferable" trait; other holders
+// approve/reject it with ordinary vote/vote-reveal against the same
+// -proposal id. Like vote/vote-reveal/propose-mint/propose-slash, it
+// signs the transaction envelope with a fresh, throwaway key.
+func runProposeUnlockTransfer(args []string) error {
+	fs := flag.NewFlagSet("propose-unlock-transfer", flag.ExitOnError)
+	path := fs.String("keystore", "walletkey.json", "keystore to unlock — the identity that minted the real NFT this proposal proves eligibility from")
+	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
+	proposal := fs.String("proposal", "", "proposal id (required)")
+	approve := fs.Bool("approve", true, "cast an approve ballot for this proposal's own first vote (default: true — proposing without approving is unusual but allowed)")
+	targetHex := fs.String("target", "", "target NFT id, hex (required, must already be minted)")
+	eligibilityParams := fs.String("eligibility-zk-params", "", "path to the real, shared Groth16 params file for anonymous voter eligibility (see 'wallet eligibility-zk-setup' and cmd/node's -eligibility-zk-params) — required")
+	var nf networkFlags
+	nf.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *proposal == "" {
+		return fmt.Errorf("-proposal is required")
+	}
+	target, err := parseNFTID(*targetHex)
+	if err != nil {
+		return fmt.Errorf("-target: %w", err)
+	}
+	ctx := context.Background()
+	queryURL, err := nf.firstQueryURL()
+	if err != nil {
+		return err
+	}
+	eligibility, err := buildVoteEligibility(ctx, *path, *fromStdin, queryURL, *eligibilityParams, types.ID(*proposal))
+	if err != nil {
+		return err
+	}
+	b, err := throwawayVoteSigner()
+	if err != nil {
+		return err
+	}
+	txn, err := b.ProposeUnlockTransfer(types.ID(*proposal), *approve, target, eligibility)
+	if err != nil {
+		return err
+	}
+	fmt.Println("real transfer-unlock proposal built — check 'wallet proposal -id <id>' for real Passed/UnlockTransferApplied status once tallied, then 'wallet nft-transfer' to move it")
+	return submitTx(ctx, &nf, txn)
+}
+
+// runNFTTransfer moves a real, already-minted, governance-unlocked NFT
+// to a new owner (txbuilder.Builder.NFTTransfer). Unlike vote/propose-*,
+// this signs with the keystore's own real identity: the real
+// authorization pkg/tx's pipeline checks IS this signature, resolved
+// against the NFT's current owner — there is no anonymity property to
+// preserve here (see types.TxNFTTransfer's own doc).
+func runNFTTransfer(args []string) error {
+	fs := flag.NewFlagSet("nft-transfer", flag.ExitOnError)
+	path := fs.String("keystore", "walletkey.json", "keystore to unlock — must be the NFT's current real owner")
+	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
+	targetHex := fs.String("target", "", "target NFT id, hex (required, must already be minted and governance-unlocked)")
+	newOwnerHex := fs.String("new-owner", "", "new owner address, hex (required)")
+	var nf networkFlags
+	nf.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	target, err := parseNFTID(*targetHex)
+	if err != nil {
+		return fmt.Errorf("-target: %w", err)
+	}
+	newOwner, err := parseAddress(*newOwnerHex)
+	if err != nil {
+		return fmt.Errorf("-new-owner: %w", err)
+	}
+	b, err := loadBuilder(*path, *fromStdin)
+	if err != nil {
+		return err
+	}
+	txn, err := b.NFTTransfer(target, newOwner)
+	if err != nil {
+		return err
+	}
+	return submitTx(context.Background(), &nf, txn)
+}
+
 func runNFTTrait(args []string) error {
 	fs := flag.NewFlagSet("nft-trait", flag.ExitOnError)
 	path := fs.String("keystore", "walletkey.json", "keystore to unlock")

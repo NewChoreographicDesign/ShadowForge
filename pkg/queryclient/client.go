@@ -209,26 +209,33 @@ type Proposal struct {
 	SlashTargetNFT string
 	SlashBurn      bool
 	SlashApplied   bool
+	// UnlockTransferTarget/UnlockTransferApplied are a real spec-10.1
+	// transfer-unlock proposal's bound claim and execution status — see
+	// types.VotePublicInputs.UnlockTransferTarget's own doc.
+	UnlockTransferTarget  string
+	UnlockTransferApplied bool
 }
 
 type proposalResponse struct {
-	ProposalID          string `json:"proposal_id"`
-	Epoch               uint64 `json:"epoch"`
-	ParamKey            string `json:"param_key,omitempty"`
-	NewValue            string `json:"new_value,omitempty"`
-	Tallied             bool   `json:"tallied"`
-	Approve             int    `json:"approve"`
-	Reject              int    `json:"reject"`
-	Passed              bool   `json:"passed"`
-	Applied             bool   `json:"applied"`
-	MintAmount          uint64 `json:"mint_amount,omitempty"`
-	MintOutCommit       string `json:"mint_out_commit,omitempty"`
-	MintApplied         bool   `json:"mint_applied"`
-	MintStaked          bool   `json:"mint_staked,omitempty"`
-	StakePositionCommit string `json:"stake_position_commit,omitempty"`
-	SlashTargetNFT      string `json:"slash_target_nft,omitempty"`
-	SlashBurn           bool   `json:"slash_burn,omitempty"`
-	SlashApplied        bool   `json:"slash_applied,omitempty"`
+	ProposalID            string `json:"proposal_id"`
+	Epoch                 uint64 `json:"epoch"`
+	ParamKey              string `json:"param_key,omitempty"`
+	NewValue              string `json:"new_value,omitempty"`
+	Tallied               bool   `json:"tallied"`
+	Approve               int    `json:"approve"`
+	Reject                int    `json:"reject"`
+	Passed                bool   `json:"passed"`
+	Applied               bool   `json:"applied"`
+	MintAmount            uint64 `json:"mint_amount,omitempty"`
+	MintOutCommit         string `json:"mint_out_commit,omitempty"`
+	MintApplied           bool   `json:"mint_applied"`
+	MintStaked            bool   `json:"mint_staked,omitempty"`
+	StakePositionCommit   string `json:"stake_position_commit,omitempty"`
+	SlashTargetNFT        string `json:"slash_target_nft,omitempty"`
+	SlashBurn             bool   `json:"slash_burn,omitempty"`
+	SlashApplied          bool   `json:"slash_applied,omitempty"`
+	UnlockTransferTarget  string `json:"unlock_transfer_target,omitempty"`
+	UnlockTransferApplied bool   `json:"unlock_transfer_applied,omitempty"`
 }
 
 func (p proposalResponse) toProposal() Proposal { return Proposal(p) }

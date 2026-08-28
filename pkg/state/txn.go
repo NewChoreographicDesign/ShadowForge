@@ -54,6 +54,10 @@ func (t *Txn) DeleteNFT(nft types.ValidatorNFT) error {
 	return deleteNFT(t.txn, nft)
 }
 
+func (t *Txn) TransferNFTOwner(oldOwner types.Address, nft types.ValidatorNFT) error {
+	return transferNFTOwner(t.txn, oldOwner, nft)
+}
+
 func (t *Txn) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
 	var nft types.ValidatorNFT
 	found, err := getJSON(t.txn, prefixNFT, id.String(), &nft)

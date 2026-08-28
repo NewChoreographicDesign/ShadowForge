@@ -231,3 +231,45 @@ func TestApplySlashFreezeVsBurn(t *testing.T) {
 		t.Fatalf("expected burn to zero TP, got %+v", burned)
 	}
 }
+
+func TestTransferOwnershipRequiresUnlock(t *testing.T) {
+	locked := types.ValidatorNFT{ID: types.NFTID{0x1}, Owner: types.Address{0x1}}
+	_, err := nft.TransferOwnership(nft.TransferParams{NFT: locked, NewOwner: types.Address{0x2}})
+	if err != nft.ErrTransferDisabled {
+		t.Fatalf("expected ErrTransferDisabled for a locked (never-unlocked) NFT, got %v", err)
+	}
+}
+
+func TestTransferOwnershipRejectsSlashed(t *testing.T) {
+	target := types.ValidatorNFT{ID: types.NFTID{0x1}, Owner: types.Address{0x1}, Slashed: true}
+	nft.UnlockTransfer(&target)
+	_, err := nft.TransferOwnership(nft.TransferParams{NFT: target, NewOwner: types.Address{0x2}})
+	if err != nft.ErrNFTSlashed {
+		t.Fatalf("expected ErrNFTSlashed for a slashed NFT even if unlocked, got %v", err)
+	}
+}
+
+func TestTransferOwnershipRejectsWhenNewOwnerAlreadyHasNFT(t *testing.T) {
+	target := types.ValidatorNFT{ID: types.NFTID{0x1}, Owner: types.Address{0x1}}
+	nft.UnlockTransfer(&target)
+	_, err := nft.TransferOwnership(nft.TransferParams{NFT: target, NewOwner: types.Address{0x2}, NewOwnerAlreadyHasNFT: true})
+	if err != nft.ErrAlreadyMinted {
+		t.Fatalf("expected ErrAlreadyMinted when the receiving wallet already holds a different NFT, got %v", err)
+	}
+}
+
+func TestTransferOwnershipSucceedsOnceUnlocked(t *testing.T) {
+	target := types.ValidatorNFT{ID: types.NFTID{0x1}, Owner: types.Address{0x1}, TP: 7}
+	nft.UnlockTransfer(&target)
+	newOwner := types.Address{0x2}
+	updated, err := nft.TransferOwnership(nft.TransferParams{NFT: target, NewOwner: newOwner})
+	if err != nil {
+		t.Fatalf("expected a real unlocked transfer to succeed: %v", err)
+	}
+	if updated.Owner != newOwner {
+		t.Fatalf("expected Owner to be reassigned to %s, got %s", newOwner, updated.Owner)
+	}
+	if updated.ID != target.ID || updated.TP != target.TP {
+		t.Fatalf("expected the rest of the record (ID, TP) to be preserved, got %+v", updated)
+	}
+}

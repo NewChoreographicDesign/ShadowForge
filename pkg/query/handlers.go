@@ -211,6 +211,11 @@ type proposalResponse struct {
 	SlashTargetNFT string `json:"slash_target_nft,omitempty"`
 	SlashBurn      bool   `json:"slash_burn,omitempty"`
 	SlashApplied   bool   `json:"slash_applied,omitempty"`
+	// UnlockTransferTarget/UnlockTransferApplied are a real spec-10.1
+	// transfer-unlock proposal's bound claim and execution status — see
+	// types.VotePublicInputs.UnlockTransferTarget's own doc.
+	UnlockTransferTarget  string `json:"unlock_transfer_target,omitempty"`
+	UnlockTransferApplied bool   `json:"unlock_transfer_applied,omitempty"`
 }
 
 func slashTargetJSON(p state.ProposalRecord) string {
@@ -218,6 +223,13 @@ func slashTargetJSON(p state.ProposalRecord) string {
 		return ""
 	}
 	return p.SlashTargetNFT.String()
+}
+
+func unlockTransferTargetJSON(p state.ProposalRecord) string {
+	if p.UnlockTransferTarget.IsZero() {
+		return ""
+	}
+	return p.UnlockTransferTarget.String()
 }
 
 func mintOutCommitJSON(p state.ProposalRecord) string {
@@ -251,23 +263,25 @@ func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, proposalResponse{
-		ProposalID:          p.ProposalID,
-		Epoch:               p.Epoch,
-		ParamKey:            p.ParamKey,
-		NewValue:            p.NewValue,
-		Tallied:             p.Tallied,
-		Approve:             p.Approve,
-		Reject:              p.Reject,
-		Passed:              p.Passed,
-		Applied:             p.Applied,
-		MintAmount:          p.MintAmount,
-		MintOutCommit:       mintOutCommitJSON(p),
-		MintApplied:         p.MintApplied,
-		MintStaked:          p.MintStaked,
-		StakePositionCommit: stakePositionCommitJSON(p),
-		SlashTargetNFT:      slashTargetJSON(p),
-		SlashBurn:           p.SlashBurn,
-		SlashApplied:        p.SlashApplied,
+		ProposalID:            p.ProposalID,
+		Epoch:                 p.Epoch,
+		ParamKey:              p.ParamKey,
+		NewValue:              p.NewValue,
+		Tallied:               p.Tallied,
+		Approve:               p.Approve,
+		Reject:                p.Reject,
+		Passed:                p.Passed,
+		Applied:               p.Applied,
+		MintAmount:            p.MintAmount,
+		MintOutCommit:         mintOutCommitJSON(p),
+		MintApplied:           p.MintApplied,
+		MintStaked:            p.MintStaked,
+		StakePositionCommit:   stakePositionCommitJSON(p),
+		SlashTargetNFT:        slashTargetJSON(p),
+		SlashBurn:             p.SlashBurn,
+		SlashApplied:          p.SlashApplied,
+		UnlockTransferTarget:  unlockTransferTargetJSON(p),
+		UnlockTransferApplied: p.UnlockTransferApplied,
 	})
 }
 
@@ -281,23 +295,25 @@ func (s *Server) handleProposals(w http.ResponseWriter, r *http.Request) {
 	out := make([]proposalResponse, 0, len(list))
 	for _, p := range list {
 		out = append(out, proposalResponse{
-			ProposalID:          p.ProposalID,
-			Epoch:               p.Epoch,
-			ParamKey:            p.ParamKey,
-			NewValue:            p.NewValue,
-			Tallied:             p.Tallied,
-			Approve:             p.Approve,
-			Reject:              p.Reject,
-			Passed:              p.Passed,
-			Applied:             p.Applied,
-			MintAmount:          p.MintAmount,
-			MintOutCommit:       mintOutCommitJSON(p),
-			MintApplied:         p.MintApplied,
-			MintStaked:          p.MintStaked,
-			StakePositionCommit: stakePositionCommitJSON(p),
-			SlashTargetNFT:      slashTargetJSON(p),
-			SlashBurn:           p.SlashBurn,
-			SlashApplied:        p.SlashApplied,
+			ProposalID:            p.ProposalID,
+			Epoch:                 p.Epoch,
+			ParamKey:              p.ParamKey,
+			NewValue:              p.NewValue,
+			Tallied:               p.Tallied,
+			Approve:               p.Approve,
+			Reject:                p.Reject,
+			Passed:                p.Passed,
+			Applied:               p.Applied,
+			MintAmount:            p.MintAmount,
+			MintOutCommit:         mintOutCommitJSON(p),
+			MintApplied:           p.MintApplied,
+			MintStaked:            p.MintStaked,
+			StakePositionCommit:   stakePositionCommitJSON(p),
+			SlashTargetNFT:        slashTargetJSON(p),
+			SlashBurn:             p.SlashBurn,
+			SlashApplied:          p.SlashApplied,
+			UnlockTransferTarget:  unlockTransferTargetJSON(p),
+			UnlockTransferApplied: p.UnlockTransferApplied,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

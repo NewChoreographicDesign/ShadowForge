@@ -24,6 +24,17 @@ func parseNFTID(s string) (types.NFTID, error) {
 	return types.NFTID(h), nil
 }
 
+// parseAddress decodes a hex string into an Address — the same
+// convention parseNFTID uses (Address and Hash share an identical
+// underlying [32]byte array).
+func parseAddress(s string) (types.Address, error) {
+	h, err := types.ParseHash(s)
+	if err != nil {
+		return types.Address{}, err
+	}
+	return types.Address(h), nil
+}
+
 func runIdentity(args []string) error {
 	fs := flag.NewFlagSet("identity", flag.ExitOnError)
 	path := fs.String("keystore", "walletkey.json", "keystore to read")
@@ -262,5 +273,9 @@ func printProposal(p queryclient.Proposal) {
 		fmt.Printf("slash target: %s\n", p.SlashTargetNFT)
 		fmt.Printf("slash burn: %v\n", p.SlashBurn)
 		fmt.Printf("slash applied: %v\n", p.SlashApplied)
+	}
+	if p.UnlockTransferTarget != "" {
+		fmt.Printf("unlock transfer target: %s\n", p.UnlockTransferTarget)
+		fmt.Printf("unlock transfer applied: %v\n", p.UnlockTransferApplied)
 	}
 }

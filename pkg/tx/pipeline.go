@@ -443,7 +443,7 @@ func (p *Pipeline) finalize(t *types.ShieldedTx) {
 // "Well-formedness: kind, fee commitment, circuit public inputs, Dilithium
 // signature, not expired. Writes: Tx admitted to the working batch."
 func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) error {
-	if t.Kind > types.TxUnstake {
+	if t.Kind > types.TxNFTTransfer {
 		return fmt.Errorf("unknown tx kind %d", t.Kind)
 	}
 	if !submittedAt.IsZero() && p.deps.now().Sub(submittedAt) > TxTTL {
@@ -554,6 +554,13 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 		}
 		if t.Nullifier.IsZero() {
 			return fmt.Errorf("unstake tx missing nullifier")
+		}
+	case types.TxNFTTransfer:
+		if t.NFTTransferPublicInputs == nil {
+			return fmt.Errorf("NFTTransfer tx missing public inputs")
+		}
+		if t.NFTTransferPublicInputs.Target.IsZero() {
+			return fmt.Errorf("NFTTransfer tx missing target NFT")
 		}
 	}
 	t.StageHints = t.StageHints.With(2)
@@ -761,6 +768,15 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 					return fmt.Errorf("slash proposal targets a nonexistent NFT %s", pub.SlashTargetNFT)
 				}
 			}
+			if !pub.UnlockTransferTarget.IsZero() {
+				// Same real existence check, for the identical reason, on
+				// the opposite governance action.
+				if _, found, err := p.deps.Store.GetNFT(pub.UnlockTransferTarget); err != nil {
+					return fmt.Errorf("unlock-transfer target lookup: %w", err)
+				} else if !found {
+					return fmt.Errorf("unlock-transfer proposal targets a nonexistent NFT %s", pub.UnlockTransferTarget)
+				}
+			}
 			record = state.ProposalRecord{
 				ProposalID:  string(pub.ProposalID),
 				Epoch:       p.deps.Epoch,
@@ -771,14 +787,15 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				// later voter's own ParamKey/NewValue are never
 				// consulted, since record is only mutated here on
 				// creation.
-				ParamKey:            pub.ParamKey,
-				NewValue:            pub.NewValue,
-				MintAmount:          pub.MintAmount,
-				MintOutCommit:       pub.MintOutCommit,
-				MintStaked:          pub.MintStaked,
-				StakePositionCommit: pub.StakePositionCommit,
-				SlashTargetNFT:      pub.SlashTargetNFT,
-				SlashBurn:           pub.SlashBurn,
+				ParamKey:             pub.ParamKey,
+				NewValue:             pub.NewValue,
+				MintAmount:           pub.MintAmount,
+				MintOutCommit:        pub.MintOutCommit,
+				MintStaked:           pub.MintStaked,
+				StakePositionCommit:  pub.StakePositionCommit,
+				SlashTargetNFT:       pub.SlashTargetNFT,
+				SlashBurn:            pub.SlashBurn,
+				UnlockTransferTarget: pub.UnlockTransferTarget,
 			}
 		}
 		if record.Tallied {
@@ -938,6 +955,40 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				}
 				p.deps.ZKRoots.Record(newRoot)
 			}
+		}
+
+	case types.TxNFTTransfer:
+		pub := t.NFTTransferPublicInputs
+		nftRec, found, err := p.deps.Store.GetNFT(pub.Target)
+		if err != nil {
+			return fmt.Errorf("nft lookup: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("no NFT record for transfer target %s", pub.Target)
+		}
+		// Real authorization: only the CURRENT owner's own real
+		// Dilithium signature (already verified at Stage 2) may initiate
+		// a transfer of their own NFT — never a bare claim.
+		signer := types.AddressFromPubkey(t.SignerPubKey)
+		if signer != nftRec.Owner {
+			return fmt.Errorf("NFTTransfer signer %s is not the current owner %s of %s", signer, nftRec.Owner, pub.Target)
+		}
+		newOwnerAlreadyHasNFT := false
+		if existing, found, err := p.deps.Store.GetNFTByOwner(pub.NewOwner); err != nil {
+			return fmt.Errorf("new-owner nft lookup: %w", err)
+		} else if found && existing.ID != pub.Target {
+			newOwnerAlreadyHasNFT = true
+		}
+		updated, err := nft.TransferOwnership(nft.TransferParams{
+			NFT:                   nftRec,
+			NewOwner:              pub.NewOwner,
+			NewOwnerAlreadyHasNFT: newOwnerAlreadyHasNFT,
+		})
+		if err != nil {
+			return fmt.Errorf("nft transfer: %w", err)
+		}
+		if err := p.deps.Store.TransferNFTOwner(nftRec.Owner, updated); err != nil {
+			return fmt.Errorf("persist nft transfer: %w", err)
 		}
 	}
 
@@ -1123,10 +1174,15 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 // does slash the target NFT now: pkg/nft.ApplySlash freezes it
 // (Slashed=true, record kept) or, for the burn outcome, the record is
 // permanently removed (Store.DeleteNFT) — the target's real existence
-// was already checked once, at Stage 4. unlock-transfer/container-asset
-// proposal kinds are tallied like any other but have no execution wired
-// here either — see governance.ProposalKind's own doc for the
-// remaining kinds this build does not yet apply.
+// was already checked once, at Stage 4. A passed proposal bound to a
+// real UnlockTransferTarget (spec 10.1 — see types.VotePublicInputs.
+// UnlockTransferTarget's own doc) really does unlock the target NFT
+// now: pkg/nft.UnlockTransfer sets the real "transferable" trait, which
+// a later Kind NFTTransfer transaction then actually acts on.
+// container-asset/upgrade-unwind proposal kinds are tallied like any
+// other but have no execution wired here either — see governance.
+// ProposalKind's own doc for the remaining kinds this build does not
+// yet apply.
 //
 // This runs deterministically off already-committed proposal state plus
 // the caller's own block Epoch, so every honest node reaches the same
@@ -1250,6 +1306,23 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 					if err := p.deps.Store.PutNFT(nftRec); err == nil {
 						record.SlashApplied = true
 					}
+				}
+			}
+		}
+
+		if record.Passed && !record.UnlockTransferTarget.IsZero() {
+			// Real spec-10.1 transfer-unlock execution: the target's real
+			// existence was already checked once, at Stage 4 — this only
+			// makes a governance-authorized unlock real by setting the
+			// real "transferable" trait, so a later Kind NFTTransfer can
+			// actually move the NFT (types.TxNFTTransfer's own doc). A
+			// target that no longer exists by tally time leaves
+			// UnlockTransferApplied false, mirroring SlashApplied's
+			// identical treatment just above.
+			if nftRec, found, err := p.deps.Store.GetNFT(record.UnlockTransferTarget); err == nil && found {
+				nft.UnlockTransfer(&nftRec)
+				if err := p.deps.Store.PutNFT(nftRec); err == nil {
+					record.UnlockTransferApplied = true
 				}
 			}
 		}

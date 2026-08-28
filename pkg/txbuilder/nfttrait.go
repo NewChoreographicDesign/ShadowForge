@@ -35,12 +35,6 @@ func ComputeTraitDeltaCommitment(key string, delta int64, salt []byte) types.Has
 // reason to derive it deterministically; this package never generates one
 // on the caller's behalf, since only the caller knows whether it needs to
 // be recoverable later.
-//
-// A real, disclosed limitation this shares with Mint (see that
-// constructor's own doc): nothing on this build's live path ever calls
-// state.Store.PutNFT to create a fresh ValidatorNFT record, so on a
-// freshly deployed network there is currently no target this can ever
-// successfully reference.
 func (b *Builder) NFTTrait(target types.NFTID, key string, delta int64, salt []byte) (types.ShieldedTx, error) {
 	if key == "" {
 		return types.ShieldedTx{}, fmt.Errorf("txbuilder: trait key must not be empty")

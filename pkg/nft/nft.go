@@ -181,6 +181,45 @@ func UnlockTransfer(nft *types.ValidatorNFT) {
 	nft.Traits["transferable"] = "true"
 }
 
+// TransferParams are the inputs to a real spec-10.1 soulbound-unlock NFT
+// ownership transfer — the actual use ErrTransferDisabled/CanTransfer/
+// UnlockTransfer above exist for: a governance-unlocked NFT that could
+// never, before this, actually change hands.
+type TransferParams struct {
+	// NFT is the current, real record being transferred.
+	NFT      types.ValidatorNFT
+	NewOwner types.Address
+	// NewOwnerAlreadyHasNFT mirrors MintParams.AlreadyHasNFT: a real,
+	// caller-supplied check (pkg/tx's pipeline, via state.Store.
+	// GetNFTByOwner) that spec 10.1's "one per wallet" invariant holds
+	// for the receiving wallet too, not just at mint time — a transfer
+	// must never let one wallet accumulate two NFTs, since that would
+	// undermine the "one NFT, one vote" Sybil resistance every other
+	// real governance/eligibility check in this codebase depends on.
+	NewOwnerAlreadyHasNFT bool
+}
+
+// TransferOwnership enforces spec 10.1's real constraints on a transfer
+// and returns the updated record (Owner reassigned), ready for the
+// caller to persist. It never touches storage itself, mirroring Mint's
+// own pure-validation shape — pkg/tx's pipeline does the real I/O
+// (including the real secondary-index bookkeeping a changed Owner
+// requires, which this package has no access to).
+func TransferOwnership(p TransferParams) (types.ValidatorNFT, error) {
+	if p.NFT.Slashed {
+		return types.ValidatorNFT{}, ErrNFTSlashed
+	}
+	if !CanTransfer(p.NFT) {
+		return types.ValidatorNFT{}, ErrTransferDisabled
+	}
+	if p.NewOwnerAlreadyHasNFT {
+		return types.ValidatorNFT{}, ErrAlreadyMinted
+	}
+	updated := p.NFT
+	updated.Owner = p.NewOwner
+	return updated, nil
+}
+
 // --- Trust Points (spec 5.4.2, 10.3) ---
 
 const (
