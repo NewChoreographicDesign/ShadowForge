@@ -480,11 +480,32 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 	case types.TxVote:
 		// Records this sealed ballot's commitment against its proposal,
 		// keyed by voter (spec 17.4: "Votes accumulate as ZKP ballots
-		// during the epoch"; one NFT, one vote — spec 9.1). The choice
-		// itself stays hidden until a later TxVoteReveal opens it; a real
-		// epoch-boundary tally (pkg/validator, once this proposal's Epoch
-		// has passed) counts only what got revealed — see
-		// types.ComputeVoteCommitment and the TxVoteReveal case below.
+		// during the epoch"). The choice itself stays hidden until a
+		// later TxVoteReveal opens it; a real epoch-boundary tally
+		// (pkg/validator, once this proposal's Epoch has passed) counts
+		// only what got revealed — see types.ComputeVoteCommitment and
+		// the TxVoteReveal case below.
+		//
+		// A real, disclosed gap, not spec 9.1's "one NFT, one vote"
+		// actually enforced: voter is derived from the signer's own
+		// public key with no check that it corresponds to a real,
+		// minted ValidatorNFT (governance.Tally's own eligibleNFTs
+		// parameter is a turnout-percentage denominator, not a
+		// membership set either). Any freshly generated keypair can cast
+		// one ballot, and with no turnout floor configured a single
+		// self-approving vote currently passes a proposal. This isn't
+		// simply an oversight to patch with a lookup: cmd/walletsim's
+		// own real, tested design deliberately casts votes from a fresh
+		// throwaway identity per session ("Wallets create throw-away
+		// 'mirror' addresses ... and burn them afterward" — its own doc,
+		// citing docs/SPEC_SOURCE.md) precisely so a ballot can't be
+		// linked back to a voter's long-lived identity; requiring the
+		// signer itself to hold the NFT would close the Sybil gap at the
+		// cost of that anonymity. A real fix needs a privacy-preserving
+		// eligibility proof (prove NFT ownership without revealing
+		// which one) that this build's ZK circuit doesn't implement —
+		// left for a dedicated follow-up rather than a same-session
+		// change to consensus-critical code.
 		pub := t.VotePublicInputs
 		voter := types.NFTID(types.SumHash(t.SignerPubKey))
 		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
@@ -564,16 +585,23 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		if _, found, err := p.deps.Store.GetContainerRoot(string(*t.ContainerID)); err != nil {
 			return fmt.Errorf("container root lookup: %w", err)
 		} else if found {
-			// Shadow verification (spec 16.3): the container's claimed
-			// new root must match what its own shadow-verify step
-			// produced; a real integration passes that duplicate-server
-			// digest as the tx's Memo. A mismatch blocks commit outright.
-			if len(t.Memo) == 32 {
-				var shadow types.Hash
-				copy(shadow[:], t.Memo)
-				if !container.ShadowVerify(newRoot, shadow) {
-					return fmt.Errorf("shadow verification mismatch: container output does not match duplicate server")
-				}
+			// Shadow verification (spec 16.3): "compares the container
+			// output to the duplicate server. Mismatch blocks commit" —
+			// unconditional once a prior root exists, so a real
+			// integration's duplicate-server digest (the tx's Memo) must
+			// actually be present here, not just checked when a
+			// submitter happens to include one. Requiring it only from
+			// the second sync onward (not the first, which has nothing
+			// yet to shadow-compare against) closes a real bypass: a
+			// submitter who simply omitted the memo previously skipped
+			// verification entirely instead of being rejected.
+			if len(t.Memo) != 32 {
+				return fmt.Errorf("shadow verification required: expected a 32-byte duplicate-server digest in Memo, got %d bytes", len(t.Memo))
+			}
+			var shadow types.Hash
+			copy(shadow[:], t.Memo)
+			if !container.ShadowVerify(newRoot, shadow) {
+				return fmt.Errorf("shadow verification mismatch: container output does not match duplicate server")
 			}
 		}
 		if err := p.deps.Store.PutContainerRoot(string(*t.ContainerID), newRoot); err != nil {

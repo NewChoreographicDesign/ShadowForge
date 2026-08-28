@@ -580,6 +580,38 @@ func TestPipelineContainerSyncShadowMismatchBlocksCommit(t *testing.T) {
 	}
 }
 
+// TestPipelineContainerSyncMissingShadowMemoBlocksCommit is a direct
+// regression test for a real bypass live auditing surfaced: shadow
+// verification (spec 16.3) only ran when a submitter happened to include
+// a 32-byte Memo, so simply omitting it skipped verification entirely
+// instead of being rejected — the opposite of "mismatch blocks commit."
+func TestPipelineContainerSyncMissingShadowMemoBlocksCommit(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	id := types.ID("acme-container-no-memo")
+
+	first := mustSign(t, types.ShieldedTx{
+		Kind: types.TxContainerSync, ContainerID: &id, Commitments: []types.Hash{{9, 9, 9}},
+	})
+	r1 := p.ProcessBatch([]tx.Entry{{Tx: first, SubmittedAt: time.Now()}})
+	if r1[0].Error != nil {
+		t.Fatalf("first sync should succeed: %v", r1[0].Error)
+	}
+
+	second := mustSign(t, types.ShieldedTx{
+		Kind: types.TxContainerSync, ContainerID: &id, Commitments: []types.Hash{{1, 1, 1}},
+		// No Memo at all — this must be rejected, not silently accepted.
+	})
+	r2 := p.ProcessBatch([]tx.Entry{{Tx: second, SubmittedAt: time.Now()}})
+	if r2[0].Error == nil {
+		t.Fatalf("expected a second sync with no shadow-verification memo to be rejected")
+	}
+	se, ok := r2[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 4 {
+		t.Fatalf("expected a stage-4 StageError, got %v", r2[0].Error)
+	}
+}
+
 func TestPipelineNFTTraitMissingTargetRejected(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
