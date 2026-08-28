@@ -30,6 +30,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -67,6 +68,7 @@ func main() {
 	dataDir := flag.String("data", "", "Badger data directory (empty = in-memory)")
 	sentinelFlag := flag.Bool("sentinel", false, "run as a protocol sentinel validator")
 	skipZK := flag.Bool("skip-zk-setup", false, "skip the Groth16 trusted setup (Kind Transfer proofs will be rejected)")
+	zkParamsPath := flag.String("zk-params", "", "path to a shared Groth16 parameters file (pkg/zk.System.WriteTo's format). If it exists, load it; if not, run a fresh trusted setup and write it there for other nodes/wallets to load. Empty (the default) runs an independent, unshared setup — fine for a single node, but a proof any wallet builds will never verify here unless every party loads the exact same params file (see 'wallet zk-setup' to generate one)")
 	announceFile := flag.String("announce-file", "", "write this node's dialable multiaddr to this path once listening (for peer discovery over a shared volume, e.g. Docker Compose)")
 	bootstrapFile := flag.String("bootstrap-file", "", "comma-separated paths to wait for and read bootstrap multiaddrs from (pairs with -announce-file on other nodes) — a full mesh among validators needs one entry per peer, since this reference build doesn't relay heartbeats or messages beyond directly connected peers")
 	keyFile := flag.String("key-file", "", "path to this node's persisted Dilithium identity keypair (empty = generate a fresh, ephemeral identity every start)")
@@ -82,11 +84,11 @@ func main() {
 	}
 	log.Printf("ShadowForge node starting: listen=%s role=%s", *listen, role)
 
-	var encKey [32]byte
-	if _, err := cryptorand.Read(encKey[:]); err != nil {
-		log.Fatalf("generate state encryption key: %v", err)
+	encKey, err := loadOrCreateStateKey(*dataDir)
+	if err != nil {
+		log.Fatalf("state encryption key: %v", err)
 	}
-	store, err := state.Open(*dataDir, *dataDir == "", crypto.EncryptionKey(encKey))
+	store, err := state.Open(*dataDir, *dataDir == "", encKey)
 	if err != nil {
 		log.Fatalf("open state store: %v", err)
 	}
@@ -104,13 +106,10 @@ func main() {
 
 	var zkSys *zk.System
 	if !*skipZK {
-		log.Println("running Groth16 trusted setup (development setup — see pkg/zk doc for the production-ceremony requirement)...")
-		start := time.Now()
-		zkSys, err = zk.Setup()
+		zkSys, err = loadOrCreateZKSystem(*zkParamsPath)
 		if err != nil {
 			log.Fatalf("zk setup: %v", err)
 		}
-		log.Printf("zk setup complete in %s", time.Since(start))
 	} else {
 		log.Println("skipping ZK setup: Kind Transfer transactions will be rejected at Stage 1")
 	}
@@ -242,6 +241,106 @@ func main() {
 // different identity each time would make every one of its peers'
 // committee assignments disagree about who it is — path lets a
 // long-running node keep the same identity across restarts.
+// loadOrCreateZKSystem loads a real, previously-generated Groth16 System
+// from path (see zk.System.WriteTo's own doc on why sharing this matters:
+// two independent zk.Setup() calls produce mutually incompatible keys, so
+// a proof any wallet builds can only ever verify against a node that
+// loaded the exact same params). An empty path always runs a fresh,
+// unshared setup — the prior, still-supported single-node default. A
+// non-empty path that doesn't exist yet runs a fresh setup and persists
+// it there, so subsequent nodes (and any wallet) pointed at the same
+// file share it; concurrent first-time startups against the same
+// not-yet-existing path is a real, documented race this simple mechanism
+// doesn't resolve — start the first node (or run `wallet zk-setup`)
+// alone to generate it once, then point every other node/wallet at the
+// resulting file.
+func loadOrCreateZKSystem(path string) (*zk.System, error) {
+	if path == "" {
+		log.Println("running Groth16 trusted setup (development setup, unshared — see pkg/zk doc for the production-ceremony requirement)...")
+		start := time.Now()
+		sys, err := zk.Setup()
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("zk setup complete in %s", time.Since(start))
+		return sys, nil
+	}
+
+	if f, err := os.Open(path); err == nil {
+		defer func() { _ = f.Close() }()
+		sys, err := zk.ReadSystem(f)
+		if err != nil {
+			return nil, fmt.Errorf("load zk params from %s: %w", path, err)
+		}
+		log.Printf("loaded shared Groth16 params from %s", path)
+		return sys, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read zk params file %s: %w", path, err)
+	}
+
+	log.Printf("running Groth16 trusted setup (development setup — see pkg/zk doc for the production-ceremony requirement) and saving it to %s for other nodes/wallets to share...", path)
+	start := time.Now()
+	sys, err := zk.Setup()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("zk setup complete in %s", time.Since(start))
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return nil, fmt.Errorf("write zk params file %s: %w", path, err)
+	}
+	return sys, nil
+}
+
+// loadOrCreateStateKey returns the real symmetric key state.Open uses to
+// encrypt note blobs and memos at rest. An empty dataDir means in-memory
+// mode (tests, ephemeral nodes) — a fresh random key every start is
+// correct there, since there is no on-disk data to ever reopen. A
+// non-empty dataDir is a real persistence directory, so its key is
+// persisted alongside it (dataDir/state.key, 0600): without this, a
+// fresh random key generated on every process start could never decrypt
+// data written under a previous run's key, silently making -data's
+// entire persistence promise break on the very first restart — a real
+// bug live auditing surfaced, not a documented boundary.
+func loadOrCreateStateKey(dataDir string) (crypto.EncryptionKey, error) {
+	if dataDir == "" {
+		var key crypto.EncryptionKey
+		if _, err := cryptorand.Read(key[:]); err != nil {
+			return crypto.EncryptionKey{}, fmt.Errorf("generate ephemeral state encryption key: %w", err)
+		}
+		return key, nil
+	}
+
+	keyPath := filepath.Join(dataDir, "state.key")
+	if b, err := os.ReadFile(keyPath); err == nil {
+		if len(b) != len(crypto.EncryptionKey{}) {
+			return crypto.EncryptionKey{}, fmt.Errorf("state key file %s is %d bytes, want %d", keyPath, len(b), len(crypto.EncryptionKey{}))
+		}
+		var key crypto.EncryptionKey
+		copy(key[:], b)
+		return key, nil
+	} else if !os.IsNotExist(err) {
+		return crypto.EncryptionKey{}, fmt.Errorf("read state key file %s: %w", keyPath, err)
+	}
+
+	var key crypto.EncryptionKey
+	if _, err := cryptorand.Read(key[:]); err != nil {
+		return crypto.EncryptionKey{}, fmt.Errorf("generate state encryption key: %w", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return crypto.EncryptionKey{}, fmt.Errorf("create data dir %s: %w", dataDir, err)
+	}
+	if err := os.WriteFile(keyPath, key[:], 0o600); err != nil {
+		return crypto.EncryptionKey{}, fmt.Errorf("write state key file %s: %w", keyPath, err)
+	}
+	return key, nil
+}
+
 func loadOrCreateIdentity(path string) (crypto.DilithiumPublicKey, crypto.DilithiumPrivateKey, error) {
 	if path != "" {
 		if b, err := os.ReadFile(path); err == nil {
