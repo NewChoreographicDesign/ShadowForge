@@ -54,6 +54,8 @@ func main() {
 		err = runVoteReveal(args)
 	case "propose-mint":
 		err = runProposeMint(args)
+	case "unstake":
+		err = runUnstake(args)
 	case "mint":
 		err = runMint(args)
 	case "nft-trait":
@@ -72,6 +74,10 @@ func main() {
 		err = runEligibilityZKSetup(args)
 	case "mint-zk-setup":
 		err = runMintZKSetup(args)
+	case "stake-zk-setup":
+		err = runStakeZKSetup(args)
+	case "unstake-zk-setup":
+		err = runUnstakeZKSetup(args)
 	case "poh-attest":
 		err = runPoHAttest(args)
 	case "nft-mint":
@@ -131,13 +137,11 @@ syncing that keystore's minted NFT from the live network (pkg/govwallet).
 An observer of the resulting transaction learns only that some real,
 minted NFT voted, never which one.
 
-Real spec-17.4 epoch mint (the "direct with 10 percent fee" proposer
-path — this build has no staking subsystem, so the spec's alternative
-staked-yield path is not implemented): submitting a proposal both casts
-its own first ballot and binds a real Groth16-proven mint request; other
-holders approve/reject it with ordinary 'vote'/'vote-reveal' against the
-same -proposal id. Needs its own one-time shared setup, like
-eligibility above:
+Real spec-17.4 epoch mint — both proposer paths spec 13.1/17.4 name are
+implemented: submitting a proposal both casts its own first ballot and
+binds a real Groth16-proven mint request; other holders approve/reject
+it with ordinary 'vote'/'vote-reveal' against the same -proposal id.
+Needs its own one-time shared setup, like eligibility above:
   wallet mint-zk-setup -out <file>
   wallet propose-mint -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -amount <n> -eligibility-zk-params <file> -mint-zk-params <file>
 Once tallied, check 'wallet proposal -id <id>' for real Passed/
@@ -150,6 +154,23 @@ verify this: this build's note-existence index is only ever populated
 by a wallet's own optional PutNote call, which nothing in this CLI — for
 Transfer's own outputs either — currently makes, a real, separate,
 pre-existing gap rather than one this fix introduces.)
+
+Add -staked to 'propose-mint' for spec 17.4's other proposer path: the
+requested amount locks as a real position (no upfront fee) instead of
+minting a note immediately, and later redeems for principal plus real
+accrued yield (pkg/staking's own doc has the exact formula this build
+implements for the spec's otherwise-underspecified "2 percent yield").
+Needs its own one-time shared setup for both the locking and redemption
+circuits:
+  wallet stake-zk-setup   -out <file>
+  wallet unstake-zk-setup -out <file>
+  wallet propose-mint -staked -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -amount <n> -eligibility-zk-params <file> -stake-zk-params <file>
+Once tallied and MintApplied, redeem it with the position opening
+propose-mint -staked printed — this build's stakewallet package syncs
+the real, canonical stake tree from the live network to build the
+Merkle proof automatically, so only the position's own secret fields
+are needed here, not a tree index:
+  wallet unstake -keystore <file> -bootstrap <addr> -query <url> -principal <n> -start-epoch <n> -owner-sk <hex> -rho <hex> -unstake-zk-params <file>
 
   wallet mint -keystore <file> -bootstrap <addr> -query <url>
 'wallet mint' is a different, older, and now-vestigial no-op kind — not

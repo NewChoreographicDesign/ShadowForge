@@ -343,6 +343,14 @@ type ProposalRecord struct {
 	MintAmount    uint64
 	MintOutCommit types.Hash
 	MintApplied   bool
+	// MintStaked/StakePositionCommit are the staked-yield proposer path's
+	// own counterpart of MintOutCommit — see types.VotePublicInputs.
+	// MintStaked's own doc. MintApplied above is shared by both paths
+	// (it marks whichever real execution step — note insertion for the
+	// direct path, position insertion for the staked one — already ran);
+	// MintStaked just says which one MintApplied refers to.
+	MintStaked          bool
+	StakePositionCommit types.Hash
 
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch

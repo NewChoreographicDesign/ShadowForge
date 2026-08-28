@@ -30,6 +30,46 @@ func TestEpochDurationSpecExamples(t *testing.T) {
 	closeEnough(t, consensus.EpochDuration(50), expect(50), 100*time.Millisecond)
 }
 
+// TestElapsedMillisSumsRealPerEpochDurations proves ElapsedMillis is
+// exactly the sum of each individual epoch's own real EpochDuration —
+// not an approximation — for a real, still-growing (pre-cap) range.
+func TestElapsedMillisSumsRealPerEpochDurations(t *testing.T) {
+	const from, to = 2, 8
+	var want time.Duration
+	for n := uint64(from); n < to; n++ {
+		want += consensus.EpochDuration(n)
+	}
+	got := time.Duration(consensus.ElapsedMillis(from, to)) * time.Millisecond
+	if got != want {
+		t.Fatalf("ElapsedMillis(%d,%d) = %v, want %v", from, to, got, want)
+	}
+}
+
+func TestElapsedMillisZeroWhenNotAdvancing(t *testing.T) {
+	if got := consensus.ElapsedMillis(10, 10); got != 0 {
+		t.Fatalf("ElapsedMillis(10,10) = %d, want 0", got)
+	}
+	if got := consensus.ElapsedMillis(10, 5); got != 0 {
+		t.Fatalf("ElapsedMillis(10,5) = %d, want 0 (toEpoch before fromEpoch)", got)
+	}
+}
+
+// TestElapsedMillisCappedTailIsExact proves the O(1) capped-tail
+// shortcut agrees with real per-epoch summation across the cap boundary
+// (epoch ~96, where every epoch after is a fixed one-year
+// EpochCapMillis) — the same real formula, not merely an approximation
+// for large ranges.
+func TestElapsedMillisCappedTailIsExact(t *testing.T) {
+	const from, to = 90, 110
+	var want int64
+	for n := uint64(from); n < to; n++ {
+		want += int64(consensus.EpochDuration(n) / time.Millisecond)
+	}
+	if got := consensus.ElapsedMillis(from, to); got != want {
+		t.Fatalf("ElapsedMillis(%d,%d) = %d, want %d", from, to, got, want)
+	}
+}
+
 func TestEpochDurationYearCap(t *testing.T) {
 	if got := consensus.EpochDuration(1000); got != consensus.EpochCap {
 		t.Fatalf("epoch 1000 should be capped at 1 year, got %v", got)

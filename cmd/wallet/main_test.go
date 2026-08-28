@@ -275,6 +275,7 @@ func TestCLIProposals(t *testing.T) {
 type testBackend struct {
 	store    *state.Store
 	chn      *chain.Chain
+	deps     tx.Deps
 	pipeline *tx.Pipeline
 	queryURL string
 	addr     string
@@ -303,6 +304,11 @@ type testBackend struct {
 	// real spec-17.4 epoch-mint circuit — see 'wallet propose-mint' own
 	// doc.
 	mintZKParamsPath string
+	// stakeZKParamsPath/unstakeZKParamsPath are mintZKParamsPath's
+	// counterparts for the real spec-17.4 staked-yield mint path — see
+	// 'wallet propose-mint -staked'/'wallet unstake' own docs.
+	stakeZKParamsPath   string
+	unstakeZKParamsPath string
 }
 
 func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *zk.Tree, zkRoots *zk.RootHistory) *testBackend {
@@ -316,7 +322,8 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	}
 	t.Cleanup(func() { _ = store.Close() })
 
-	chn, err := chain.Open(store, time.Now().UnixMilli())
+	genesisMs := time.Now().UnixMilli()
+	chn, err := chain.Open(store, genesisMs)
 	if err != nil {
 		t.Fatalf("open chain: %v", err)
 	}
@@ -368,7 +375,47 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		t.Fatalf("close mint zk params file: %v", err)
 	}
 
-	pipeline := tx.NewPipeline(tx.Deps{
+	// Real, shared staked-yield mint params — every propose-mint
+	// -staked/unstake-exercising test in this file needs this backend's
+	// pipeline and the CLI's own loaded copy to verify against identical
+	// Groth16 keys, exactly like mintSys above.
+	stakeSys, err := zk.SetupStake()
+	if err != nil {
+		t.Fatalf("stake zk setup: %v", err)
+	}
+	stakeParamsPath := filepath.Join(t.TempDir(), "stake-zk-params.bin")
+	stakeParamsFile, err := os.Create(stakeParamsPath)
+	if err != nil {
+		t.Fatalf("create stake zk params file: %v", err)
+	}
+	if _, err := stakeSys.WriteTo(stakeParamsFile); err != nil {
+		t.Fatalf("write stake zk params: %v", err)
+	}
+	if err := stakeParamsFile.Close(); err != nil {
+		t.Fatalf("close stake zk params file: %v", err)
+	}
+	unstakeSys, err := zk.SetupUnstake()
+	if err != nil {
+		t.Fatalf("unstake zk setup: %v", err)
+	}
+	unstakeParamsPath := filepath.Join(t.TempDir(), "unstake-zk-params.bin")
+	unstakeParamsFile, err := os.Create(unstakeParamsPath)
+	if err != nil {
+		t.Fatalf("create unstake zk params file: %v", err)
+	}
+	if _, err := unstakeSys.WriteTo(unstakeParamsFile); err != nil {
+		t.Fatalf("write unstake zk params: %v", err)
+	}
+	if err := unstakeParamsFile.Close(); err != nil {
+		t.Fatalf("close unstake zk params file: %v", err)
+	}
+	stakeTree := zk.NewTree()
+	initialStakeRoot, err := stakeTree.Root()
+	if err != nil {
+		t.Fatalf("initial stake root: %v", err)
+	}
+
+	deps := tx.Deps{
 		Store:               store,
 		StateTree:           state.NewMerkleTree(),
 		ZK:                  zkSys,
@@ -379,7 +426,12 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		EligibilityTree:     eligTree,
 		EligibilityRoots:    zk.NewRootHistory(initialEligRoot),
 		MintZK:              mintSys,
-	})
+		StakeZK:             stakeSys,
+		UnstakeZK:           unstakeSys,
+		StakeTree:           stakeTree,
+		StakeRoots:          zk.NewRootHistory(initialStakeRoot),
+	}
+	pipeline := tx.NewPipeline(deps)
 
 	v1pk, v1sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
@@ -388,10 +440,12 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	v1id := types.NFTID(types.SumHash(v1pk))
 
 	b := &testBackend{
-		store: store, chn: chn, pipeline: pipeline, v1id: v1id, v1pk: v1pk, v1sk: v1sk, logf: t.Logf,
+		store: store, chn: chn, deps: deps, pipeline: pipeline, v1id: v1id, v1pk: v1pk, v1sk: v1sk, logf: t.Logf,
 		attestorKeystorePath: attestorPath, attestorKeystorePassphrase: "attestor-passphrase",
 		eligibilityZKParamsPath: eligParamsPath,
 		mintZKParamsPath:        mintParamsPath,
+		stakeZKParamsPath:       stakeParamsPath,
+		unstakeZKParamsPath:     unstakeParamsPath,
 	}
 
 	h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
@@ -407,7 +461,7 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	}
 	b.addr = addrs[0]
 
-	srv := query.NewServer(store, chn, tx.NewMempool(), query.Config{ListenAddr: "127.0.0.1:0", Logf: t.Logf})
+	srv := query.NewServer(store, chn, tx.NewMempool(), query.Config{ListenAddr: "127.0.0.1:0", GenesisMs: genesisMs, Logf: t.Logf})
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := srv.Start(ctx); err != nil {
 		cancel()
@@ -688,6 +742,111 @@ func TestCLIProposeMintEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(out, "mint applied: true") {
 		t.Fatalf("expected 'wallet proposal' to report the real mint as applied, got:\n%s", out)
+	}
+}
+
+// TestCLIProposeMintStakedAndUnstakeEndToEnd proves the real spec-17.4
+// staked-yield path end to end through the actual CLI: 'wallet
+// propose-mint -staked' builds and submits a real, Groth16-proven staked
+// mint claim, a matching 'wallet vote-reveal' opens the sealed ballot,
+// the test directly drives the same real TallyDueProposals a live
+// validator runs at epoch end (this build's CLI has no epoch-boundary
+// trigger of its own — see TestCLIProposeMintEndToEnd's identical
+// doc), and 'wallet unstake' — using only the position opening
+// propose-mint -staked printed, syncing the real stake tree from the
+// live network itself via pkg/stakewallet — redeems it for a real
+// spendable note that lands in the same canonical tree Transfer's own
+// outputs live in.
+func TestCLIProposeMintStakedAndUnstakeEndToEnd(t *testing.T) {
+	zkTree := zk.NewTree()
+	initialRoot, err := zkTree.Root()
+	if err != nil {
+		t.Fatalf("initial root: %v", err)
+	}
+	zkRoots := zk.NewRootHistory(initialRoot)
+	backend := newTestBackend(t, 0x07, nil, zkTree, zkRoots)
+
+	path, ks := newTestKeystore(t, "staked-voter-passphrase")
+	mintNFTViaCLI(t, backend, ks.PublicKey(), path, "staked-voter-passphrase")
+
+	const amount = 5000
+
+	withStdin(t, "staked-voter-passphrase")
+	out, err := captureStdout(t, func() error {
+		return runProposeMint([]string{
+			"-keystore", path, "-passphrase-stdin", "-staked",
+			"-proposal", "cli-staked-1", "-approve", "-amount", fmt.Sprintf("%d", amount),
+			"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+			"-stake-zk-params", backend.stakeZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runProposeMint -staked: %v", err)
+	}
+	if !strings.Contains(out, "real staked mint proposal built and proved") {
+		t.Fatalf("expected propose-mint -staked output to describe the real position opening, got:\n%s", out)
+	}
+	principalStr := mustExtractFlagValue(t, out, "-principal")
+	startEpochStr := mustExtractFlagValue(t, out, "-start-epoch")
+	ownerSKHex := mustExtractFlagValue(t, out, "-owner-sk")
+	rhoHex := mustExtractFlagValue(t, out, "-rho")
+	if principalStr != fmt.Sprintf("%d", amount) {
+		t.Fatalf("expected printed principal %d, got %s", amount, principalStr)
+	}
+
+	withStdin(t, "staked-voter-passphrase")
+	err = runVoteReveal([]string{
+		"-keystore", path, "-passphrase-stdin",
+		"-proposal", "cli-staked-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runVoteReveal: %v", err)
+	}
+
+	remainingBefore := backend.deps.StakeTree.Remaining()
+	tallied, err := backend.pipeline.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed || !tallied[0].MintApplied || !tallied[0].MintStaked {
+		t.Fatalf("expected the real staked proposal to pass and the real position to be applied, got %+v", tallied)
+	}
+	if got := backend.deps.StakeTree.Remaining(); got != remainingBefore-1 {
+		t.Fatalf("expected the real position the CLI proved to land in the stake tree, remaining went from %d to %d", remainingBefore, got)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runProposal([]string{"-query", backend.queryURL, "-id", "cli-staked-1"})
+	})
+	if err != nil {
+		t.Fatalf("runProposal: %v", err)
+	}
+	if !strings.Contains(out, "mint staked: true") || !strings.Contains(out, "mint applied: true") {
+		t.Fatalf("expected 'wallet proposal' to report the real staked mint as applied, got:\n%s", out)
+	}
+
+	remainingNotesBefore := zkTree.Remaining()
+	withStdin(t, "staked-voter-passphrase")
+	out, err = captureStdout(t, func() error {
+		return runUnstake([]string{
+			"-keystore", path, "-passphrase-stdin",
+			"-principal", principalStr, "-start-epoch", startEpochStr,
+			"-owner-sk", ownerSKHex, "-rho", rhoHex,
+			"-unstake-zk-params", backend.unstakeZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runUnstake: %v", err)
+	}
+	if !strings.Contains(out, "real unstake built and proved") {
+		t.Fatalf("expected unstake output to describe the real redemption, got:\n%s", out)
+	}
+	if got := zkTree.Remaining(); got != remainingNotesBefore-1 {
+		t.Fatalf("expected the real redeemed note to land in the canonical note tree, remaining went from %d to %d", remainingNotesBefore, got)
 	}
 }
 

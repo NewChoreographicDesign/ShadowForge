@@ -175,3 +175,111 @@ func loadMintSystem(path string) (*zk.MintSystem, error) {
 	}
 	return sys, nil
 }
+
+// runStakeZKSetup is runMintZKSetup's counterpart for the real spec-17.4
+// staked-yield mint circuit (pkg/zk.StakeCircuit) — a separate Groth16
+// setup and shared params file, since it's a distinct circuit from
+// MintCircuit and needs its own proving/verifying keys every validator
+// and staking wallet must agree on.
+func runStakeZKSetup(args []string) error {
+	fs := flag.NewFlagSet("stake-zk-setup", flag.ExitOnError)
+	out := fs.String("out", "stake-zk-params.bin", "where to write the real Groth16 parameters")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if _, err := os.Stat(*out); err == nil {
+		return fmt.Errorf("%s already exists — refusing to overwrite an existing, possibly already-shared params file", *out)
+	}
+
+	fmt.Println("running Groth16 trusted setup for the real staked-yield mint circuit (development setup — see pkg/zk doc for the production-ceremony requirement)...")
+	start := time.Now()
+	sys, err := zk.SetupStake()
+	if err != nil {
+		return fmt.Errorf("stake zk setup: %w", err)
+	}
+	fmt.Printf("setup complete in %s\n", time.Since(start))
+
+	f, err := os.Create(*out)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", *out, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return fmt.Errorf("write %s: %w", *out, err)
+	}
+	fmt.Printf("wrote %s — point every validator node (-stake-zk-params) and every wallet propose-mint -staked (-stake-zk-params) at this same file\n", *out)
+	return nil
+}
+
+// loadStakeSystem loads real, previously-generated Groth16 parameters
+// for the stake circuit from path — see loadZKSystem's own doc for why
+// this must always be a shared file, never a fresh per-process setup.
+func loadStakeSystem(path string) (*zk.StakeSystem, error) {
+	if path == "" {
+		return nil, fmt.Errorf("-stake-zk-params is required: a wallet must prove against the exact same Groth16 parameters the network's validators verify against (run 'wallet stake-zk-setup' once to generate a shared params file if one doesn't exist yet)")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open stake zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	sys, err := zk.ReadStakeSystem(f)
+	if err != nil {
+		return nil, fmt.Errorf("load stake zk params from %s: %w", path, err)
+	}
+	return sys, nil
+}
+
+// runUnstakeZKSetup is runStakeZKSetup's counterpart for the real
+// unstake circuit (pkg/zk.UnstakeCircuit) — a separate Groth16 setup and
+// shared params file, since it's a distinct circuit from StakeCircuit and
+// needs its own proving/verifying keys every validator and staking
+// wallet must agree on.
+func runUnstakeZKSetup(args []string) error {
+	fs := flag.NewFlagSet("unstake-zk-setup", flag.ExitOnError)
+	out := fs.String("out", "unstake-zk-params.bin", "where to write the real Groth16 parameters")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if _, err := os.Stat(*out); err == nil {
+		return fmt.Errorf("%s already exists — refusing to overwrite an existing, possibly already-shared params file", *out)
+	}
+
+	fmt.Println("running Groth16 trusted setup for the real unstake circuit (development setup — see pkg/zk doc for the production-ceremony requirement)...")
+	start := time.Now()
+	sys, err := zk.SetupUnstake()
+	if err != nil {
+		return fmt.Errorf("unstake zk setup: %w", err)
+	}
+	fmt.Printf("setup complete in %s\n", time.Since(start))
+
+	f, err := os.Create(*out)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", *out, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return fmt.Errorf("write %s: %w", *out, err)
+	}
+	fmt.Printf("wrote %s — point every validator node (-unstake-zk-params) and every wallet unstake (-unstake-zk-params) at this same file\n", *out)
+	return nil
+}
+
+// loadUnstakeSystem loads real, previously-generated Groth16 parameters
+// for the unstake circuit from path — see loadZKSystem's own doc for why
+// this must always be a shared file, never a fresh per-process setup.
+func loadUnstakeSystem(path string) (*zk.UnstakeSystem, error) {
+	if path == "" {
+		return nil, fmt.Errorf("-unstake-zk-params is required: a wallet must prove against the exact same Groth16 parameters the network's validators verify against (run 'wallet unstake-zk-setup' once to generate a shared params file if one doesn't exist yet)")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open unstake zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	sys, err := zk.ReadUnstakeSystem(f)
+	if err != nil {
+		return nil, fmt.Errorf("load unstake zk params from %s: %w", path, err)
+	}
+	return sys, nil
+}

@@ -63,6 +63,51 @@ func EpochDuration(n uint64) time.Duration {
 	return time.Duration(durationMillis(n)) * time.Millisecond
 }
 
+// ElapsedMillis returns the real, exact wall-clock milliseconds separating
+// the start of fromEpoch and the start of toEpoch — sum(duration(i) for i
+// in [fromEpoch, toEpoch)) — using the same exact-integer durationMillis
+// every other epoch computation in this file is built on. toEpoch <=
+// fromEpoch returns 0 rather than a negative value: pkg/staking's real
+// yield formula (spec 17.4's "staked 2 percent yield path") needs this to
+// convert a stake position's real held duration into a fraction of a
+// year, and epochs grow 1.1x per epoch (durationMillis above) rather than
+// being fixed-length, so counting elapsed *epochs* alone — ignoring how
+// long each one actually lasted — would badly misprice yield for a
+// position held across epoch-duration growth. Once durationMillis(n)
+// reaches EpochCapMillis (spec 5.2's one-year cap, after roughly 96
+// epochs), every further epoch is worth exactly EpochCapMillis, so the
+// tail of a very long span is summed in O(1) rather than one epoch at a
+// time — the same capped-tail strategy CurrentEpoch already uses, for the
+// same reason (a long-lived chain must never pay for an ever-growing
+// loop).
+func ElapsedMillis(fromEpoch, toEpoch uint64) int64 {
+	if toEpoch <= fromEpoch {
+		return 0
+	}
+	var total int64
+	n := fromEpoch
+	for n < toEpoch {
+		d := durationMillis(n)
+		if d >= EpochCapMillis {
+			remaining := toEpoch - n
+			// remaining epochs, each capped at EpochCapMillis: bounded by
+			// big.Int first so a pathological (attacker-unreachable, since
+			// toEpoch is always this node's own real current epoch, never
+			// attacker-supplied) huge span clamps rather than silently
+			// wrapping an int64 multiplication.
+			capped := new(big.Int).Mul(big.NewInt(int64(remaining)), big.NewInt(EpochCapMillis))
+			capped.Add(capped, big.NewInt(total))
+			if capped.IsInt64() {
+				return capped.Int64()
+			}
+			return int64(^uint64(0) >> 1) // math.MaxInt64, avoiding an import solely for one constant
+		}
+		total += d
+		n++
+	}
+	return total
+}
+
 // GenesisTime is the chain's genesis timestamp, in unix milliseconds
 // (spec 5.2: "store GenesisTime").
 type GenesisTime int64

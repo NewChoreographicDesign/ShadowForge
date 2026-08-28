@@ -444,7 +444,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	for i, t := range prop.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(prop.Epoch), Height: prop.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, MintZK: n.mintZK, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(prop.Epoch), Height: prop.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, MintZK: n.mintZK, StakeZK: n.stakeZK, UnstakeZK: n.unstakeZK, StakeTree: n.stakeTree, StakeRoots: n.stakeRoots, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 
 	if failed := firstFailure(results); failed != nil {
@@ -651,7 +651,7 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	for i, t := range ann.Block.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(ann.Block.Epoch), Height: ann.Block.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, MintZK: n.mintZK, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(ann.Block.Epoch), Height: ann.Block.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, MintZK: n.mintZK, StakeZK: n.stakeZK, UnstakeZK: n.unstakeZK, StakeTree: n.stakeTree, StakeRoots: n.stakeRoots, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 	for _, res := range results {
 		if res.Error != nil {

@@ -74,6 +74,10 @@ func main() {
 	eligibilityZKParamsPath := flag.String("eligibility-zk-params", "", "path to a shared Groth16 parameters file for the anonymous voter-eligibility circuit (pkg/zk.EligibilitySystem.WriteTo's format; a distinct file from -zk-params — different circuit, different keys). Same load-or-create-and-share behavior as -zk-params; see 'wallet eligibility-zk-setup' to generate one")
 	skipMintZK := flag.Bool("skip-mint-zk-setup", false, "skip the real spec-17.4 epoch-mint Groth16 trusted setup (a TxVote binding a mint claim will be rejected — ordinary up/down and ParamKey votes are unaffected)")
 	mintZKParamsPath := flag.String("mint-zk-params", "", "path to a shared Groth16 parameters file for the epoch-mint circuit (pkg/zk.MintSystem.WriteTo's format; a distinct file from -zk-params/-eligibility-zk-params — different circuit, different keys). Same load-or-create-and-share behavior; see 'wallet mint-zk-setup' to generate one")
+	skipStakeZK := flag.Bool("skip-stake-zk-setup", false, "skip the real spec-17.4 staked-yield mint Groth16 trusted setup (a TxVote binding a staked mint claim will be rejected — the direct mint path and ordinary votes are unaffected)")
+	stakeZKParamsPath := flag.String("stake-zk-params", "", "path to a shared Groth16 parameters file for the staked-yield mint circuit (pkg/zk.StakeSystem.WriteTo's format; a distinct file/circuit from -mint-zk-params). Same load-or-create-and-share behavior; see 'wallet stake-zk-setup' to generate one")
+	skipUnstakeZK := flag.Bool("skip-unstake-zk-setup", false, "skip the real spec-17.4 unstake Groth16 trusted setup (Kind Unstake transactions will be rejected — creating a staked position is unaffected, but it can never be redeemed on this node)")
+	unstakeZKParamsPath := flag.String("unstake-zk-params", "", "path to a shared Groth16 parameters file for the unstake circuit (pkg/zk.UnstakeSystem.WriteTo's format; a distinct file/circuit from -stake-zk-params). Same load-or-create-and-share behavior; see 'wallet unstake-zk-setup' to generate one")
 	announceFile := flag.String("announce-file", "", "write this node's dialable multiaddr to this path once listening (for peer discovery over a shared volume, e.g. Docker Compose)")
 	bootstrapFile := flag.String("bootstrap-file", "", "comma-separated paths to wait for and read bootstrap multiaddrs from (pairs with -announce-file on other nodes) — a full mesh among validators needs one entry per peer, since this reference build doesn't relay heartbeats or messages beyond directly connected peers")
 	keyFile := flag.String("key-file", "", "path to this node's persisted Dilithium identity keypair (empty = generate a fresh, ephemeral identity every start)")
@@ -138,6 +142,26 @@ func main() {
 		}
 	} else {
 		log.Println("skipping mint ZK setup: a TxVote binding a real epoch-mint claim will be rejected (ordinary votes are unaffected)")
+	}
+
+	var stakeZK *zk.StakeSystem
+	if !*skipStakeZK {
+		stakeZK, err = loadOrCreateStakeZKSystem(*stakeZKParamsPath)
+		if err != nil {
+			log.Fatalf("stake zk setup: %v", err)
+		}
+	} else {
+		log.Println("skipping stake ZK setup: a TxVote binding a real staked-yield mint claim will be rejected (the direct mint path and ordinary votes are unaffected)")
+	}
+
+	var unstakeZK *zk.UnstakeSystem
+	if !*skipUnstakeZK {
+		unstakeZK, err = loadOrCreateUnstakeZKSystem(*unstakeZKParamsPath)
+		if err != nil {
+			log.Fatalf("unstake zk setup: %v", err)
+		}
+	} else {
+		log.Println("skipping unstake ZK setup: Kind Unstake transactions will be rejected (creating a staked position is unaffected, but it can never be redeemed on this node)")
 	}
 
 	v := vault.New(vault.DefaultSplits())
@@ -207,7 +231,7 @@ func main() {
 	}
 
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mintZK, mempool, pk, sk, *sentinelFlag, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mintZK, stakeZK, unstakeZK, mempool, pk, sk, *sentinelFlag, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {
@@ -446,6 +470,100 @@ func loadOrCreateMintZKSystem(path string) (*zk.MintSystem, error) {
 	defer func() { _ = f.Close() }()
 	if _, err := sys.WriteTo(f); err != nil {
 		return nil, fmt.Errorf("write mint zk params file %s: %w", path, err)
+	}
+	return sys, nil
+}
+
+// loadOrCreateStakeZKSystem is loadOrCreateMintZKSystem's counterpart for
+// the real spec-17.4 staked-yield mint circuit (pkg/zk.StakeCircuit) — a
+// distinct circuit needing its own, separately-shared proving/verifying
+// keys and params file.
+func loadOrCreateStakeZKSystem(path string) (*zk.StakeSystem, error) {
+	if path == "" {
+		log.Println("running Groth16 trusted setup for the real staked-yield mint circuit (development setup, unshared — see pkg/zk doc for the production-ceremony requirement)...")
+		start := time.Now()
+		sys, err := zk.SetupStake()
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("stake zk setup complete in %s", time.Since(start))
+		return sys, nil
+	}
+
+	if f, err := os.Open(path); err == nil {
+		defer func() { _ = f.Close() }()
+		sys, err := zk.ReadStakeSystem(f)
+		if err != nil {
+			return nil, fmt.Errorf("load stake zk params from %s: %w", path, err)
+		}
+		log.Printf("loaded shared stake Groth16 params from %s", path)
+		return sys, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read stake zk params file %s: %w", path, err)
+	}
+
+	log.Printf("running Groth16 trusted setup for the real staked-yield mint circuit (development setup — see pkg/zk doc for the production-ceremony requirement) and saving it to %s for other nodes/wallets to share...", path)
+	start := time.Now()
+	sys, err := zk.SetupStake()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("stake zk setup complete in %s", time.Since(start))
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create stake zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return nil, fmt.Errorf("write stake zk params file %s: %w", path, err)
+	}
+	return sys, nil
+}
+
+// loadOrCreateUnstakeZKSystem is loadOrCreateStakeZKSystem's counterpart
+// for the real unstake circuit (pkg/zk.UnstakeCircuit) — a distinct
+// circuit needing its own, separately-shared proving/verifying keys and
+// params file.
+func loadOrCreateUnstakeZKSystem(path string) (*zk.UnstakeSystem, error) {
+	if path == "" {
+		log.Println("running Groth16 trusted setup for the real unstake circuit (development setup, unshared — see pkg/zk doc for the production-ceremony requirement)...")
+		start := time.Now()
+		sys, err := zk.SetupUnstake()
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("unstake zk setup complete in %s", time.Since(start))
+		return sys, nil
+	}
+
+	if f, err := os.Open(path); err == nil {
+		defer func() { _ = f.Close() }()
+		sys, err := zk.ReadUnstakeSystem(f)
+		if err != nil {
+			return nil, fmt.Errorf("load unstake zk params from %s: %w", path, err)
+		}
+		log.Printf("loaded shared unstake Groth16 params from %s", path)
+		return sys, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read unstake zk params file %s: %w", path, err)
+	}
+
+	log.Printf("running Groth16 trusted setup for the real unstake circuit (development setup — see pkg/zk doc for the production-ceremony requirement) and saving it to %s for other nodes/wallets to share...", path)
+	start := time.Now()
+	sys, err := zk.SetupUnstake()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("unstake zk setup complete in %s", time.Since(start))
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create unstake zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return nil, fmt.Errorf("write unstake zk params file %s: %w", path, err)
 	}
 	return sys, nil
 }

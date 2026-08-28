@@ -182,8 +182,7 @@ package — this is not a stub with comments describing intended behavior.
   dead end every proposal type once did: it could be built, voted on, and
   pass tally, with no code ever crediting SFG to anyone. This build wires
   the proposer-direct path (spec 17.4's other option, a staked 2% yield
-  path, is left out on the same disclosed boundary as before — it needs a
-  staking subsystem this L1-core build doesn't implement anywhere).
+  path, is now real too — see the staking bullet below).
   `pkg/zk.MintCircuit` (a real Groth16 circuit, deliberately the simplest
   one in this codebase — it proves only `OutCommit == MiMC(Amount,
   OwnerPK, Rho)`, no Merkle membership, since minting creates value rather
@@ -216,6 +215,60 @@ package — this is not a stub with comments describing intended behavior.
   a minted (or transferred) note landed — `wallet proposal -id` showing
   `mint applied: true` is the real, working way to confirm a mint
   executed.
+- **A real staking subsystem for spec 17.4's other mint path — closing
+  the scope cut the epoch-mint work above originally disclosed.** The
+  spec names "staked 2 percent yield" in one sentence and defines
+  neither a period, a funding source, nor withdrawal mechanics — the
+  same kind of gap `MintFeeNumerator`/`MintFeeDenominator` above already
+  had to resolve for the direct path. This build makes the same kind of
+  real, disclosed decision (`pkg/staking`'s own doc has the full
+  reasoning): "2 percent" is read as a real annual rate, accrued
+  pro-rata over a position's actual held wall-clock duration — not a
+  naive epoch count, since spec 5.2's epochs grow 1.1x per epoch and cap
+  at one year (`pkg/consensus.EpochDuration`), so two positions held for
+  "the same number of epochs" at different points in a chain's life
+  cover wildly different real time. `pkg/consensus.ElapsedMillis` sums
+  each epoch's own real duration between two epoch numbers, exactly
+  once, for both the yield formula and its own tests to share; `pkg/
+  staking.YieldAmount`/`FinalAmount` apply spec 9.1's real per-year
+  percentage over it in exact `math/big` integer arithmetic (floored,
+  like every other fee/yield figure in this codebase — no fabricated
+  fractional SFG), and a dedicated test proves a position held for
+  exactly one full, capped (post-growth-curve) real epoch earns exactly
+  2% of principal.
+  A locked position is a real, separate commitment scheme
+  (`pkg/zk.StakeCircuit`/`StakeSystem`, binding `PositionCommit ==
+  MiMC(Principal, StartEpoch, OwnerPK, Rho)`) rather than an immediately
+  spendable note: `types.VotePublicInputs.MintStaked` selects this path
+  at proposal time exactly like the direct path's own claim (same
+  "first `TxVote` wins" mechanism), the position lands in a new,
+  canonical stake-commitment tree (`Deps.StakeTree`/`StakeRoots`,
+  populated only by `TallyDueProposals`, structurally parallel to
+  `ZKTree`/`EligibilityTree`) instead of the note tree, and no Vault fee
+  is taken up front — the "cost" is realized later, gradually, as real
+  new SFG issuance, consistent with spec 9.1's inflation already being
+  "unlocked only against activity." Redeeming a position is a genuinely
+  new transaction kind, `Kind Unstake`: `pkg/zk.UnstakeCircuit` proves
+  real Merkle membership of the (still-hidden) position plus a
+  correctly-derived nullifier — EligibilityCircuit's membership-and-
+  nullifier shape, reused rather than reinvented — and binds a fresh
+  output note to `FinalAmount`, which `pkg/tx`'s Stage 1 independently
+  recomputes via the real formula above and rejects outright if the
+  transaction's own claim disagrees; the position's `StartEpoch` never
+  needs a separate server-side record because it's baked directly into
+  `PositionCommit` itself, so a real Merkle-membership check alone
+  proves it honestly, without ever revealing which position redeemed.
+  `pkg/stakewallet` (new) is a real, network-syncing client mirroring
+  `pkg/govwallet`'s own design, but replaying every known *proposal*
+  (`/v1/proposals`, in the same `ProposalID`-sorted order
+  `TallyDueProposals` itself uses) rather than blocks, since the stake
+  tree — unlike the note tree — is touched only by tally, never ordinary
+  transaction processing; `cmd/wallet propose-mint -staked`/`unstake`/
+  `stake-zk-setup`/`unstake-zk-setup` are the real CLI. Threaded through
+  the same layers Tier C #1/#2 already were:
+  `pkg/validator.Node`/`NewNode`, both `consensus.go` pipeline
+  construction sites, and `cmd/node`'s `-stake-zk-params`/
+  `-unstake-zk-params` flags.
 
 ## Security
 

@@ -50,6 +50,36 @@ func getTestMintSystem(t *testing.T) *zk.MintSystem {
 	return testMintSys
 }
 
+// testStakeSystem/testUnstakeSystem are likewise expensive to Setup;
+// build them once for the whole package's tests.
+var (
+	testStakeOnce sync.Once
+	testStakeSys  *zk.StakeSystem
+	testStakeErr  error
+
+	testUnstakeOnce sync.Once
+	testUnstakeSys  *zk.UnstakeSystem
+	testUnstakeErr  error
+)
+
+func getTestStakeSystem(t *testing.T) *zk.StakeSystem {
+	t.Helper()
+	testStakeOnce.Do(func() { testStakeSys, testStakeErr = zk.SetupStake() })
+	if testStakeErr != nil {
+		t.Fatalf("stake zk setup: %v", testStakeErr)
+	}
+	return testStakeSys
+}
+
+func getTestUnstakeSystem(t *testing.T) *zk.UnstakeSystem {
+	t.Helper()
+	testUnstakeOnce.Do(func() { testUnstakeSys, testUnstakeErr = zk.SetupUnstake() })
+	if testUnstakeErr != nil {
+		t.Fatalf("unstake zk setup: %v", testUnstakeErr)
+	}
+	return testUnstakeSys
+}
+
 // These are white-box tests (package validator, not validator_test): they
 // call unexported methods (handleBlockProposal, handleStageVote,
 // tryFinalize, sweepTimeouts, recordOnline) directly to exercise the
@@ -114,7 +144,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		OnlineTimeout:     time.Minute,
 		Genesis:           consensus.GenesisTime(genesisMs),
 	}
-	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), getTestMintSystem(t), mempool, pk, sk, false, testLogf(t))
+	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), getTestMintSystem(t), getTestStakeSystem(t), getTestUnstakeSystem(t), mempool, pk, sk, false, testLogf(t))
 }
 
 type peerKey struct {

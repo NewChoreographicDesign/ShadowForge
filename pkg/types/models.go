@@ -86,6 +86,22 @@ const (
 	// what makes TxVote/TxVoteReveal's voter eligibility real instead of
 	// an unchecked, freely-forgeable identity.
 	TxNFTMint
+	// TxUnstake redeems a real spec-17.4 "staked 2 percent yield" epoch-
+	// mint position (see VotePublicInputs.MintStaked's own doc for how one
+	// is created) for a fresh, ordinary spendable note carrying the
+	// position's principal plus its real accrued yield
+	// (pkg/staking.FinalAmount). Structurally the closest kin of Kind
+	// Transfer, not TxVote: a real Groth16 proof (pkg/zk.UnstakeCircuit)
+	// proves membership of the locked position in the real, canonical
+	// stake-commitment tree and reveals a nullifier preventing the same
+	// position from ever being redeemed twice — see UnstakePublicInputs'
+	// own doc for the exact field layout. This is a genuinely new,
+	// standalone transaction kind (unlike the staked path's own
+	// creation, which piggybacks on TxVote exactly like the direct
+	// path's does): redeeming a position happens whenever its owner
+	// chooses, entirely independent of any proposal's own vote/tally
+	// lifecycle.
+	TxUnstake
 )
 
 func (k TxKind) String() string {
@@ -108,6 +124,8 @@ func (k TxKind) String() string {
 		return "VoteReveal"
 	case TxNFTMint:
 		return "NFTMint"
+	case TxUnstake:
+		return "Unstake"
 	default:
 		return "Unknown"
 	}
@@ -131,9 +149,21 @@ type DilithiumSig []byte
 
 // ShieldedTx is the persisted, never-cleartext transaction object (spec 4.2).
 type ShieldedTx struct {
-	TxID         Hash
-	Nullifier    Hash   // prevents double-spend of the note
-	Commitments  []Hash // new notes created
+	TxID Hash
+	// Nullifier prevents double-spend of the note — for Kind Unstake,
+	// this same field carries the redeemed stake position's own real
+	// nullifier instead (zk.StakeSecret.Nullifier()), preventing the
+	// identical position from ever being redeemed twice; it shares one
+	// nullifier-spent namespace with ordinary notes (state.Store.
+	// MarkNullifierSpent/IsNullifierSpent), which is cryptographically
+	// safe since both are independently-random MiMC(rho, ownerSK) values
+	// (see UnstakeCircuit's own doc).
+	Nullifier Hash
+	// Commitments lists new notes created — for Kind Unstake, this is
+	// always exactly one element: the redeemed position's real proceeds
+	// note (UnstakePublicInputs.FinalAmount), inserted into the same
+	// canonical tree a Transfer's own output commitments live in.
+	Commitments  []Hash
 	Proof        []byte // gnark proof bytes
 	FeeCommit    Hash   // fee paid to Vault, also shielded
 	Memo         []byte // optional encrypted memo for receiver
@@ -168,6 +198,32 @@ type ShieldedTx struct {
 	// which extra public inputs the circuit must bind" — this is that
 	// binding for Transfer).
 	TransferPublicInputs *TransferPublicInputs
+
+	// UnstakePublicInputs carries the exact, fixed-shape public inputs
+	// pkg/zk's UnstakeCircuit was actually proved and must be verified
+	// against, for Kind Unstake — see that type's own doc.
+	UnstakePublicInputs *UnstakePublicInputs
+}
+
+// UnstakePublicInputs binds a real spec-17.4 staked-yield position
+// redemption (Kind Unstake). MerkleRoot anchors the real Groth16 proof
+// (ShieldedTx.Proof) to a root pkg/tx's pipeline recognizes in its real
+// stake-commitment root history (mirroring Kind Transfer's own
+// TransferPublicInputs.MerkleRoot check). Principal/StartEpoch are the
+// redeemed position's own claimed opening — cryptographically pinned by
+// the proof's real Merkle-membership check, not merely asserted (see
+// zk.UnstakeCircuit's own doc on why trusting them here is safe).
+// FinalAmount is the claimed total the resulting note (ShieldedTx.
+// Commitments[0]) carries; pkg/tx's Stage 1 independently recomputes it
+// via pkg/staking.FinalAmount(Principal, StartEpoch, <this node's own
+// current epoch>) and rejects the transaction outright if the claim
+// doesn't match — the real yield formula is never trusted from the
+// transaction's own say-so.
+type UnstakePublicInputs struct {
+	MerkleRoot  Hash
+	Principal   uint64
+	StartEpoch  EpochNumber
+	FinalAmount uint64
 }
 
 // TransferPublicInputs mirrors pkg/zk.TransferCircuit's public inputs
@@ -224,32 +280,52 @@ type VotePublicInputs struct {
 	NewValue string // decimal literal, e.g. "0.03" — see governance.ApplyParamChange
 
 	// MintAmount/MintOutCommit/MintProof optionally bind this proposal to
-	// a real spec-17.4 epoch mint (the "direct with 10 percent fee"
-	// proposer path — see MintNetAmount's own doc; this build does not
-	// implement the spec's staked-2%-yield alternative, a real, disclosed
-	// scope cut, not a silent omission). Like ParamKey/NewValue, they are
-	// only meaningful — and only ever checked — on the first TxVote to
-	// reference a given ProposalID: pkg/tx's Stage 4 verifies MintProof
-	// once, at that first vote, and rejects the vote outright if it
-	// doesn't real-and-truly bind MintOutCommit to MintAmount (pkg/zk.
-	// MintSystem); every later voter's own claims are ignored, exactly
-	// like ParamKey/NewValue. MintAmount == 0 means this proposal
-	// requests no mint (a plain up/down vote, or a ParamKey change).
+	// a real spec-17.4 epoch mint. Two proposer paths exist, matching
+	// spec 13.1/17.4's "direct with 10 percent fee, or staked 2 percent
+	// yield path" exactly — MintStaked selects which:
 	//
-	// MintOutCommit is a real shielded note commitment for MintNetAmount
-	// (Amount minus the Vault's fee) — the same commitment formula every
-	// other note in this codebase uses (zk.NoteSecret.Commitment()) — so
-	// once this proposal passes and is tallied, MintOutCommit becomes a
-	// real, spendable note in the canonical tree, exactly like a
-	// Transfer's own output commitments. The proposer alone knows this
-	// note's real opening (they built it), so no separate discovery
-	// mechanism is needed for them to later spend it — a real, disclosed
-	// limitation: an observer other than the proposer has no automatic
-	// way to learn this note exists via wallet sync (see pkg/tx's Stage 4
-	// TxVote case for the full disclosure).
+	//   - MintStaked == false (the "direct" path — see MintNetAmount's
+	//     own doc): MintOutCommit/MintProof are used, and are a real
+	//     shielded note commitment for MintNetAmount (Amount minus the
+	//     Vault's fee), the same commitment formula every other note in
+	//     this codebase uses (zk.NoteSecret.Commitment()).
+	//   - MintStaked == true (the "staked" path — see pkg/staking's own
+	//     doc for the real yield formula this build implements for spec
+	//     17.4's genuinely underspecified "2 percent yield"):
+	//     StakePositionCommit/StakeProof are used instead, a real
+	//     zk.StakeSecret commitment for the FULL Amount (no upfront fee —
+	//     see pkg/staking's doc for why) locked from exactly this
+	//     proposal's own creation epoch (Deps.Epoch at the moment the
+	//     first vote lands — pkg/tx's Stage 4 checks the proof was built
+	//     for exactly that epoch, not one the proposer picked freely).
+	//     Once passed and tallied, StakePositionCommit lands in the real,
+	//     canonical stake-commitment tree rather than the note tree — it
+	//     is not yet spendable; TxUnstake later redeems it for a real
+	//     note carrying principal plus real accrued yield.
+	//
+	// Either way, they are only meaningful — and only ever checked — on
+	// the first TxVote to reference a given ProposalID: pkg/tx's Stage 4
+	// verifies the relevant proof once, at that first vote, and rejects
+	// the vote outright if it doesn't real-and-truly bind the claimed
+	// commitment to Amount; every later voter's own claims are ignored,
+	// exactly like ParamKey/NewValue. MintAmount == 0 means this proposal
+	// requests no mint (a plain up/down vote, or a ParamKey change), and
+	// MintStaked is meaningless in that case.
+	//
+	// The proposer alone knows the resulting note's (or, for the staked
+	// path, the resulting position's) real opening — they built it — so
+	// no separate discovery mechanism is needed for them to later spend
+	// or unstake it; a real, disclosed limitation shared by both paths:
+	// an observer other than the proposer has no automatic way to learn
+	// it exists via ordinary wallet sync (see pkg/tx's Stage 4 TxVote
+	// case for the full disclosure).
 	MintAmount    uint64
 	MintOutCommit Hash
 	MintProof     []byte // gnark Groth16 proof bytes (pkg/zk.MintSystem)
+
+	MintStaked          bool
+	StakePositionCommit Hash
+	StakeProof          []byte // gnark Groth16 proof bytes (pkg/zk.StakeSystem)
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

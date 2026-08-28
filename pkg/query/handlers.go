@@ -196,13 +196,28 @@ type proposalResponse struct {
 	MintAmount    uint64 `json:"mint_amount,omitempty"`
 	MintOutCommit string `json:"mint_out_commit,omitempty"`
 	MintApplied   bool   `json:"mint_applied"`
+	// MintStaked/StakePositionCommit are the staked-yield proposer path's
+	// own counterpart of MintOutCommit — see types.VotePublicInputs.
+	// MintStaked's own doc. StakePositionCommit is safe to expose for the
+	// identical reason MintOutCommit already is: it's already public the
+	// moment the binding TxVote is gossiped. pkg/stakewallet's real sync
+	// depends on this field to rebuild its local stake-tree mirror.
+	MintStaked          bool   `json:"mint_staked,omitempty"`
+	StakePositionCommit string `json:"stake_position_commit,omitempty"`
 }
 
 func mintOutCommitJSON(p state.ProposalRecord) string {
-	if p.MintAmount == 0 {
+	if p.MintAmount == 0 || p.MintStaked {
 		return ""
 	}
 	return p.MintOutCommit.String()
+}
+
+func stakePositionCommitJSON(p state.ProposalRecord) string {
+	if p.MintAmount == 0 || !p.MintStaked {
+		return ""
+	}
+	return p.StakePositionCommit.String()
 }
 
 func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
@@ -222,18 +237,20 @@ func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, proposalResponse{
-		ProposalID:    p.ProposalID,
-		Epoch:         p.Epoch,
-		ParamKey:      p.ParamKey,
-		NewValue:      p.NewValue,
-		Tallied:       p.Tallied,
-		Approve:       p.Approve,
-		Reject:        p.Reject,
-		Passed:        p.Passed,
-		Applied:       p.Applied,
-		MintAmount:    p.MintAmount,
-		MintOutCommit: mintOutCommitJSON(p),
-		MintApplied:   p.MintApplied,
+		ProposalID:          p.ProposalID,
+		Epoch:               p.Epoch,
+		ParamKey:            p.ParamKey,
+		NewValue:            p.NewValue,
+		Tallied:             p.Tallied,
+		Approve:             p.Approve,
+		Reject:              p.Reject,
+		Passed:              p.Passed,
+		Applied:             p.Applied,
+		MintAmount:          p.MintAmount,
+		MintOutCommit:       mintOutCommitJSON(p),
+		MintApplied:         p.MintApplied,
+		MintStaked:          p.MintStaked,
+		StakePositionCommit: stakePositionCommitJSON(p),
 	})
 }
 
@@ -247,18 +264,20 @@ func (s *Server) handleProposals(w http.ResponseWriter, r *http.Request) {
 	out := make([]proposalResponse, 0, len(list))
 	for _, p := range list {
 		out = append(out, proposalResponse{
-			ProposalID:    p.ProposalID,
-			Epoch:         p.Epoch,
-			ParamKey:      p.ParamKey,
-			NewValue:      p.NewValue,
-			Tallied:       p.Tallied,
-			Approve:       p.Approve,
-			Reject:        p.Reject,
-			Passed:        p.Passed,
-			Applied:       p.Applied,
-			MintAmount:    p.MintAmount,
-			MintOutCommit: mintOutCommitJSON(p),
-			MintApplied:   p.MintApplied,
+			ProposalID:          p.ProposalID,
+			Epoch:               p.Epoch,
+			ParamKey:            p.ParamKey,
+			NewValue:            p.NewValue,
+			Tallied:             p.Tallied,
+			Approve:             p.Approve,
+			Reject:              p.Reject,
+			Passed:              p.Passed,
+			Applied:             p.Applied,
+			MintAmount:          p.MintAmount,
+			MintOutCommit:       mintOutCommitJSON(p),
+			MintApplied:         p.MintApplied,
+			MintStaked:          p.MintStaked,
+			StakePositionCommit: stakePositionCommitJSON(p),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

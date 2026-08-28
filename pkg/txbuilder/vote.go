@@ -3,6 +3,7 @@ package txbuilder
 import (
 	"fmt"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/staking"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
@@ -156,6 +157,148 @@ func (b *Builder) ProposeMint(proposalID types.ID, approve bool, amount uint64, 
 		return types.ShieldedTx{}, zk.NoteSecret{}, err
 	}
 	return finalized, secret, nil
+}
+
+// ProposeMintStaked is ProposeMint's spec-17.4 "staked 2 percent yield"
+// counterpart: it casts a real sealed ballot for proposalID exactly like
+// ProposeMint does, and binds it to a real, Groth16-proven request to
+// lock amount SFG as a staked position rather than mint it directly (see
+// types.VotePublicInputs.MintStaked's own doc, and pkg/staking's own doc
+// for the real yield formula this build implements for the spec's
+// otherwise-underspecified "2 percent yield").
+//
+// currentEpoch must be this node's own real current epoch at the moment
+// this proposal is first created — pkg/tx's Stage 4 checks the resulting
+// proof was built for exactly that epoch (a proposer cannot pick an
+// earlier one to front-run extra yield); the caller is responsible for
+// supplying it correctly (mirroring Deps.Epoch elsewhere in this
+// codebase).
+//
+// sys must be the exact same real, shared zk.StakeSystem every validator
+// verifying this proposal loads (mirroring ProposeMint's own sys
+// parameter). amount must be > 0. Returns the real zk.StakeSecret
+// opening the resulting locked position: this package never persists
+// anything (see the package doc), so the caller alone is responsible for
+// remembering it — it is the only way to ever redeem the staked value
+// later, via Unstake.
+func (b *Builder) ProposeMintStaked(proposalID types.ID, approve bool, amount uint64, currentEpoch types.EpochNumber, sys *zk.StakeSystem, eligibility types.VoteEligibilityProof) (types.ShieldedTx, zk.StakeSecret, error) {
+	if proposalID == "" {
+		return types.ShieldedTx{}, zk.StakeSecret{}, fmt.Errorf("txbuilder: proposal id must not be empty")
+	}
+	if amount == 0 {
+		return types.ShieldedTx{}, zk.StakeSecret{}, fmt.Errorf("txbuilder: mint amount must be greater than 0")
+	}
+	ownerSK, err := zk.NewSpendKey()
+	if err != nil {
+		return types.ShieldedTx{}, zk.StakeSecret{}, fmt.Errorf("txbuilder: generate stake position owner key: %w", err)
+	}
+	rho, err := zk.NewRho()
+	if err != nil {
+		return types.ShieldedTx{}, zk.StakeSecret{}, fmt.Errorf("txbuilder: generate stake position rho: %w", err)
+	}
+	secret := zk.StakeSecret{Principal: amount, StartEpoch: uint64(currentEpoch), OwnerSK: ownerSK, Rho: rho}
+
+	proof, err := sys.Prove(secret)
+	if err != nil {
+		return types.ShieldedTx{}, zk.StakeSecret{}, fmt.Errorf("txbuilder: prove stake: %w", err)
+	}
+	proofBytes, err := zk.ProofToBytes(proof)
+	if err != nil {
+		return types.ShieldedTx{}, zk.StakeSecret{}, fmt.Errorf("txbuilder: serialize stake proof: %w", err)
+	}
+
+	nonce := voteNonce(proposalID, eligibility.Nullifier)
+	commitment := types.ComputeVoteCommitment(eligibility.Nullifier, approve, nonce)
+
+	t := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID:          proposalID,
+			Commitment:          commitment,
+			MintAmount:          amount,
+			MintStaked:          true,
+			StakePositionCommit: types.Hash(zk.ToBytes32(secret.Commitment())),
+			StakeProof:          proofBytes,
+		},
+		VoteEligibility: &eligibility,
+		Nullifier:       types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("stake-mint-commit")),
+	}
+	finalized, err := b.finalize(t)
+	if err != nil {
+		return types.ShieldedTx{}, zk.StakeSecret{}, err
+	}
+	return finalized, secret, nil
+}
+
+// Unstake redeems position — a real staked position ProposeMintStaked
+// created and this proposal already passed and was tallied — for a
+// fresh, ordinary spendable note carrying the position's principal plus
+// its real accrued yield.
+//
+// merkleProof is the position's own real membership witness in the
+// canonical stake-commitment tree (this package never touches a network
+// or a tree — see the package doc — so unlike Vote's eligibility
+// parameter, the caller must supply this directly, e.g. via
+// pkg/stakewallet's real sync). merkleRoot must be a root pkg/tx's
+// pipeline still recognizes (its real StakeRoots history tolerates
+// staleness the same way Transfer's own root check does — see
+// zk.RootHistory's own doc — but an arbitrarily old root may eventually
+// age out).
+//
+// currentEpoch must be this node's own real current epoch: unlike
+// ProposeMintStaked's own currentEpoch parameter (which becomes
+// cryptographically pinned into the position's commitment), this one
+// only determines the real yield this call computes and proves — pkg/tx's
+// Stage 1 independently recomputes the identical formula against its own
+// view of the current epoch and rejects the transaction if they disagree
+// (see types.UnstakePublicInputs' own doc), so submitting stale is safe
+// to attempt but not guaranteed to land; the caller should use the most
+// recent epoch it knows of.
+//
+// sys must be the exact same real, shared zk.UnstakeSystem every
+// validator verifying this transaction loads. Returns the real
+// zk.NoteSecret opening the resulting proceeds note, for the identical
+// reason ProposeMint/ProposeMintStaked return theirs.
+func (b *Builder) Unstake(position zk.StakeSecret, merkleProof zk.Proof, merkleRoot zk.FieldElement, currentEpoch types.EpochNumber, sys *zk.UnstakeSystem) (types.ShieldedTx, zk.NoteSecret, error) {
+	finalAmount := staking.FinalAmount(position.Principal, types.EpochNumber(position.StartEpoch), currentEpoch)
+
+	outOwnerSK, err := zk.NewSpendKey()
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: generate unstake proceeds owner key: %w", err)
+	}
+	outRho, err := zk.NewRho()
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: generate unstake proceeds rho: %w", err)
+	}
+	out := zk.NoteSecret{Value: finalAmount, OwnerSK: outOwnerSK, Rho: outRho}
+
+	in := zk.UnstakeInput{MerkleRoot: merkleRoot, Position: position, Proof: merkleProof, Out: out}
+	proof, err := sys.Prove(in)
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: prove unstake: %w", err)
+	}
+	proofBytes, err := zk.ProofToBytes(proof)
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: serialize unstake proof: %w", err)
+	}
+
+	t := types.ShieldedTx{
+		Kind:        types.TxUnstake,
+		Proof:       proofBytes,
+		Nullifier:   types.Hash(zk.ToBytes32(in.Nullifier())),
+		Commitments: []types.Hash{types.Hash(zk.ToBytes32(out.Commitment()))},
+		UnstakePublicInputs: &types.UnstakePublicInputs{
+			MerkleRoot:  types.Hash(zk.ToBytes32(merkleRoot)),
+			Principal:   position.Principal,
+			StartEpoch:  types.EpochNumber(position.StartEpoch),
+			FinalAmount: finalAmount,
+		},
+	}
+	finalized, err := b.finalize(t)
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, err
+	}
+	return finalized, out, nil
 }
 
 // VoteReveal opens the sealed ballot Vote(proposalID, approve, ...)

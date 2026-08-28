@@ -83,6 +83,43 @@ func NewSpendKey() (FieldElement, error) { return RandomFieldElement() }
 // NewRho draws a fresh random nullifier seed.
 func NewRho() (FieldElement, error) { return RandomFieldElement() }
 
+// StakeSecret is the private opening of one locked spec-17.4 staked-yield
+// position (StakeCircuit) — NoteSecret's shape (a value, a spend key, and
+// a nullifier seed) plus StartEpoch, the one addition StakeCircuit's own
+// doc explains: because a later Unstake proof (UnstakeCircuit) must never
+// reveal which position it opens, StartEpoch has to be provable purely
+// from the hidden leaf's own preimage rather than looked up by leaf
+// identity in some separate record, so it is baked directly into the
+// commitment here instead of tracked alongside it.
+type StakeSecret struct {
+	Principal  uint64
+	StartEpoch uint64
+	OwnerSK    FieldElement
+	Rho        FieldElement
+}
+
+// OwnerPK derives the position's public spend-key binding: ownerPK =
+// MiMC(ownerSK) — identical formula to NoteSecret.OwnerPK().
+func (s StakeSecret) OwnerPK() FieldElement {
+	return mimcHash(s.OwnerSK)
+}
+
+// Commitment computes commitment = MiMC(principal, startEpoch, ownerPK,
+// rho), matching StakeCircuit's in-circuit computation exactly.
+func (s StakeSecret) Commitment() FieldElement {
+	return mimcHash(ValueElement(s.Principal), ValueElement(s.StartEpoch), s.OwnerPK(), s.Rho)
+}
+
+// Nullifier computes nullifier = MiMC(rho, ownerSK) — the identical
+// formula NoteSecret.Nullifier() already uses, deliberately reused rather
+// than a second one invented for this second commitment scheme (see
+// UnstakeCircuit's own doc on why that reuse is safe): pkg/tx's pipeline
+// checks it against the same nullifier-spent set an ordinary note's own
+// nullifier already shares.
+func (s StakeSecret) Nullifier() FieldElement {
+	return mimcHash(s.Rho, s.OwnerSK)
+}
+
 // FieldElementFromBigInt / ToBigInt are small convenience wrappers used by
 // callers that store values as *big.Int (e.g. gnark witness assignment).
 func FieldElementFromBigInt(v *big.Int) FieldElement {

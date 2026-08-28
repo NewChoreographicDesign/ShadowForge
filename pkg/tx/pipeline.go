@@ -13,6 +13,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/nft"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
+	"github.com/shadowforge/shadowforge-l1/pkg/staking"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/vault"
@@ -123,7 +124,32 @@ type Deps struct {
 	// up/down votes and ParamKey changes) is entirely unaffected either
 	// way.
 	MintZK *zk.MintSystem
-	Now    func() time.Time
+	// StakeZK verifies a real spec-17.4 "staked 2 percent yield" position-
+	// creation proof (types.VotePublicInputs.StakeProof) the moment a
+	// TxVote first binds a proposal to a staked mint claim (Stage 4) —
+	// the staked-path counterpart of MintZK, checked at the identical
+	// point in the identical fail-closed way (nil rejects only a TxVote
+	// that actually carries MintStaked == true with a nonzero
+	// MintAmount; every other TxVote is unaffected).
+	StakeZK *zk.StakeSystem
+	// StakeTree/StakeRoots are the real, canonical stake-position-
+	// commitment tree and its historical root set — the staked-path
+	// counterpart of ZKTree/ZKRoots, populated by TallyDueProposals (a
+	// passed, staked mint proposal's real StakePositionCommit) rather
+	// than by ordinary Stage 4 processing, since a position isn't known
+	// to exist until its proposal actually passes. Nil (never true on a
+	// real node) leaves a passed staked proposal's MintApplied false, the
+	// same way a nil ZKTree does for the direct path.
+	StakeTree  *zk.Tree
+	StakeRoots *zk.RootHistory
+	// UnstakeZK verifies a real Kind Unstake transaction's proof (Stage
+	// 1, mirroring where Kind Transfer's own proof is checked — both are
+	// real "spend a committed thing, mint a fresh output" claims, unlike
+	// MintZK/StakeZK's claim-and-record shape checked at Stage 4). Nil
+	// rejects every Kind Unstake transaction outright, fail-closed for
+	// the identical reason ZK == nil rejects every Kind Transfer.
+	UnstakeZK *zk.UnstakeSystem
+	Now       func() time.Time
 }
 
 func (d Deps) now() time.Time {
@@ -222,32 +248,25 @@ func (p *Pipeline) processOne(t *types.ShieldedTx, submittedAt time.Time) error 
 // nullified. Balance never revealed. Writes: Nullifier reserved in a
 // pending set (not yet finalized)."
 func (p *Pipeline) stage1SenderLeave(t *types.ShieldedTx) error {
-	if t.Kind != types.TxTransfer {
+	switch t.Kind {
+	case types.TxTransfer:
+		return p.stage1Transfer(t)
+	case types.TxUnstake:
+		return p.stage1Unstake(t)
+	default:
 		t.StageHints = t.StageHints.With(1)
 		return nil
 	}
+}
+
+func (p *Pipeline) stage1Transfer(t *types.ShieldedTx) error {
 	pub := t.TransferPublicInputs
 	if pub == nil || len(pub.Nullifiers) == 0 {
 		return fmt.Errorf("transfer missing public inputs")
 	}
 
-	p.mu.Lock()
-	for _, n := range pub.Nullifiers {
-		if p.pendingNullifiers[n] {
-			p.mu.Unlock()
-			return fmt.Errorf("nullifier %s already reserved in this batch (double-spend)", n)
-		}
-	}
-	p.mu.Unlock()
-
-	for _, n := range pub.Nullifiers {
-		spent, err := p.deps.Store.IsNullifierSpent(n)
-		if err != nil {
-			return fmt.Errorf("nullifier lookup: %w", err)
-		}
-		if spent {
-			return fmt.Errorf("nullifier %s already spent", n)
-		}
+	if err := p.reserveNullifiers(pub.Nullifiers); err != nil {
+		return err
 	}
 
 	if p.deps.ZK == nil {
@@ -278,35 +297,142 @@ func (p *Pipeline) stage1SenderLeave(t *types.ShieldedTx) error {
 		return fmt.Errorf("zk proof invalid: %w", err)
 	}
 
+	p.markReserved(pub.Nullifiers)
+	t.StageHints = t.StageHints.With(1)
+	return nil
+}
+
+// stage1Unstake verifies a Kind Unstake transaction's real Groth16 proof
+// at Stage 1, mirroring exactly where Kind Transfer's own proof is
+// checked — both are "spend a real committed thing, mint a fresh output"
+// claims (see types.TxUnstake's own doc for why this, not Stage 4, is the
+// right place, unlike MintZK/StakeZK's claim-and-record checks).
+func (p *Pipeline) stage1Unstake(t *types.ShieldedTx) error {
+	pub := t.UnstakePublicInputs
+	if pub == nil {
+		return fmt.Errorf("unstake tx missing public inputs")
+	}
+	if len(t.Commitments) != 1 {
+		return fmt.Errorf("unstake tx must carry exactly one output commitment, got %d", len(t.Commitments))
+	}
+
+	if err := p.reserveNullifiers([]types.Hash{t.Nullifier}); err != nil {
+		return err
+	}
+
+	if p.deps.UnstakeZK == nil {
+		return fmt.Errorf("no unstake ZK system configured; cannot verify an Unstake proof")
+	}
+	if p.deps.StakeRoots == nil {
+		return fmt.Errorf("no stake root history configured; cannot verify an unstake proof anchors to a real tree")
+	}
+
+	rootElem := zk.FieldElementFromBytes32(pub.MerkleRoot)
+	if !p.deps.StakeRoots.Contains(rootElem) {
+		return fmt.Errorf("unstake proof anchored to an unrecognized stake-commitment tree root")
+	}
+
+	// The real yield formula is never trusted from the transaction's own
+	// say-so: recompute it against this node's own current epoch and
+	// reject outright if the claimed FinalAmount disagrees (pkg/staking's
+	// own doc explains why StartEpoch itself is safe to trust here — it's
+	// cryptographically pinned by the Merkle-membership check the proof
+	// verification below performs).
+	wantFinal := staking.FinalAmount(pub.Principal, pub.StartEpoch, p.deps.Epoch)
+	if pub.FinalAmount != wantFinal {
+		return fmt.Errorf("claimed final amount %d does not match the real yield formula for this epoch (want %d)", pub.FinalAmount, wantFinal)
+	}
+
+	unstakePub := zk.UnstakePublic{
+		MerkleRoot:  rootElem,
+		Nullifier:   zk.FieldElementFromBytes32(t.Nullifier),
+		Principal:   pub.Principal,
+		StartEpoch:  uint64(pub.StartEpoch),
+		FinalAmount: pub.FinalAmount,
+		OutCommit:   zk.FieldElementFromBytes32(t.Commitments[0]),
+	}
+	if err := p.deps.UnstakeZK.VerifyPublicProofBytes(t.Proof, unstakePub); err != nil {
+		return fmt.Errorf("unstake proof invalid: %w", err)
+	}
+
+	p.markReserved([]types.Hash{t.Nullifier})
+	t.StageHints = t.StageHints.With(1)
+	return nil
+}
+
+// reserveNullifiers checks nullifiers against both this batch's in-flight
+// reservations and the durably-spent set, without yet committing the
+// reservation — shared by Transfer (possibly several nullifiers) and
+// Unstake (always exactly one) so both get the identical double-spend
+// protection.
+func (p *Pipeline) reserveNullifiers(nullifiers []types.Hash) error {
 	p.mu.Lock()
-	for _, n := range pub.Nullifiers {
-		p.pendingNullifiers[n] = true
+	for _, n := range nullifiers {
+		if p.pendingNullifiers[n] {
+			p.mu.Unlock()
+			return fmt.Errorf("nullifier %s already reserved in this batch (double-spend)", n)
+		}
 	}
 	p.mu.Unlock()
 
-	t.StageHints = t.StageHints.With(1)
+	for _, n := range nullifiers {
+		spent, err := p.deps.Store.IsNullifierSpent(n)
+		if err != nil {
+			return fmt.Errorf("nullifier lookup: %w", err)
+		}
+		if spent {
+			return fmt.Errorf("nullifier %s already spent", n)
+		}
+	}
 	return nil
+}
+
+func (p *Pipeline) markReserved(nullifiers []types.Hash) {
+	p.mu.Lock()
+	for _, n := range nullifiers {
+		p.pendingNullifiers[n] = true
+	}
+	p.mu.Unlock()
+}
+
+// txNullifiers returns the Stage-1 reservation(s) t implies, for release/
+// finalize below — Transfer's plural TransferPublicInputs.Nullifiers, or
+// Unstake's singular top-level Nullifier, or none for every other kind.
+func txNullifiers(t *types.ShieldedTx) []types.Hash {
+	switch t.Kind {
+	case types.TxTransfer:
+		if t.TransferPublicInputs == nil {
+			return nil
+		}
+		return t.TransferPublicInputs.Nullifiers
+	case types.TxUnstake:
+		return []types.Hash{t.Nullifier}
+	default:
+		return nil
+	}
 }
 
 // release drops a rejected transaction's Stage-1 reservations, per the
 // atomicity rule.
 func (p *Pipeline) release(t *types.ShieldedTx) {
-	if t.TransferPublicInputs == nil {
+	nullifiers := txNullifiers(t)
+	if len(nullifiers) == 0 {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, n := range t.TransferPublicInputs.Nullifiers {
+	for _, n := range nullifiers {
 		delete(p.pendingNullifiers, n)
 	}
 }
 
 func (p *Pipeline) finalize(t *types.ShieldedTx) {
-	if t.TransferPublicInputs == nil {
+	nullifiers := txNullifiers(t)
+	if len(nullifiers) == 0 {
 		return
 	}
 	p.mu.Lock()
-	for _, n := range t.TransferPublicInputs.Nullifiers {
+	for _, n := range nullifiers {
 		delete(p.pendingNullifiers, n)
 	}
 	p.mu.Unlock()
@@ -317,7 +443,7 @@ func (p *Pipeline) finalize(t *types.ShieldedTx) {
 // "Well-formedness: kind, fee commitment, circuit public inputs, Dilithium
 // signature, not expired. Writes: Tx admitted to the working batch."
 func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) error {
-	if t.Kind > types.TxNFTMint {
+	if t.Kind > types.TxUnstake {
 		return fmt.Errorf("unknown tx kind %d", t.Kind)
 	}
 	if !submittedAt.IsZero() && p.deps.now().Sub(submittedAt) > TxTTL {
@@ -388,11 +514,20 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 			return fmt.Errorf("vote tx missing real anonymous eligibility proof (VoteEligibility)")
 		}
 		if t.VotePublicInputs.MintAmount != 0 {
-			if len(t.VotePublicInputs.MintProof) == 0 {
-				return fmt.Errorf("vote tx claims a mint amount but is missing MintProof")
-			}
-			if t.VotePublicInputs.MintOutCommit.IsZero() {
-				return fmt.Errorf("vote tx claims a mint amount but MintOutCommit is empty")
+			if t.VotePublicInputs.MintStaked {
+				if len(t.VotePublicInputs.StakeProof) == 0 {
+					return fmt.Errorf("vote tx claims a staked mint amount but is missing StakeProof")
+				}
+				if t.VotePublicInputs.StakePositionCommit.IsZero() {
+					return fmt.Errorf("vote tx claims a staked mint amount but StakePositionCommit is empty")
+				}
+			} else {
+				if len(t.VotePublicInputs.MintProof) == 0 {
+					return fmt.Errorf("vote tx claims a mint amount but is missing MintProof")
+				}
+				if t.VotePublicInputs.MintOutCommit.IsZero() {
+					return fmt.Errorf("vote tx claims a mint amount but MintOutCommit is empty")
+				}
 			}
 		}
 	case types.TxVoteReveal:
@@ -409,6 +544,16 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 	case types.TxNFTMint:
 		if t.NFTMintPublicInputs == nil {
 			return fmt.Errorf("NFTMint tx missing public inputs")
+		}
+	case types.TxUnstake:
+		if t.UnstakePublicInputs == nil {
+			return fmt.Errorf("unstake tx missing public inputs")
+		}
+		if len(t.Proof) == 0 {
+			return fmt.Errorf("unstake tx missing proof")
+		}
+		if t.Nullifier.IsZero() {
+			return fmt.Errorf("unstake tx missing nullifier")
 		}
 	}
 	t.StageHints = t.StageHints.With(2)
@@ -575,15 +720,33 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 			// VotePublicInputs' own doc) — a later voter's own MintAmount/
 			// MintOutCommit/MintProof are never consulted.
 			if pub.MintAmount != 0 {
-				if p.deps.MintZK == nil {
-					return fmt.Errorf("no mint ZK system configured; cannot verify a real epoch-mint claim")
-				}
-				mintPub := zk.MintPublic{
-					Amount:    types.MintNetAmount(pub.MintAmount),
-					OutCommit: zk.FieldElementFromBytes32(pub.MintOutCommit),
-				}
-				if err := p.deps.MintZK.VerifyPublicProofBytes(pub.MintProof, mintPub); err != nil {
-					return fmt.Errorf("mint proof invalid: %w", err)
+				if pub.MintStaked {
+					if p.deps.StakeZK == nil {
+						return fmt.Errorf("no stake ZK system configured; cannot verify a real staked epoch-mint claim")
+					}
+					// StartEpoch is not a free choice: it must be exactly
+					// this proposal's own creation epoch, closing off a
+					// proposer picking an earlier epoch to front-run extra
+					// yield (pkg/staking's own doc).
+					stakePub := zk.StakePublic{
+						Principal:      pub.MintAmount,
+						StartEpoch:     uint64(p.deps.Epoch),
+						PositionCommit: zk.FieldElementFromBytes32(pub.StakePositionCommit),
+					}
+					if err := p.deps.StakeZK.VerifyPublicProofBytes(pub.StakeProof, stakePub); err != nil {
+						return fmt.Errorf("stake proof invalid: %w", err)
+					}
+				} else {
+					if p.deps.MintZK == nil {
+						return fmt.Errorf("no mint ZK system configured; cannot verify a real epoch-mint claim")
+					}
+					mintPub := zk.MintPublic{
+						Amount:    types.MintNetAmount(pub.MintAmount),
+						OutCommit: zk.FieldElementFromBytes32(pub.MintOutCommit),
+					}
+					if err := p.deps.MintZK.VerifyPublicProofBytes(pub.MintProof, mintPub); err != nil {
+						return fmt.Errorf("mint proof invalid: %w", err)
+					}
 				}
 			}
 			record = state.ProposalRecord{
@@ -596,10 +759,12 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				// later voter's own ParamKey/NewValue are never
 				// consulted, since record is only mutated here on
 				// creation.
-				ParamKey:      pub.ParamKey,
-				NewValue:      pub.NewValue,
-				MintAmount:    pub.MintAmount,
-				MintOutCommit: pub.MintOutCommit,
+				ParamKey:            pub.ParamKey,
+				NewValue:            pub.NewValue,
+				MintAmount:          pub.MintAmount,
+				MintOutCommit:       pub.MintOutCommit,
+				MintStaked:          pub.MintStaked,
+				StakePositionCommit: pub.StakePositionCommit,
 			}
 		}
 		if record.Tallied {
@@ -733,6 +898,31 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 					return fmt.Errorf("compute eligibility tree root: %w", err)
 				}
 				p.deps.EligibilityRoots.Record(newRoot)
+			}
+		}
+
+	case types.TxUnstake:
+		// The real proof (membership of the redeemed position, correct
+		// nullifier, correct binding of FinalAmount to the new note) was
+		// already verified once, at Stage 1 — this only makes the
+		// resulting note real by inserting it into the same canonical
+		// tree a Transfer's own outputs live in, mirroring exactly how
+		// Transfer's own OutCommits are inserted above.
+		outCommit := t.Commitments[0]
+		if p.deps.ZKTree != nil {
+			if p.deps.ZKTree.Remaining() < 1 {
+				return fmt.Errorf("canonical commitment tree has no room for the unstake proceeds note")
+			}
+			if _, err := p.deps.ZKTree.Insert(zk.FieldElementFromBytes32(outCommit)); err != nil {
+				return fmt.Errorf("insert unstake proceeds commitment into canonical tree: %w", err)
+			}
+			p.deps.StateTree.Append(outCommit)
+			if p.deps.ZKRoots != nil {
+				newRoot, err := p.deps.ZKTree.Root()
+				if err != nil {
+					return fmt.Errorf("compute canonical tree root: %w", err)
+				}
+				p.deps.ZKRoots.Record(newRoot)
 			}
 		}
 	}
@@ -874,6 +1064,15 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 			p.deps.Vault.CollectFee(decimal.FromInt(int64(t.TransferPublicInputs.FeeAmount)))
 		}
 	}
+	if t.Kind == types.TxUnstake {
+		// Durably marks the redeemed position's nullifier spent, in the
+		// same shared nullifier-spent set an ordinary note's own
+		// nullifier uses (types.ShieldedTx.Nullifier's own doc) — no
+		// staked position can ever be redeemed twice.
+		if err := p.deps.Store.MarkNullifierSpent(t.Nullifier); err != nil {
+			return fmt.Errorf("commit unstake nullifier: %w", err)
+		}
+	}
 	t.StageHints = t.StageHints.With(5)
 	return nil
 }
@@ -951,8 +1150,31 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 			}
 		}
 
-		if record.Passed && record.MintAmount > 0 {
-			// Real spec-17.4 mint execution: MintOutCommit's real Groth16
+		if record.Passed && record.MintAmount > 0 && record.MintStaked {
+			// Real spec-17.4 staked-yield mint execution: StakePositionCommit's
+			// real Groth16 proof was already verified once, at Stage 4 —
+			// this only makes the locked position real by inserting it into
+			// the real, canonical stake-commitment tree, mirroring the
+			// direct path's own ZKTree insertion below, but into a
+			// separate tree since the position is not yet spendable (it
+			// becomes so only once a later TxUnstake redeems it). No Vault
+			// fee is collected on this path — see pkg/staking's own doc for
+			// why that asymmetry with the direct path is deliberate.
+			// StakeTree == nil (never true on a real node) leaves
+			// MintApplied false, mirroring the direct path's identical
+			// treatment.
+			if p.deps.StakeTree != nil {
+				if _, err := p.deps.StakeTree.Insert(zk.FieldElementFromBytes32(record.StakePositionCommit)); err == nil {
+					record.MintApplied = true
+					if p.deps.StakeRoots != nil {
+						if newRoot, rootErr := p.deps.StakeTree.Root(); rootErr == nil {
+							p.deps.StakeRoots.Record(newRoot)
+						}
+					}
+				}
+			}
+		} else if record.Passed && record.MintAmount > 0 {
+			// Real spec-17.4 direct-mint execution: MintOutCommit's real Groth16
 			// proof was already verified once, at Stage 4, the moment
 			// this proposal's first vote bound it (see that case's own
 			// doc) — nothing here re-proves soundness, it only makes a

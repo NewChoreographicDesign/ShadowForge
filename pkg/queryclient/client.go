@@ -198,21 +198,28 @@ type Proposal struct {
 	MintAmount    uint64
 	MintOutCommit string
 	MintApplied   bool
+	// MintStaked/StakePositionCommit are the staked-yield proposer path's
+	// own counterpart of MintOutCommit — see types.VotePublicInputs.
+	// MintStaked's own doc.
+	MintStaked          bool
+	StakePositionCommit string
 }
 
 type proposalResponse struct {
-	ProposalID    string `json:"proposal_id"`
-	Epoch         uint64 `json:"epoch"`
-	ParamKey      string `json:"param_key,omitempty"`
-	NewValue      string `json:"new_value,omitempty"`
-	Tallied       bool   `json:"tallied"`
-	Approve       int    `json:"approve"`
-	Reject        int    `json:"reject"`
-	Passed        bool   `json:"passed"`
-	Applied       bool   `json:"applied"`
-	MintAmount    uint64 `json:"mint_amount,omitempty"`
-	MintOutCommit string `json:"mint_out_commit,omitempty"`
-	MintApplied   bool   `json:"mint_applied"`
+	ProposalID          string `json:"proposal_id"`
+	Epoch               uint64 `json:"epoch"`
+	ParamKey            string `json:"param_key,omitempty"`
+	NewValue            string `json:"new_value,omitempty"`
+	Tallied             bool   `json:"tallied"`
+	Approve             int    `json:"approve"`
+	Reject              int    `json:"reject"`
+	Passed              bool   `json:"passed"`
+	Applied             bool   `json:"applied"`
+	MintAmount          uint64 `json:"mint_amount,omitempty"`
+	MintOutCommit       string `json:"mint_out_commit,omitempty"`
+	MintApplied         bool   `json:"mint_applied"`
+	MintStaked          bool   `json:"mint_staked,omitempty"`
+	StakePositionCommit string `json:"stake_position_commit,omitempty"`
 }
 
 func (p proposalResponse) toProposal() Proposal { return Proposal(p) }

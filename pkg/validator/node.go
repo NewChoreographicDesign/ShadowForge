@@ -197,6 +197,20 @@ type Node struct {
 	// its own — a passed mint's real output note lands in the same
 	// canonical zkTree/zkRoots above (tx.Deps.MintZK's own doc).
 	mintZK *zk.MintSystem
+	// stakeZK/unstakeZK are the real Groth16 systems for spec-17.4's
+	// staked-yield mint proposer path (pkg/zk.StakeCircuit/
+	// UnstakeCircuit) — NewNode parameters for the same reason mintZK is:
+	// real, shared proving/verifying keys every node and staking wallet
+	// must agree on.
+	stakeZK   *zk.StakeSystem
+	unstakeZK *zk.UnstakeSystem
+	// stakeTree/stakeRoots are the real, canonical stake-position-
+	// commitment tree and its historical root set — the staked-path
+	// counterpart of zkTree/zkRoots, built fresh per process the same way
+	// and populated only by TallyDueProposals (tx.Deps.StakeTree's own
+	// doc), not by ordinary Stage 4 processing.
+	stakeTree  *zk.Tree
+	stakeRoots *zk.RootHistory
 	// oracleQuorum is the real quorum-verified price/ATR feed the pipeline
 	// cross-checks BankDeposit/BankWithdraw claims against (spec 11.3). Nil
 	// disables the cross-check entirely (e.g. a local test network with no
@@ -278,7 +292,7 @@ type Node struct {
 // keypair; the node's consensus identity (types.NFTID) is derived from the
 // public key (types.NFTID(types.SumHash(pk))) — a genuine cryptographic
 // binding, not an arbitrary label.
-func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mintZK *zk.MintSystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
+func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mintZK *zk.MintSystem, stakeZK *zk.StakeSystem, unstakeZK *zk.UnstakeSystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -299,6 +313,11 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 	if err != nil {
 		logf("validator: BUG: fresh eligibility zk.Tree root computation failed (%v); seeding RootHistory with the zero element", err)
 	}
+	stakeTree := zk.NewTree()
+	initialStakeRoot, err := stakeTree.Root()
+	if err != nil {
+		logf("validator: BUG: fresh stake zk.Tree root computation failed (%v); seeding RootHistory with the zero element", err)
+	}
 	n := &Node{
 		cfg:                 cfg,
 		mempool:             mempool,
@@ -313,6 +332,10 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		eligibilityTree:     eligibilityTree,
 		eligibilityRoots:    zk.NewRootHistory(initialEligibilityRoot),
 		mintZK:              mintZK,
+		stakeZK:             stakeZK,
+		unstakeZK:           unstakeZK,
+		stakeTree:           stakeTree,
+		stakeRoots:          zk.NewRootHistory(initialStakeRoot),
 		oracleQuorum:        oracleQuorum,
 		trustedPoHAttestors: trustedPoHAttestors,
 		governanceParams: func() *governance.Params {

@@ -6,11 +6,15 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"time"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	"github.com/shadowforge/shadowforge-l1/pkg/govwallet"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
+	"github.com/shadowforge/shadowforge-l1/pkg/queryclient"
+	"github.com/shadowforge/shadowforge-l1/pkg/stakewallet"
 	"github.com/shadowforge/shadowforge-l1/pkg/txbuilder"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/walletkey"
@@ -168,20 +172,26 @@ func runVoteReveal(args []string) error {
 	return submitTx(ctx, &nf, txn)
 }
 
-// runProposeMint drives the real spec-17.4 epoch-mint proposer path
-// (txbuilder.Builder.ProposeMint): a real Groth16 proof binds the
-// requested amount to a real output note commitment, both submitted
-// inside an ordinary sealed-ballot TxVote. Like vote/vote-reveal, it
-// signs the transaction envelope with a fresh, throwaway key.
+// runProposeMint drives the real spec-17.4 epoch-mint proposer path:
+// either the direct path (txbuilder.Builder.ProposeMint — a real Groth16
+// proof binds the requested amount to a real output note commitment) or,
+// with -staked, the staked-yield path (txbuilder.Builder.
+// ProposeMintStaked — the same amount instead locks as a real position
+// that later redeems for principal plus real accrued yield via 'wallet
+// unstake'). Either way, both are submitted inside an ordinary
+// sealed-ballot TxVote; like vote/vote-reveal, it signs the transaction
+// envelope with a fresh, throwaway key.
 func runProposeMint(args []string) error {
 	fs := flag.NewFlagSet("propose-mint", flag.ExitOnError)
 	path := fs.String("keystore", "walletkey.json", "keystore to unlock — the identity that minted the real NFT this proposal proves eligibility from")
 	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
 	proposal := fs.String("proposal", "", "proposal id (required)")
 	approve := fs.Bool("approve", true, "cast an approve ballot for this proposal's own first vote (default: true — proposing without approving is unusual but allowed)")
-	amount := fs.Uint64("amount", 0, "SFG amount requested (required, > 0) — the real note this mint creates, once passed, holds amount minus the real Vault fee (see types.MintNetAmount)")
+	amount := fs.Uint64("amount", 0, "SFG amount requested (required, > 0) — for the direct path, the real note this mint creates holds amount minus the real Vault fee (types.MintNetAmount); for -staked, the real locked position holds the full amount (no upfront fee — see pkg/staking's own doc)")
+	staked := fs.Bool("staked", false, "request the spec-17.4 staked 2 percent yield path instead of the default direct-with-fee path — see pkg/staking's own doc for the real yield formula")
 	eligibilityParams := fs.String("eligibility-zk-params", "", "path to the real, shared Groth16 params file for anonymous voter eligibility (see 'wallet eligibility-zk-setup' and cmd/node's -eligibility-zk-params) — required")
-	mintParams := fs.String("mint-zk-params", "", "path to the real, shared Groth16 params file for the epoch-mint circuit (see 'wallet mint-zk-setup' and cmd/node's -mint-zk-params) — required")
+	mintParams := fs.String("mint-zk-params", "", "path to the real, shared Groth16 params file for the epoch-mint circuit (see 'wallet mint-zk-setup' and cmd/node's -mint-zk-params) — required unless -staked")
+	stakeParams := fs.String("stake-zk-params", "", "path to the real, shared Groth16 params file for the staked-yield mint circuit (see 'wallet stake-zk-setup' and cmd/node's -stake-zk-params) — required when -staked")
 	var nf networkFlags
 	nf.register(fs)
 	if err := fs.Parse(args); err != nil {
@@ -202,11 +212,37 @@ func runProposeMint(args []string) error {
 	if err != nil {
 		return err
 	}
-	mintSys, err := loadMintSystem(*mintParams)
+	b, err := throwawayVoteSigner()
 	if err != nil {
 		return err
 	}
-	b, err := throwawayVoteSigner()
+
+	if *staked {
+		status, err := queryclient.New(queryURL).Status(ctx)
+		if err != nil {
+			return fmt.Errorf("fetch status for current epoch: %w", err)
+		}
+		currentEpoch := consensus.CurrentEpoch(consensus.GenesisTime(status.GenesisMs), time.Now())
+		stakeSys, err := loadStakeSystem(*stakeParams)
+		if err != nil {
+			return err
+		}
+		txn, position, err := b.ProposeMintStaked(types.ID(*proposal), *approve, *amount, types.EpochNumber(currentEpoch), stakeSys, eligibility)
+		if err != nil {
+			return err
+		}
+		ownerSKBytes := zk.ToBytes32(position.OwnerSK)
+		rhoBytes := zk.ToBytes32(position.Rho)
+		fmt.Println("real staked mint proposal built and proved — save this position opening, it is the ONLY way to ever unstake the locked value once this proposal passes:")
+		fmt.Printf("  -principal %d\n", position.Principal)
+		fmt.Printf("  -start-epoch %d\n", position.StartEpoch)
+		fmt.Printf("  -owner-sk %s\n", hex.EncodeToString(ownerSKBytes[:]))
+		fmt.Printf("  -rho %s\n", hex.EncodeToString(rhoBytes[:]))
+		fmt.Println("check 'wallet proposal -id <id>' for real Passed/MintApplied status once tallied, then 'wallet unstake' to redeem it")
+		return submitTx(ctx, &nf, txn)
+	}
+
+	mintSys, err := loadMintSystem(*mintParams)
 	if err != nil {
 		return err
 	}
@@ -224,6 +260,118 @@ func runProposeMint(args []string) error {
 	fmt.Printf("  -rho %s\n", hex.EncodeToString(rhoBytes[:]))
 	fmt.Println("check 'wallet proposal -id <id>' for real Passed/MintApplied status once tallied")
 	return submitTx(ctx, &nf, txn)
+}
+
+// runUnstake redeems a real spec-17.4 staked-yield position ('wallet
+// propose-mint -staked' own printed output) for a fresh, ordinary
+// spendable note carrying the position's principal plus its real
+// accrued yield (txbuilder.Builder.Unstake). It syncs a real
+// pkg/stakewallet.Wallet purely against the live network to locate the
+// position and build a real Merkle membership proof — this build's own
+// disclosed discovery limitation applies here too (types.
+// VotePublicInputs.MintStaked's own doc): only the caller who holds the
+// real position opening can do this, since nothing else identifies it.
+func runUnstake(args []string) error {
+	fs := flag.NewFlagSet("unstake", flag.ExitOnError)
+	path := fs.String("keystore", "walletkey.json", "keystore to unlock — signs the resulting transaction envelope; any identity may submit it, since the position opening below is what actually authorizes the redemption")
+	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
+	principal := fs.Uint64("principal", 0, "the staked position's real principal (required) — from 'wallet propose-mint -staked' own printed output")
+	startEpoch := fs.Uint64("start-epoch", 0, "the staked position's real start epoch (required) — from 'wallet propose-mint -staked' own printed output")
+	ownerSKHex := fs.String("owner-sk", "", "the staked position's real owner spend key, hex (required) — from 'wallet propose-mint -staked' own printed output")
+	rhoHex := fs.String("rho", "", "the staked position's real rho, hex (required) — from 'wallet propose-mint -staked' own printed output")
+	unstakeParams := fs.String("unstake-zk-params", "", "path to the real, shared Groth16 params file for the unstake circuit (see 'wallet unstake-zk-setup' and cmd/node's -unstake-zk-params) — required")
+	var nf networkFlags
+	nf.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *principal == 0 {
+		return fmt.Errorf("-principal must be greater than 0")
+	}
+	if *ownerSKHex == "" || *rhoHex == "" {
+		return fmt.Errorf("-owner-sk and -rho are required")
+	}
+	ownerSK, err := parseFieldElementHex(*ownerSKHex)
+	if err != nil {
+		return fmt.Errorf("-owner-sk: %w", err)
+	}
+	rho, err := parseFieldElementHex(*rhoHex)
+	if err != nil {
+		return fmt.Errorf("-rho: %w", err)
+	}
+	position := zk.StakeSecret{Principal: *principal, StartEpoch: *startEpoch, OwnerSK: ownerSK, Rho: rho}
+
+	ctx := context.Background()
+	queryURL, err := nf.firstQueryURL()
+	if err != nil {
+		return err
+	}
+
+	sw, err := stakewallet.New(stakewallet.Config{QueryBase: queryURL})
+	if err != nil {
+		return err
+	}
+	sw.Remember(position)
+	if err := sw.Sync(ctx); err != nil {
+		return fmt.Errorf("sync stake tree: %w", err)
+	}
+	if !sw.Found(position) {
+		return fmt.Errorf("this position was not found in any synced, passed, applied staked proposal — has 'wallet proposal -id <id>' shown mint applied: true yet?")
+	}
+	root, err := sw.CurrentRoot()
+	if err != nil {
+		return err
+	}
+	merkleProof, err := sw.ProofFor(position)
+	if err != nil {
+		return err
+	}
+
+	status, err := queryclient.New(queryURL).Status(ctx)
+	if err != nil {
+		return fmt.Errorf("fetch status for current epoch: %w", err)
+	}
+	currentEpoch := consensus.CurrentEpoch(consensus.GenesisTime(status.GenesisMs), time.Now())
+
+	unstakeSys, err := loadUnstakeSystem(*unstakeParams)
+	if err != nil {
+		return err
+	}
+	b, err := loadBuilder(*path, *fromStdin)
+	if err != nil {
+		return err
+	}
+	txn, out, err := b.Unstake(position, merkleProof, root, types.EpochNumber(currentEpoch), unstakeSys)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("real unstake built and proved: redeemed %d principal for %d total (principal + real accrued yield)\n", position.Principal, out.Value)
+	outCommitBytes := zk.ToBytes32(out.Commitment())
+	outOwnerSKBytes := zk.ToBytes32(out.OwnerSK)
+	outRhoBytes := zk.ToBytes32(out.Rho)
+	fmt.Println("save this new note opening — it is the ONLY way to ever spend the redeemed value:")
+	fmt.Printf("  -commitment %s\n", hex.EncodeToString(outCommitBytes[:]))
+	fmt.Printf("  -value %d\n", out.Value)
+	fmt.Printf("  -owner-sk %s\n", hex.EncodeToString(outOwnerSKBytes[:]))
+	fmt.Printf("  -rho %s\n", hex.EncodeToString(outRhoBytes[:]))
+	return submitTx(ctx, &nf, txn)
+}
+
+// parseFieldElementHex decodes a hex-encoded 32-byte value into a real
+// zk.FieldElement — the shared parsing helper 'wallet unstake' uses for
+// -owner-sk/-rho, both raw BN254 scalar-field elements rather than
+// types.Hash-shaped values.
+func parseFieldElementHex(s string) (zk.FieldElement, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return zk.FieldElement{}, fmt.Errorf("invalid hex: %w", err)
+	}
+	if len(b) != 32 {
+		return zk.FieldElement{}, fmt.Errorf("expected 32 bytes, got %d", len(b))
+	}
+	var arr [32]byte
+	copy(arr[:], b)
+	return zk.FieldElementFromBytes32(arr), nil
 }
 
 func runMint(args []string) error {
