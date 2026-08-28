@@ -10,7 +10,12 @@
 //  3. The nullifier is correctly derived from rho (and the owner's spend
 //     key, in this implementation — see Nullifier below) so the same note
 //     cannot be spent twice.
-//  4. Sum(spent values) = sum(new note values) + fee.
+//  4. Sum(spent values) = sum(new note values) + fee — every value and
+//     the fee are also range-constrained to this codebase's uint64
+//     domain (see valueBits below), since the sum check alone is
+//     arithmetic modulo the BN254 scalar field: an unconstrained value
+//     could otherwise wrap around that modulus and let a prover claim
+//     conservation while actually creating value.
 //  5. New commitments are well-formed bindings of the claimed secret openings.
 //
 // Circuit size: spec 23's own risk register says the Year-1 mitigation for
@@ -65,15 +70,34 @@ type TransferCircuit struct {
 	OutRho     [NumOutputs]frontend.Variable
 }
 
-// Define encodes the five spec-8.1 constraints described in the package doc.
+// valueBits bounds every note value and the fee to this codebase's own
+// uint64 domain (zk.NoteSecret.Value, ValueElement's parameter — every
+// value this package's own tooling ever constructs is already in this
+// range). Property 4's sum check below is arithmetic modulo the BN254
+// scalar field (~2^254), not modulo 2^64: without this bound, a prover
+// could choose an out-of-range OutValue that wraps around the field
+// modulus so inSum == outSum+Fee holds in-circuit while one output note
+// is actually worth far more than the inputs ever were — a real value-
+// creation exploit, not merely a theoretical one, since nothing else in
+// the pipeline (which never sees plaintext values) would catch it. Two
+// inputs plus two outputs plus a fee, each under 2^64, sums to well
+// under 2^67 — nowhere near large enough to wrap the ~2^254 field, so
+// the addition itself is safe once every term is individually bounded.
+const valueBits = 64
+
+// Define encodes the five spec-8.1 constraints described in the package
+// doc, plus the range constraints valueBits documents above.
 func (c *TransferCircuit) Define(api frontend.API) error {
 	h, err := mimc.NewMiMC(api)
 	if err != nil {
 		return err
 	}
 
+	api.ToBinary(c.Fee, valueBits)
+
 	inSum := frontend.Variable(0)
 	for i := 0; i < NumInputs; i++ {
+		api.ToBinary(c.InValue[i], valueBits)
 		// Property 2: the spender knows the opening. ownerPK is derived
 		// in-circuit from the claimed spend key, binding "knows the
 		// secret key" to "knows the note opening" below.
@@ -107,6 +131,8 @@ func (c *TransferCircuit) Define(api frontend.API) error {
 
 	outSum := frontend.Variable(0)
 	for j := 0; j < NumOutputs; j++ {
+		api.ToBinary(c.OutValue[j], valueBits)
+
 		// Property 5: new commitments are well-formed bindings of the
 		// claimed secret openings.
 		h.Reset()
