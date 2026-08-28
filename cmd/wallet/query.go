@@ -258,4 +258,9 @@ func printProposal(p queryclient.Proposal) {
 		}
 		fmt.Printf("mint applied: %v\n", p.MintApplied)
 	}
+	if p.SlashTargetNFT != "" {
+		fmt.Printf("slash target: %s\n", p.SlashTargetNFT)
+		fmt.Printf("slash burn: %v\n", p.SlashBurn)
+		fmt.Printf("slash applied: %v\n", p.SlashApplied)
+	}
 }

@@ -745,6 +745,83 @@ func TestCLIProposeMintEndToEnd(t *testing.T) {
 	}
 }
 
+// TestCLIProposeSlashEndToEnd proves the real spec-10.3 slash path end
+// to end through the actual CLI: a real minted NFT gives a voter real
+// anonymous eligibility, 'wallet propose-slash' builds and submits a
+// real slash request against a second, separately-minted target NFT, a
+// matching 'wallet vote-reveal' opens the sealed ballot, and — since
+// this build's CLI deliberately exposes no epoch-boundary/tally command
+// of its own (see TestCLIProposeMintEndToEnd's identical doc) — the test
+// drives the same real TallyDueProposals a live validator runs at epoch
+// end, then proves the real target NFT record lands genuinely Slashed.
+func TestCLIProposeSlashEndToEnd(t *testing.T) {
+	backend := newTestBackend(t, 0x08, nil, nil, nil)
+
+	voterPath, voterKS := newTestKeystore(t, "slash-voter-passphrase")
+	mintNFTViaCLI(t, backend, voterKS.PublicKey(), voterPath, "slash-voter-passphrase")
+
+	targetPath, targetKS := newTestKeystore(t, "slash-target-passphrase")
+	mintNFTViaCLI(t, backend, targetKS.PublicKey(), targetPath, "slash-target-passphrase")
+	targetOwner := types.AddressFromPubkey(targetKS.PublicKey())
+	targetNFT, found, err := backend.store.GetNFTByOwner(targetOwner)
+	if err != nil || !found {
+		t.Fatalf("expected the target's real minted NFT to be found: found=%v err=%v", found, err)
+	}
+
+	withStdin(t, "slash-voter-passphrase")
+	out, err := captureStdout(t, func() error {
+		return runProposeSlash([]string{
+			"-keystore", voterPath, "-passphrase-stdin",
+			"-proposal", "cli-slash-1", "-approve", "-target", targetNFT.ID.String(),
+			"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runProposeSlash: %v", err)
+	}
+	if !strings.Contains(out, "real slash proposal built") {
+		t.Fatalf("expected propose-slash output to describe the real proposal, got:\n%s", out)
+	}
+
+	withStdin(t, "slash-voter-passphrase")
+	err = runVoteReveal([]string{
+		"-keystore", voterPath, "-passphrase-stdin",
+		"-proposal", "cli-slash-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runVoteReveal: %v", err)
+	}
+
+	tallied, err := backend.pipeline.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed || !tallied[0].SlashApplied {
+		t.Fatalf("expected the real proposal to pass and the real slash to be applied, got %+v", tallied)
+	}
+
+	got, found, err := backend.store.GetNFT(targetNFT.ID)
+	if err != nil || !found {
+		t.Fatalf("expected the target's NFT record to still exist (frozen, not burned): found=%v err=%v", found, err)
+	}
+	if !got.Slashed {
+		t.Fatalf("expected the real target NFT to be marked Slashed")
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runProposal([]string{"-query", backend.queryURL, "-id", "cli-slash-1"})
+	})
+	if err != nil {
+		t.Fatalf("runProposal: %v", err)
+	}
+	if !strings.Contains(out, "slash applied: true") {
+		t.Fatalf("expected 'wallet proposal' to report the real slash as applied, got:\n%s", out)
+	}
+}
+
 // TestCLIProposeMintStakedAndUnstakeEndToEnd proves the real spec-17.4
 // staked-yield path end to end through the actual CLI: 'wallet
 // propose-mint -staked' builds and submits a real, Groth16-proven staked

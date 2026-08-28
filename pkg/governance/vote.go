@@ -20,17 +20,19 @@ var MinTurnout = decimal.MustFromString("0.20")
 //
 // Execution status: ProposalParamChange is real end-to-end — a passed
 // proposal actually mutates live Params (see ApplyParamChange, and
-// pkg/tx's TallyDueProposals, which is what calls it). The other four
-// kinds are tallied identically (real ballots, real majority, real
-// persisted Approve/Reject/Passed) but this build wires no execution step
-// for a pass: ProposalSlashNFT still requires a separate, manual call
-// into pkg/nft.ApplySlash; ProposalUnlockNFTTransfer into
-// pkg/nft.UnlockTransfer; ProposalContainerAsset and
-// ProposalUpgradeUnwind have no automated effect at all. A real
-// deployment needs a wallet/App-layer or operator step to read a passed
-// proposal's Kind and act on it for those four, the same "tally is
-// real, automatic execution is a separate later step" split
-// TallyDueProposals' own doc already draws for SFG minting.
+// pkg/tx's TallyDueProposals, which is what calls it). ProposalSlashNFT
+// is real end-to-end too (types.VotePublicInputs.SlashTargetNFT/
+// SlashBurn; TallyDueProposals calls pkg/nft.ApplySlash on a pass, plus
+// a real state.Store.DeleteNFT for the burn outcome). The remaining
+// three kinds are tallied identically (real ballots, real majority,
+// real persisted Approve/Reject/Passed) but this build wires no
+// execution step for a pass: ProposalUnlockNFTTransfer still requires a
+// separate, manual call into pkg/nft.UnlockTransfer;
+// ProposalContainerAsset and ProposalUpgradeUnwind have no automated
+// effect at all. A real deployment needs a wallet/App-layer or operator
+// step to read a passed proposal's Kind and act on it for those three,
+// the same "tally is real, automatic execution is a separate later
+// step" split TallyDueProposals' own doc already draws for SFG minting.
 type ProposalKind uint8
 
 const (

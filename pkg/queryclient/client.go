@@ -203,6 +203,12 @@ type Proposal struct {
 	// MintStaked's own doc.
 	MintStaked          bool
 	StakePositionCommit string
+	// SlashTargetNFT/SlashBurn/SlashApplied are a real spec-10.3 slash
+	// proposal's bound claim and execution status — see types.
+	// VotePublicInputs.SlashTargetNFT's own doc.
+	SlashTargetNFT string
+	SlashBurn      bool
+	SlashApplied   bool
 }
 
 type proposalResponse struct {
@@ -220,6 +226,9 @@ type proposalResponse struct {
 	MintApplied         bool   `json:"mint_applied"`
 	MintStaked          bool   `json:"mint_staked,omitempty"`
 	StakePositionCommit string `json:"stake_position_commit,omitempty"`
+	SlashTargetNFT      string `json:"slash_target_nft,omitempty"`
+	SlashBurn           bool   `json:"slash_burn,omitempty"`
+	SlashApplied        bool   `json:"slash_applied,omitempty"`
 }
 
 func (p proposalResponse) toProposal() Proposal { return Proposal(p) }

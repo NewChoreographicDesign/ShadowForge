@@ -95,6 +95,8 @@ type NFTID [32]byte
 
 func (n NFTID) String() string { return hex.EncodeToString(n[:]) }
 
+func (n NFTID) IsZero() bool { return n == NFTID{} }
+
 func (n NFTID) MarshalJSON() ([]byte, error) { return marshalHexJSON(n[:]) }
 
 func (n *NFTID) UnmarshalJSON(b []byte) error { return unmarshalHexJSON(b, n[:]) }

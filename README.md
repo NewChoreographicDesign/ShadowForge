@@ -269,6 +269,32 @@ package — this is not a stub with comments describing intended behavior.
   `pkg/validator.Node`/`NewNode`, both `consensus.go` pipeline
   construction sites, and `cmd/node`'s `-stake-zk-params`/
   `-unstake-zk-params` flags.
+- **Real spec-10.3 slash execution — closing another "tally is real,
+  execution isn't" gap `governance.ProposalKind`'s own doc had disclosed
+  since the anonymous-eligibility work.** A passed `ProposalSlashNFT`
+  vote used to require a separate, manual operator call into
+  `pkg/nft.ApplySlash` — the tally itself was real, but nothing in the
+  pipeline ever acted on it. `types.VotePublicInputs` gained
+  `SlashTargetNFT`/`SlashBurn`, bound at proposal time via the same
+  "first `TxVote` wins" mechanism every other proposal claim already
+  uses; Stage 4 rejects a slash claim against a target that was never
+  minted (or already burned) the moment it's first bound, and
+  `TallyDueProposals` calls the real `pkg/nft.ApplySlash` on a pass —
+  freezing the record (`Slashed=true`, kept) or, for the burn outcome,
+  removing it permanently via a new `state.Store.DeleteNFT` (which
+  clears both the primary record and its owner-index entry, so the
+  owner can mint a fresh NFT afterward). `pkg/txbuilder.
+  Builder.ProposeSlash`/`cmd/wallet propose-slash` are the real CLI,
+  reusing the same eligibility/throwaway-signer machinery `propose-mint`
+  already established. A real, disclosed limitation this does not fix,
+  documented at the point of decision: anonymous voter eligibility
+  still cannot re-check whether the NFT behind a valid vote has since
+  been slashed, since a membership proof never reveals which leaf it
+  opens — revoking an already-anonymous credential remains the separate,
+  larger undertaking (a slashed-leaf accumulator or epoch-scoped
+  re-registration) `requireEligibleVoterZK`'s own doc already named; this
+  work makes the slash itself real without claiming to have closed that
+  older, deeper gap.
 
 ## Security
 

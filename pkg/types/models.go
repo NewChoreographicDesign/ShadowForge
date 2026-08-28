@@ -326,6 +326,37 @@ type VotePublicInputs struct {
 	MintStaked          bool
 	StakePositionCommit Hash
 	StakeProof          []byte // gnark Groth16 proof bytes (pkg/zk.StakeSystem)
+
+	// SlashTargetNFT/SlashBurn optionally bind this proposal to a real
+	// spec-10.3 slash vote against a specific, already-minted
+	// ValidatorNFT ("Malicious stage signatures or provable double
+	// proposals create a slash proposal. Slash execution is a governance
+	// vote that burns or freezes the NFT"). Like every other optional
+	// binding above, only the first TxVote to reference a given
+	// ProposalID matters: pkg/tx's Stage 4 checks the target NFT really
+	// exists at that point and rejects the vote outright if it doesn't —
+	// a slash proposal against a nonexistent (or already-burned) NFT can
+	// never even be created — and the actual slash (pkg/nft.ApplySlash,
+	// plus deletion for the burn outcome) runs once, in
+	// TallyDueProposals, only if the proposal passes. SlashTargetNFT's
+	// zero value means this proposal carries no slash (a plain up/down
+	// vote, a ParamKey change, or a mint request). SlashBurn selects
+	// which of spec 10.3's two outcomes a pass applies: false freezes
+	// the NFT (Slashed=true, record kept — pkg/nft.SlashFreeze); true
+	// removes its record entirely (pkg/nft.SlashBurn).
+	//
+	// A real, disclosed limitation this does NOT fix: anonymous voter
+	// eligibility (VoteEligibilityProof) still cannot re-check whether
+	// the specific NFT behind a valid proof has since been slashed,
+	// since a membership proof never reveals which leaf it opens — see
+	// pkg/tx's requireEligibleVoterZK for the full, pre-existing
+	// disclosure. This only makes the slash itself real (the NFT record
+	// is genuinely frozen or burned); revoking an already-anonymous
+	// credential remains the separate, larger undertaking that doc
+	// already names (a slashed-leaf accumulator or epoch-scoped
+	// re-registration).
+	SlashTargetNFT NFTID
+	SlashBurn      bool
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

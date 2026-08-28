@@ -46,6 +46,10 @@ type Accessor interface {
 	MarkNullifierSpent(nullifier types.Hash) error
 	IsNullifierSpent(nullifier types.Hash) (bool, error)
 	PutNFT(nft types.ValidatorNFT) error
+	// DeleteNFT permanently removes nft — the real spec-10.3 "burn" slash
+	// outcome (governance.SlashBurn). See deleteNFT's own doc for why
+	// both index entries must go together.
+	DeleteNFT(nft types.ValidatorNFT) error
 	GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error)
 	// GetNFTByOwner looks up the (at most one, real "one per wallet")
 	// ValidatorNFT record for owner — the real check TxNFTMint's Stage 4
@@ -257,8 +261,26 @@ func getNFTByOwner(txn *badger.Txn, owner types.Address) (types.ValidatorNFT, bo
 	return nft, found, err
 }
 
+// deleteNFT removes nft's own record and its owner-index entry — the
+// real spec-10.3 "burn" slash outcome (governance.SlashBurn), as opposed
+// to "freeze" (ApplySlash's Slashed=true, record kept, via putNFT/PutNFT
+// above). Both index entries must go together, or a burned owner would
+// be left permanently unable to mint a new NFT (GetNFTByOwner still
+// finding a dangling id) while the id itself resolves to nothing.
+func deleteNFT(txn *badger.Txn, nft types.ValidatorNFT) error {
+	if err := txn.Delete(withPrefix(prefixNFT, nft.ID.String())); err != nil {
+		return err
+	}
+	return txn.Delete(withPrefix(prefixNFTByOwner, nft.Owner.String()))
+}
+
 func (s *Store) PutNFT(nft types.ValidatorNFT) error {
 	return s.db.Update(func(txn *badger.Txn) error { return putNFT(txn, nft) })
+}
+
+// DeleteNFT permanently removes nft — see deleteNFT's own doc.
+func (s *Store) DeleteNFT(nft types.ValidatorNFT) error {
+	return s.db.Update(func(txn *badger.Txn) error { return deleteNFT(txn, nft) })
 }
 
 func (s *Store) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
@@ -351,6 +373,17 @@ type ProposalRecord struct {
 	// MintStaked just says which one MintApplied refers to.
 	MintStaked          bool
 	StakePositionCommit types.Hash
+
+	// SlashTargetNFT/SlashBurn are a real spec-10.3 slash proposal's
+	// bound claim, taken from whichever TxVote first referenced
+	// ProposalID — see types.VotePublicInputs.SlashTargetNFT's own doc.
+	// SlashTargetNFT's zero value means this proposal requests no slash.
+	// SlashApplied mirrors MintApplied/Applied: the durable record of
+	// whether the real execution step (pkg/nft.ApplySlash, plus a real
+	// DeleteNFT for the burn outcome) already ran.
+	SlashTargetNFT types.NFTID
+	SlashBurn      bool
+	SlashApplied   bool
 
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch

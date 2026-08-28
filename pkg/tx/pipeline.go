@@ -749,6 +749,18 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 					}
 				}
 			}
+			if !pub.SlashTargetNFT.IsZero() {
+				// A slash proposal against a nonexistent (or already
+				// burned) NFT can never even be created — checked once,
+				// here, at the exact point the claim becomes durable, for
+				// the same reason every other real claim in this pipeline
+				// is checked at submission rather than deferred to tally.
+				if _, found, err := p.deps.Store.GetNFT(pub.SlashTargetNFT); err != nil {
+					return fmt.Errorf("slash target lookup: %w", err)
+				} else if !found {
+					return fmt.Errorf("slash proposal targets a nonexistent NFT %s", pub.SlashTargetNFT)
+				}
+			}
 			record = state.ProposalRecord{
 				ProposalID:  string(pub.ProposalID),
 				Epoch:       p.deps.Epoch,
@@ -765,6 +777,8 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				MintOutCommit:       pub.MintOutCommit,
 				MintStaked:          pub.MintStaked,
 				StakePositionCommit: pub.StakePositionCommit,
+				SlashTargetNFT:      pub.SlashTargetNFT,
+				SlashBurn:           pub.SlashBurn,
 			}
 		}
 		if record.Tallied {
@@ -955,11 +969,13 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 // A real, disclosed limitation of this anonymous design, replacing the
 // old check's rec.Slashed test: because a valid proof never reveals
 // which leaf it opens, this cannot tell whether that specific NFT has
-// since been slashed. Revoking an anonymous credential needs either a
+// since been slashed — even though slash execution itself is now real
+// (types.VotePublicInputs.SlashTargetNFT; TallyDueProposals calls
+// pkg/nft.ApplySlash on a pass), the slashed NFT's own record being
+// really updated doesn't help a membership proof that never names which
+// leaf it is. Revoking an anonymous credential needs either a
 // slashed-leaf accumulator or epoch-scoped re-registration, and this
-// build implements neither yet — see governance.ProposalSlashNFT's own
-// doc, which already discloses that automated slash execution itself
-// isn't wired end to end in this build.
+// build implements neither yet.
 func (p *Pipeline) requireEligibleVoterZK(proof *types.VoteEligibilityProof, proposalID types.ID) (types.Hash, error) {
 	if p.deps.EligibilityZK == nil {
 		return types.Hash{}, fmt.Errorf("no anonymous eligibility ZK system configured; cannot verify a voter eligibility proof")
@@ -1089,21 +1105,28 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 // persisted but never changed anything live); Deps.Governance == nil
 // skips this step entirely (existing tests that don't wire it up keep
 // working unchanged). A passed proposal bound to a real MintAmount (spec
-// 17.4's "direct with 10 percent fee" proposer path — see
-// types.VotePublicInputs.MintAmount's own doc) really does mint SFG now:
-// MintOutCommit — already proof-verified once, at Stage 4, when the
-// first vote bound it — is inserted into the same canonical tree a
-// Transfer's own outputs live in, becoming a real, spendable note, and
-// the Vault collects its real fee share (types.MintFeeAmount). The
-// spec's alternative "staked 2 percent yield path" is a real, disclosed
-// scope cut: this build has no staking subsystem at all, so only the
-// direct path is implemented — a mint proposal requests it or is not a
-// mint proposal. Deps.ZKTree == nil (never true on a real node) skips
-// this step the same way Deps.Governance == nil skips ParamKey
-// application. Slashing/unlock-transfer/container-asset proposal kinds
-// are tallied like any other but have no execution wired here either —
-// see governance.ProposalKind's own doc for the remaining kinds this
-// build does not yet apply.
+// 17.4 — see types.VotePublicInputs.MintAmount's own doc) really does
+// mint SFG now, on whichever of the two real proposer paths it
+// requested: the direct path inserts MintOutCommit — already
+// proof-verified once, at Stage 4, when the first vote bound it — into
+// the same canonical tree a Transfer's own outputs live in, becoming a
+// real, spendable note, and the Vault collects its real fee share
+// (types.MintFeeAmount); the staked path (pkg/staking's own doc has the
+// real yield formula) instead inserts StakePositionCommit into the
+// separate, real canonical stake tree, with no Vault fee taken (a real,
+// deliberate asymmetry between the two paths, not an oversight) — a
+// later Kind Unstake transaction is what actually pays it out. Deps.
+// ZKTree/StakeTree == nil (never true on a real node) skips the
+// relevant step the same way Deps.Governance == nil skips ParamKey
+// application. A passed proposal bound to a real SlashTargetNFT (spec
+// 10.3 — see types.VotePublicInputs.SlashTargetNFT's own doc) really
+// does slash the target NFT now: pkg/nft.ApplySlash freezes it
+// (Slashed=true, record kept) or, for the burn outcome, the record is
+// permanently removed (Store.DeleteNFT) — the target's real existence
+// was already checked once, at Stage 4. unlock-transfer/container-asset
+// proposal kinds are tallied like any other but have no execution wired
+// here either — see governance.ProposalKind's own doc for the
+// remaining kinds this build does not yet apply.
 //
 // This runs deterministically off already-committed proposal state plus
 // the caller's own block Epoch, so every honest node reaches the same
@@ -1196,6 +1219,36 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 					}
 					if p.deps.Vault != nil {
 						p.deps.Vault.CollectFee(decimal.FromInt(int64(types.MintFeeAmount(record.MintAmount))))
+					}
+				}
+			}
+		}
+
+		if record.Passed && !record.SlashTargetNFT.IsZero() {
+			// Real spec-10.3 slash execution: the target's real existence
+			// was already checked once, at Stage 4, the moment this
+			// proposal's first vote bound it (see that case's own doc) —
+			// this only makes a governance-authorized slash real. A
+			// target that no longer exists by tally time (e.g. a second,
+			// independent slash proposal against the same NFT that
+			// happened to pass and tally first) leaves SlashApplied
+			// false, the same durable "never actually executed" signal
+			// MintApplied gives for the mint paths above, rather than a
+			// hard tally failure — one proposal's outcome must never
+			// block tallying every other due proposal in the same call.
+			if nftRec, found, err := p.deps.Store.GetNFT(record.SlashTargetNFT); err == nil && found {
+				action := nft.SlashFreeze
+				if record.SlashBurn {
+					action = nft.SlashBurn
+				}
+				nft.ApplySlash(&nftRec, action)
+				if record.SlashBurn {
+					if err := p.deps.Store.DeleteNFT(nftRec); err == nil {
+						record.SlashApplied = true
+					}
+				} else {
+					if err := p.deps.Store.PutNFT(nftRec); err == nil {
+						record.SlashApplied = true
 					}
 				}
 			}

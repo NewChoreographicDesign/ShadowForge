@@ -56,6 +56,8 @@ func main() {
 		err = runProposeMint(args)
 	case "unstake":
 		err = runUnstake(args)
+	case "propose-slash":
+		err = runProposeSlash(args)
 	case "mint":
 		err = runMint(args)
 	case "nft-trait":
@@ -130,12 +132,25 @@ zk-setup' below, but a separate circuit and file):
   wallet bank-deposit    -keystore <file> -bootstrap <addr> -query <url> -asset SFG
   wallet bank-withdraw   -keystore <file> -bootstrap <addr> -query <url> -asset SFG
 
-'vote'/'vote-reveal'/'propose-mint' sign the transaction itself with a
-fresh, throwaway key — never the keystore identity that minted the NFT —
-and prove eligibility instead via a real anonymous ZK proof built by
-syncing that keystore's minted NFT from the live network (pkg/govwallet).
-An observer of the resulting transaction learns only that some real,
-minted NFT voted, never which one.
+'vote'/'vote-reveal'/'propose-mint'/'propose-slash' sign the transaction
+itself with a fresh, throwaway key — never the keystore identity that
+minted the NFT — and prove eligibility instead via a real anonymous ZK
+proof built by syncing that keystore's minted NFT from the live network
+(pkg/govwallet). An observer of the resulting transaction learns only
+that some real, minted NFT voted, never which one.
+
+Real spec-10.3 slash proposal — submitting one both casts its own first
+ballot and binds a real request to freeze or burn a specific,
+already-minted NFT; other holders approve/reject it with ordinary
+vote/vote-reveal against the same -proposal id:
+  wallet propose-slash -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -target <hex> -eligibility-zk-params <file>
+Add -burn to permanently remove the target's record instead of the
+default freeze (Slashed=true, record kept). Once tallied, check 'wallet
+proposal -id <id>' for real Passed/SlashApplied status. A real,
+disclosed limitation this does not fix: anonymous voter eligibility
+still cannot re-check whether the NFT behind a valid vote has since
+been slashed, since a membership proof never reveals which leaf it
+opens — see types.VotePublicInputs.SlashTargetNFT's own doc.
 
 Real spec-17.4 epoch mint — both proposer paths spec 13.1/17.4 name are
 implemented: submitting a proposal both casts its own first ballot and

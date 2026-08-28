@@ -301,6 +301,41 @@ func (b *Builder) Unstake(position zk.StakeSecret, merkleProof zk.Proof, merkleR
 	return finalized, out, nil
 }
 
+// ProposeSlash casts a real sealed ballot for proposalID exactly like
+// Vote does, and binds it to a real spec-10.3 slash request against
+// target (see types.VotePublicInputs.SlashTargetNFT's own doc). Unlike
+// ProposeMint/ProposeMintStaked, this needs no Groth16 proof of its
+// own: pkg/tx's Stage 4 checks target really exists at the moment this
+// binds, and the actual slash — freeze (burn == false) or a real record
+// deletion (burn == true) — runs once, at tally, if the proposal
+// passes. Like ParamKey/NewValue, the claim only matters on the first
+// Vote/ProposeSlash call to ever reference proposalID; the pipeline
+// verifies it once, right there, and ignores a later caller's own
+// claim.
+func (b *Builder) ProposeSlash(proposalID types.ID, approve bool, target types.NFTID, burn bool, eligibility types.VoteEligibilityProof) (types.ShieldedTx, error) {
+	if proposalID == "" {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: proposal id must not be empty")
+	}
+	if target.IsZero() {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: slash target must not be empty")
+	}
+	nonce := voteNonce(proposalID, eligibility.Nullifier)
+	commitment := types.ComputeVoteCommitment(eligibility.Nullifier, approve, nonce)
+
+	t := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID:     proposalID,
+			Commitment:     commitment,
+			SlashTargetNFT: target,
+			SlashBurn:      burn,
+		},
+		VoteEligibility: &eligibility,
+		Nullifier:       types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("slash-commit")),
+	}
+	return b.finalize(t)
+}
+
 // VoteReveal opens the sealed ballot Vote(proposalID, approve, ...)
 // earlier committed, by recomputing the same deterministic nonce and
 // handing back the (approve, nonce) pair the pipeline checks against the

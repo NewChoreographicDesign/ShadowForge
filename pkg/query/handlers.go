@@ -204,6 +204,20 @@ type proposalResponse struct {
 	// depends on this field to rebuild its local stake-tree mirror.
 	MintStaked          bool   `json:"mint_staked,omitempty"`
 	StakePositionCommit string `json:"stake_position_commit,omitempty"`
+	// SlashTargetNFT/SlashBurn/SlashApplied are a real spec-10.3 slash
+	// proposal's bound claim and execution status — see types.
+	// VotePublicInputs.SlashTargetNFT's own doc. SlashTargetNFT is safe
+	// to expose here for the identical reason MintOutCommit already is.
+	SlashTargetNFT string `json:"slash_target_nft,omitempty"`
+	SlashBurn      bool   `json:"slash_burn,omitempty"`
+	SlashApplied   bool   `json:"slash_applied,omitempty"`
+}
+
+func slashTargetJSON(p state.ProposalRecord) string {
+	if p.SlashTargetNFT.IsZero() {
+		return ""
+	}
+	return p.SlashTargetNFT.String()
 }
 
 func mintOutCommitJSON(p state.ProposalRecord) string {
@@ -251,6 +265,9 @@ func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
 		MintApplied:         p.MintApplied,
 		MintStaked:          p.MintStaked,
 		StakePositionCommit: stakePositionCommitJSON(p),
+		SlashTargetNFT:      slashTargetJSON(p),
+		SlashBurn:           p.SlashBurn,
+		SlashApplied:        p.SlashApplied,
 	})
 }
 
@@ -278,6 +295,9 @@ func (s *Server) handleProposals(w http.ResponseWriter, r *http.Request) {
 			MintApplied:         p.MintApplied,
 			MintStaked:          p.MintStaked,
 			StakePositionCommit: stakePositionCommitJSON(p),
+			SlashTargetNFT:      slashTargetJSON(p),
+			SlashBurn:           p.SlashBurn,
+			SlashApplied:        p.SlashApplied,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
