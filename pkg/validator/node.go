@@ -16,7 +16,18 @@
 // receives a BlockAnnounce for a batch it did not itself vote on replays
 // the batch through the exact same pipeline and refuses to adopt the
 // block if its own recomputed state root disagrees with what was
-// announced.
+// announced. A node that falls more than one block behind — the announced
+// height is past its own NextHeight() — triggers real multi-block catch-up
+// instead of silently dropping the announce: a real, unicast
+// request/response wire exchange (shadownet.MsgBlockRequest/
+// MsgBlockResponse — a request/response addition alongside
+// MsgBlockProposal's own broadcast one, necessary for the identical
+// reason: spec 6's message list is push/broadcast-only) fetches whatever
+// blocks it's missing from the peer that sent the announce, capped at
+// shadownet.MaxCatchUpBlocks per round trip, and every block that comes
+// back is independently re-verified and replayed through the exact same
+// tryAdoptBlockLocked path a single announced block gets — nothing is
+// ever adopted just because it arrived as a "response."
 //
 // Sentinel activation (spec 5.5) and outage/megabatch recovery (spec 5.6)
 // are wired in for real too, not just unit-tested in pkg/consensus in
@@ -33,15 +44,13 @@
 // budget that protects every ordinary batch) until a clean dual-track
 // cycle reaches real BFT quorum and OutageFlag clears.
 //
-// What is intentionally out of scope, documented rather than silently
-// skipped: multi-block catch-up sync for a node that falls more than one
-// block behind (see handleBlockAnnounce), and MegabatchPart's chunked
-// wire-format reassembly for a recovery batch too large to fit even a
-// single MaxBatchBytes-bounded proposal (see pkg/net/message.go's doc) —
-// a real megabatch fits the existing single-proposal pipeline for any
-// backlog depth this build's own MaxBatchBytes budget can absorb per
-// round; splitting one across multiple wire messages is a separate,
-// larger undertaking.
+// What is intentionally still out of scope, documented rather than
+// silently skipped: MegabatchPart's chunked wire-format reassembly for a
+// recovery batch too large to fit even a single MaxBatchBytes-bounded
+// proposal (see pkg/net/message.go's doc) — a real megabatch fits the
+// existing single-proposal pipeline for any backlog depth this build's
+// own MaxBatchBytes budget can absorb per round; splitting one across
+// multiple wire messages is a separate, larger undertaking.
 package validator
 
 import (

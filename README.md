@@ -422,11 +422,41 @@ controller every tick (`evaluateOutage`), and a validator that detects an
 outage builds a real dual-track proposal (`buildProposalBatch`'s
 `dualTrack` path, `OutageController.BuildMegabatch`) until a clean cycle
 reaches real BFT quorum. Still intentionally out of scope, per
-`pkg/validator/node.go`'s own doc: multi-block catch-up sync for a node
-that falls more than one block behind (`handleBlockAnnounce` only
-replay-adopts one block at a time), and `MegabatchPart`'s chunked
-wire-format reassembly for a recovery batch too large for a single
+`pkg/validator/node.go`'s own doc: `MegabatchPart`'s chunked wire-format
+reassembly for a recovery batch too large for a single
 `MaxBatchBytes`-bounded proposal.
+
+**Real multi-block catch-up sync — closing a gap `pkg/validator/node.go`'s
+own doc had disclosed as "intentionally out of scope."** A node that fell
+more than one block behind used to have no way back onto the chain:
+`handleBlockAnnounce` only ever replay-adopted the single block it was
+just told about, so a node that missed even one commit while offline (a
+brief disconnect, a late join) was stuck forever, silently rejecting
+every future announce as premature. Two message types spec 6 doesn't
+spell out but a real catch-up protocol needs — `MsgBlockRequest`/
+`MsgBlockResponse` (`pkg/net`) — close it: on an announce more than one
+height ahead of its own `NextHeight()`, a node now sends a real,
+peer-targeted `BlockRequestPayload` (`net.Node.Send`, not a broadcast) to
+whoever sent the announce, asking for every block it's missing up to
+that height; the responder answers with whatever real, already-committed
+blocks it actually has in range, capped at `MaxCatchUpBlocks` (200) as
+defense-in-depth against an unbounded response. The requester never
+trusts what comes back — `handleBlockResponse` sorts the blocks by
+height and independently re-verifies and replays each one through the
+identical `tryAdoptBlockLocked` path a single announce gets (real
+signature checks, real committee-membership checks, real
+`pkg/chain.Append` height/`PrevHash` validation), stopping at the first
+gap or failed block rather than adopting a partial or malformed
+response. A request for more than `MaxCatchUpBlocks` blocks behind is
+handled incrementally: the node simply issues another request once it's
+processed the first response, rather than requiring a single unbounded
+transfer. `pkg/validator/catchup_test.go`'s
+`TestNodeCatchesUpAcrossMultipleBlocks` proves this over real libp2p
+connections — two live, quorum-capable validators commit several blocks
+together before a third, passive node ever connects, and that node's
+chain head converges with theirs purely through real wire
+`BlockAnnounce`/`BlockRequest`/`BlockResponse` traffic, never a direct
+call into another node's internals.
 
 Cross-process BFT finality (spec 5.7) is fully wired and network-tested:
 `pkg/validator` runs a real propose/vote/commit state machine — genuine

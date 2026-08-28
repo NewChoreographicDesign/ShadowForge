@@ -24,6 +24,16 @@ const (
 	MsgMegabatchPart MessageType = "MegabatchPart"
 	MsgContainerSync MessageType = "ContainerSync"
 	MsgSilentPad     MessageType = "SilentPad"
+	// MsgBlockRequest/MsgBlockResponse are a second necessary addition
+	// spec 6's message list doesn't spell out, for the identical reason
+	// MsgBlockProposal is: real multi-block catch-up (a node that falls
+	// more than one block behind its peers) needs a way to ask a
+	// specific peer for the blocks it's missing and receive them back,
+	// which a purely broadcast/push protocol (every other message type
+	// here) cannot do on its own. See pkg/validator's own doc for why
+	// this was previously out of scope and what closing it now covers.
+	MsgBlockRequest  MessageType = "BlockRequest"
+	MsgBlockResponse MessageType = "BlockResponse"
 )
 
 // Envelope is the wire format for every message this protocol sends: a
@@ -119,4 +129,37 @@ type ContainerSyncPayload struct {
 // burst load (spec 15.4).
 type SilentPadPayload struct {
 	Nonce []byte `json:"nonce"`
+}
+
+// MaxCatchUpBlocks bounds how many blocks a single BlockRequest may ask
+// for (and a single BlockResponse may return) — real defense-in-depth
+// against a request for an unbounded range turning into an unbounded
+// response, mirroring MaxEnvelopeSize/MaxBatchBytes's identical role
+// elsewhere in this codebase. A node needing to catch up by more than
+// this many blocks simply issues another request once it has processed
+// the first response's blocks — real, incremental catch-up, not a
+// single unbounded transfer.
+const MaxCatchUpBlocks = 200
+
+// BlockRequestPayload asks the receiving peer for every block it has
+// stored with FromHeight <= height <= ToHeight (inclusive), sent to one
+// specific peer (net.Node.Send), not broadcast — see MsgBlockRequest's
+// own doc for why this, unlike every other message in this protocol,
+// needs a request/response shape rather than push/broadcast.
+type BlockRequestPayload struct {
+	FromHeight uint64 `json:"from_height"`
+	ToHeight   uint64 `json:"to_height"`
+}
+
+// BlockResponsePayload answers a BlockRequestPayload with every real,
+// already-committed block the responder actually has in the requested
+// range, in ascending height order, capped at MaxCatchUpBlocks — it may
+// be shorter than requested (the responder's own head is behind
+// ToHeight, or it simply doesn't have every block in range), never
+// fabricated to fill a gap: the requester independently re-verifies
+// every block it receives (the same real replay-and-check path a
+// BlockAnnounce gets) before ever adopting it, exactly like this
+// protocol already does for a single announced block.
+type BlockResponsePayload struct {
+	Blocks []types.Block `json:"blocks"`
 }

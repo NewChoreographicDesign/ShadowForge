@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
@@ -875,7 +877,7 @@ func TestHandleBlockAnnounceAdoptsIndependentlyVerifiedBlock(t *testing.T) {
 	block := r.block
 	block.Votes = votes
 
-	adopter.handleBlockAnnounce(shadownet.BlockAnnouncePayload{Block: block})
+	adopter.handleBlockAnnounce(peer.ID(""), shadownet.BlockAnnouncePayload{Block: block})
 
 	if adopter.chn.HeadHeight() != height {
 		t.Fatalf("expected adopter to adopt the announced block, head still at %d", adopter.chn.HeadHeight())

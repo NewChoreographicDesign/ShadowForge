@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -99,7 +101,23 @@ func (n *Node) handleMessage(p peer.ID, env shadownet.Envelope) {
 			n.log("validator: bad block announce from %s: %v", p, err)
 			return
 		}
-		n.handleBlockAnnounce(ann)
+		n.handleBlockAnnounce(p, ann)
+
+	case shadownet.MsgBlockRequest:
+		var req shadownet.BlockRequestPayload
+		if err := decode(env, &req); err != nil {
+			n.log("validator: bad block request from %s: %v", p, err)
+			return
+		}
+		n.handleBlockRequest(p, req)
+
+	case shadownet.MsgBlockResponse:
+		var resp shadownet.BlockResponsePayload
+		if err := decode(env, &resp); err != nil {
+			n.log("validator: bad block response from %s: %v", p, err)
+			return
+		}
+		n.handleBlockResponse(resp)
 
 	default:
 		// MegabatchPart, ContainerSync, SilentPad: accepted on the wire
@@ -607,20 +625,27 @@ func (n *Node) tryFinalizeLocked(r *round) {
 
 // handleBlockAnnounce lets a node that did not itself reach quorum locally
 // (it wasn't on the committee, or its votes arrived too late) adopt a
-// finalized block by independently replaying it: the batch is run through
-// the exact same pipeline this node would have used to vote, and the block
-// is only adopted if the freshly recomputed state root agrees with what was
-// announced and chain.Append's own quorum/signature reverification passes.
-// Multi-block catch-up (this node more than one block behind) is out of
-// scope, per the package doc.
-func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
+// finalized block by independently replaying it, or — if this node has
+// fallen more than one block behind — first triggers real multi-block
+// catch-up (requestCatchUp) against whoever sent the announce, previously
+// out of scope per this package's own doc.
+func (n *Node) handleBlockAnnounce(sender peer.ID, ann shadownet.BlockAnnouncePayload) {
 	height := ann.Block.Height
-	if height <= n.chn.HeadHeight() || height != n.chn.NextHeight() {
-		return // stale, or too far ahead for this build's single-block adoption
+	if height <= n.chn.HeadHeight() {
+		return // stale
 	}
-
-	online := n.onlineSet(time.Now())
-	committee := consensus.AssignCommittee(online, height, committeeSize(len(online)))
+	if height > n.chn.NextHeight() {
+		// More than one block behind: this node cannot verify ann.Block
+		// yet (chain.Append requires the immediately preceding block to
+		// already be canonical), so request everything it's missing,
+		// this announced block included, from the peer that sent it.
+		// The eventual BlockResponse (handleBlockResponse) replays and
+		// adopts each real block in order via the exact same tryAdoptBlockLocked
+		// this function itself uses below — no separate re-adoption of
+		// ann.Block is needed once that catches this node up.
+		n.requestCatchUp(sender, n.chn.NextHeight(), height)
+		return
+	}
 
 	n.roundMu.Lock()
 	defer n.roundMu.Unlock()
@@ -634,10 +659,32 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	if height <= n.chn.HeadHeight() {
 		return
 	}
+	if err := n.tryAdoptBlockLocked(ann.Block); err != nil {
+		n.log("validator: rejecting announced block at height %d: %v", height, err)
+		return
+	}
+	n.log("validator: adopted announced height %d state_root=%s", height, ann.Block.StateRoot)
+}
+
+// tryAdoptBlockLocked independently replays and, if the freshly
+// recomputed state root agrees with b's own and chain.Append's own
+// quorum/signature reverification passes, adopts b — the real
+// verification core both handleBlockAnnounce's single-block path and
+// handleBlockResponse's multi-block catch-up path share. Callers must
+// already hold roundMu, and b.Height must equal n.chn.NextHeight().
+func (n *Node) tryAdoptBlockLocked(b types.Block) error {
+	height := b.Height
+	if height != n.chn.NextHeight() {
+		return fmt.Errorf("block at height %d is not the expected next height %d", height, n.chn.NextHeight())
+	}
+
+	online := n.onlineSet(time.Now())
+	committee := consensus.AssignCommittee(online, height, committeeSize(len(online)))
 
 	if r, hadRound := n.rounds[height]; hadRound {
 		// Whatever this node was tentatively tracking for this height is
-		// superseded by the announced block; discard it before replaying.
+		// superseded by the real block being adopted; discard it before
+		// replaying.
 		delete(n.rounds, height)
 		r.rollback()
 		n.tree.TruncateTo(r.treeSnapshotLen)
@@ -646,58 +693,146 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	treeSnapshot := n.tree.Len()
 	txn := n.store.BeginTxn()
 
-	entries := make([]tx.Entry, len(ann.Block.Batch))
+	entries := make([]tx.Entry, len(b.Batch))
 	now := time.Now()
-	for i, t := range ann.Block.Batch {
+	for i, t := range b.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(ann.Block.Epoch), Height: ann.Block.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, MintZK: n.mintZK, StakeZK: n.stakeZK, UnstakeZK: n.unstakeZK, StakeTree: n.stakeTree, StakeRoots: n.stakeRoots, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(b.Epoch), Height: b.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, MintZK: n.mintZK, StakeZK: n.stakeZK, UnstakeZK: n.unstakeZK, StakeTree: n.stakeTree, StakeRoots: n.stakeRoots, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 	for _, res := range results {
 		if res.Error != nil {
-			n.log("validator: rejecting announced block at height %d: tx %s failed replay: %v", height, res.Tx.TxID, res.Error)
 			txn.Discard()
 			n.tree.TruncateTo(treeSnapshot)
-			return
+			return fmt.Errorf("tx %s failed replay: %w", res.Tx.TxID, res.Error)
 		}
 	}
 
 	// Same deterministic epoch tally as handleBlockProposal, replayed here
-	// too — otherwise a node that only ever adopts blocks via announce
-	// would silently disagree with the rest of the network about which
-	// proposals have already been tallied.
-	if _, err := pipeline.TallyDueProposals(types.EpochNumber(ann.Block.Epoch)); err != nil {
-		n.log("validator: rejecting announced block at height %d: epoch tally failed: %v", height, err)
+	// too — otherwise a node that only ever adopts blocks via announce or
+	// catch-up would silently disagree with the rest of the network about
+	// which proposals have already been tallied.
+	if _, err := pipeline.TallyDueProposals(types.EpochNumber(b.Epoch)); err != nil {
 		txn.Discard()
 		n.tree.TruncateTo(treeSnapshot)
-		return
+		return fmt.Errorf("epoch tally failed: %w", err)
 	}
 
 	stateRoot := n.tree.Root()
-	if stateRoot != ann.Block.StateRoot {
-		n.log("validator: rejecting announced block at height %d: recomputed state root %s disagrees with announced %s", height, stateRoot, ann.Block.StateRoot)
+	if stateRoot != b.StateRoot {
 		txn.Discard()
 		n.tree.TruncateTo(treeSnapshot)
-		return
+		return fmt.Errorf("recomputed state root %s disagrees with announced %s", stateRoot, b.StateRoot)
 	}
 
-	if err := n.chn.Append(ann.Block, committee, n.pubKeyLookup); err != nil {
-		n.log("validator: rejecting announced block at height %d: chain.Append: %v", height, err)
+	if err := n.chn.Append(b, committee, n.pubKeyLookup); err != nil {
 		txn.Discard()
 		n.tree.TruncateTo(treeSnapshot)
-		return
+		return fmt.Errorf("chain.Append: %w", err)
 	}
 	if err := txn.Commit(); err != nil {
-		n.log("validator: FATAL-ish: adopted announced height %d but the state txn failed to commit: %v", height, err)
+		return fmt.Errorf("FATAL-ish: adopted height %d but the state txn failed to commit: %w", height, err)
+	}
+	// b.Batch is now durably committed regardless of whether this node
+	// ever locally drained it — see pruneCommittedFromLocalQueues' own
+	// doc.
+	n.pruneCommittedFromLocalQueues(b.Batch)
+	n.noteCommittedBlock(b)
+	return nil
+}
+
+// requestCatchUp asks sender (net.Node.Send, unicast — not a broadcast,
+// since only the peer that just proved it has a block this node lacks is
+// asked) for every real, already-committed block in [from, to], capped
+// at shadownet.MaxCatchUpBlocks. handleBlockResponse independently
+// re-verifies and replays whatever comes back — this call only ever
+// asks; it never trusts.
+func (n *Node) requestCatchUp(sender peer.ID, from, to uint64) {
+	if to < from {
 		return
 	}
-	// ann.Block.Batch is now durably committed regardless of whether this
-	// node ever locally drained it — see pruneCommittedFromLocalQueues'
-	// own doc.
-	n.pruneCommittedFromLocalQueues(ann.Block.Batch)
+	if to-from+1 > shadownet.MaxCatchUpBlocks {
+		to = from + shadownet.MaxCatchUpBlocks - 1
+	}
+	env, err := shadownet.NewEnvelope(shadownet.MsgBlockRequest, shadownet.BlockRequestPayload{FromHeight: from, ToHeight: to})
+	if err != nil {
+		n.log("validator: build block request: %v", err)
+		return
+	}
+	if err := n.net.Send(context.Background(), sender, env); err != nil {
+		n.log("validator: send block request to %s: %v", sender, err)
+	}
+}
 
-	n.log("validator: adopted announced height %d state_root=%s", height, ann.Block.StateRoot)
-	n.noteCommittedBlock(ann.Block)
+// handleBlockRequest answers a peer's real catch-up request with every
+// real block this node actually has stored in the requested range (still
+// capped at shadownet.MaxCatchUpBlocks even if the requester's own claim
+// was larger) — never fabricated to fill a gap this node doesn't
+// actually have; it stops at the first missing height, which is either
+// this node's own head or a real hole neither side can do anything
+// about right now.
+func (n *Node) handleBlockRequest(sender peer.ID, req shadownet.BlockRequestPayload) {
+	if req.ToHeight < req.FromHeight {
+		return
+	}
+	to := req.ToHeight
+	if to-req.FromHeight+1 > shadownet.MaxCatchUpBlocks {
+		to = req.FromHeight + shadownet.MaxCatchUpBlocks - 1
+	}
+	var blocks []types.Block
+	for h := req.FromHeight; h <= to; h++ {
+		b, found, err := n.store.GetBlock(h)
+		if err != nil {
+			n.log("validator: get block %d for catch-up response to %s: %v", h, sender, err)
+			break
+		}
+		if !found {
+			break
+		}
+		blocks = append(blocks, b)
+	}
+	if len(blocks) == 0 {
+		return
+	}
+	env, err := shadownet.NewEnvelope(shadownet.MsgBlockResponse, shadownet.BlockResponsePayload{Blocks: blocks})
+	if err != nil {
+		n.log("validator: build block response: %v", err)
+		return
+	}
+	if err := n.net.Send(context.Background(), sender, env); err != nil {
+		n.log("validator: send block response to %s: %v", sender, err)
+	}
+}
+
+// handleBlockResponse replays every block a real catch-up response
+// carries, in ascending height order, through the identical
+// independent-reverification path (tryAdoptBlockLocked) a single
+// BlockAnnounce gets — nothing here is trusted just because it arrived
+// as a response to this node's own request. Stops at the first height
+// that isn't exactly this node's own next height (a gap, an
+// out-of-order/duplicate response, or a failed replay), leaving the
+// remainder for a later announce or request rather than skipping ahead
+// unsafely.
+func (n *Node) handleBlockResponse(resp shadownet.BlockResponsePayload) {
+	blocks := append([]types.Block(nil), resp.Blocks...)
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Height < blocks[j].Height })
+
+	n.roundMu.Lock()
+	defer n.roundMu.Unlock()
+
+	for _, b := range blocks {
+		if b.Height <= n.chn.HeadHeight() {
+			continue // already have it
+		}
+		if b.Height != n.chn.NextHeight() {
+			break // a gap, or out of order; stop rather than skip ahead
+		}
+		if err := n.tryAdoptBlockLocked(b); err != nil {
+			n.log("validator: catch-up replay failed at height %d: %v", b.Height, err)
+			break
+		}
+		n.log("validator: caught up to height %d via block response", b.Height)
+	}
 }
 
 // noteCommittedBlock updates outage-recovery bookkeeping for a block this
