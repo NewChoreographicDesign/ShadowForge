@@ -5,6 +5,15 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
 
+// MinTurnout is the spec's real quorum floor ("governance turnout above
+// 20% of eligible NFTs" — docs/SPEC_SOURCE.md). A fixed protocol
+// constant, not a
+// governance.Params field a passed proposal could adjust — turnout
+// itself gating whether a proposal passes must not be something a
+// low-turnout proposal could first vote down to make every later
+// proposal easier to pass.
+var MinTurnout = decimal.MustFromString("0.20")
+
 // ProposalKind enumerates what a governance vote can do. Slashing requires
 // a vote (spec 10.3: "Slash execution is a governance vote that burns or
 // freezes the NFT. Automatic silent burns are not in spec").

@@ -44,6 +44,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 
 	nodes := make([]*validator.Node, n)
 	hosts := make([]host.Host, n)
+	stores := make([]*state.Store, n)
 	for i := 0; i < n; i++ {
 		h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
 		if err != nil {
@@ -53,6 +54,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 		hosts[i] = h
 
 		store := openIntegrationStore(t, i)
+		stores[i] = store
 		tree := state.NewMerkleTree()
 		chn, err := chain.Open(store, genesisMs)
 		if err != nil {
@@ -69,7 +71,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 		logf := func(format string, args ...interface{}) {
 			t.Logf("node%d: "+format, append([]interface{}{idx}, args...)...)
 		}
-		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, mempool, pk, sk, false, logf)
+		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, mempool, pk, sk, false, logf)
 	}
 
 	// Full mesh: every node dials every other node, so Broadcast (which
@@ -129,7 +131,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 	}
 	connectCancel()
 
-	voteTx := mustSignIntegrationVote(t, "integration-proposal")
+	voteTx := mustSignIntegrationVote(t, stores, "integration-proposal")
 	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: voteTx})
 	if err != nil {
 		t.Fatalf("build tx offer: %v", err)
@@ -183,11 +185,25 @@ func openIntegrationStore(t *testing.T, idx int) *state.Store {
 	return s
 }
 
-func mustSignIntegrationVote(t *testing.T, proposalID string) types.ShieldedTx {
+// mustSignIntegrationVote builds a real, signed TxVote and seeds a real
+// ValidatorNFT for its fresh signer key into every node's store, in
+// lockstep — real voter eligibility (pkg/tx's requireEligibleVoter) is
+// unconditional and each of the 4 nodes here independently re-verifies
+// this transaction against its own store, so every one needs the
+// identical real NFT record, not just whichever node happens to receive
+// the tx first.
+func mustSignIntegrationVote(t *testing.T, stores []*state.Store, proposalID string) types.ShieldedTx {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
+	}
+	owner := types.AddressFromPubkey(pk)
+	nftRec := types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}
+	for i, s := range stores {
+		if err := s.PutNFT(nftRec); err != nil {
+			t.Fatalf("seed voter nft on node %d: %v", i, err)
+		}
 	}
 	in := types.ShieldedTx{
 		Kind: types.TxVote,

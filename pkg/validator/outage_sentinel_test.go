@@ -148,7 +148,7 @@ func TestTxOfferRoutesToBacklogDuringOutage(t *testing.T) {
 	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
 	n.outage.Declare()
 
-	voteTx := mustSignVote(t, "outage-proposal", 1)
+	voteTx := mustSignVote(t, n, "outage-proposal", 1)
 	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: voteTx})
 	if err != nil {
 		t.Fatalf("build envelope: %v", err)
@@ -166,7 +166,7 @@ func TestTxOfferRoutesToBacklogDuringOutage(t *testing.T) {
 func TestTxOfferAdmitsToMempoolWhenNoOutage(t *testing.T) {
 	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
 
-	voteTx := mustSignVote(t, "normal-proposal", 1)
+	voteTx := mustSignVote(t, n, "normal-proposal", 1)
 	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: voteTx})
 	if err != nil {
 		t.Fatalf("build envelope: %v", err)
@@ -185,9 +185,9 @@ func TestTxOfferAdmitsToMempoolWhenNoOutage(t *testing.T) {
 // TxVote padded with a Memo so its JSON-marshaled size is deterministic
 // and controllable — the same technique pkg/tx/mempool_test.go uses to
 // test DrainBatchBytes' real size-based behavior.
-func sizedVoteTx(t *testing.T, proposalID string, commitment byte, paddingLen int) types.ShieldedTx {
+func sizedVoteTx(t *testing.T, n *Node, proposalID string, commitment byte, paddingLen int) types.ShieldedTx {
 	t.Helper()
-	tx := mustSignVote(t, proposalID, commitment)
+	tx := mustSignVote(t, n, proposalID, commitment)
 	tx.Memo = make([]byte, paddingLen)
 	return tx
 }
@@ -196,7 +196,7 @@ func TestBuildProposalBatchDualTrackCombinesWithinByteBudget(t *testing.T) {
 	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
 	n.cfg.MaxBatchSize = 100
 
-	live := sizedVoteTx(t, "live-1", 1, 50)
+	live := sizedVoteTx(t, n, "live-1", 1, 50)
 	if err := n.mempool.Submit(live, time.Now()); err != nil {
 		t.Fatalf("submit live tx: %v", err)
 	}
@@ -215,9 +215,9 @@ func TestBuildProposalBatchDualTrackCombinesWithinByteBudget(t *testing.T) {
 
 	now := time.Now()
 	backlogTxs := []types.ShieldedTx{
-		sizedVoteTx(t, "backlog-1", 2, 50),
-		sizedVoteTx(t, "backlog-2", 3, 50),
-		sizedVoteTx(t, "backlog-3", 4, 50), // should overflow the budget and get re-enqueued
+		sizedVoteTx(t, n, "backlog-1", 2, 50),
+		sizedVoteTx(t, n, "backlog-2", 3, 50),
+		sizedVoteTx(t, n, "backlog-3", 4, 50), // should overflow the budget and get re-enqueued
 	}
 	for _, bt := range backlogTxs {
 		if err := n.outage.Enqueue(bt, now); err != nil {
@@ -343,7 +343,7 @@ func TestOutageEndToEndDualTrackRoundClearsOnQuorum(t *testing.T) {
 
 	// A real TxOffer arrives while the outage is active: it must be
 	// backlogged, not live-admitted.
-	backlogged := mustSignVote(t, "backlog-proposal", 9)
+	backlogged := mustSignVote(t, n, "backlog-proposal", 9)
 	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: backlogged})
 	if err != nil {
 		t.Fatalf("build envelope: %v", err)

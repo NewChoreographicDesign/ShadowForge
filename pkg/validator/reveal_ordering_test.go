@@ -139,7 +139,7 @@ func TestFilterReadyRevealsAllowsRevealWhoseCommitIsDurablyCommitted(t *testing.
 
 func TestFilterReadyRevealsUnrelatedTxsAlwaysReady(t *testing.T) {
 	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
-	other := mustSignVote(t, "unrelated", 1) // an ordinary TxVote commit, nothing to defer
+	other := mustSignVote(t, n, "unrelated", 1) // an ordinary TxVote commit, nothing to defer
 	ready, deferred := n.filterReadyReveals([]types.ShieldedTx{other})
 	if len(deferred) != 0 || len(ready) != 1 {
 		t.Fatalf("expected the unrelated tx to pass through as ready, got ready=%+v deferred=%+v", ready, deferred)
@@ -160,7 +160,7 @@ func TestBuildProposalBatchDefersNotYetReadyRevealAndReinserts(t *testing.T) {
 	if err := n.mempool.Submit(stranded, time.Now()); err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	normal := mustSignVote(t, "normal-proposal", 5)
+	normal := mustSignVote(t, n, "normal-proposal", 5)
 	if err := n.mempool.Submit(normal, time.Now()); err != nil {
 		t.Fatalf("submit: %v", err)
 	}

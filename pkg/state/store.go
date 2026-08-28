@@ -28,6 +28,7 @@ var (
 	prefixCommitment = []byte("commit:")
 	prefixNullifier  = []byte("null:")
 	prefixNFT        = []byte("nft:")
+	prefixNFTByOwner = []byte("nft_owner:")
 	prefixHold       = []byte("hold:")
 	prefixProposal   = []byte("prop:")
 	prefixContainer  = []byte("container:")
@@ -46,6 +47,12 @@ type Accessor interface {
 	IsNullifierSpent(nullifier types.Hash) (bool, error)
 	PutNFT(nft types.ValidatorNFT) error
 	GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error)
+	// GetNFTByOwner looks up the (at most one, real "one per wallet")
+	// ValidatorNFT record for owner — the real check TxNFTMint's Stage 4
+	// and TxVote/TxVoteReveal's voter-eligibility check both need,
+	// backed by a real secondary index (prefixNFTByOwner) rather than a
+	// full scan over every minted NFT.
+	GetNFTByOwner(owner types.Address) (types.ValidatorNFT, bool, error)
 	PutHold(hold types.BankHold) error
 	GetHold(id types.Hash) (types.BankHold, bool, error)
 	PutProposal(p ProposalRecord) error
@@ -226,8 +233,32 @@ func (s *Store) IsNullifierSpent(nullifier types.Hash) (bool, error) {
 
 // --- NFTs ---
 
+// putNFT stores nft under both its own id and — the real secondary
+// index GetNFTByOwner needs — its owner, so "does this wallet already
+// hold a soulbound NFT" and "which real NFT does this wallet's vote
+// belong to" are both real, indexed lookups rather than a full scan.
+// Re-saving an existing NFT (e.g. TxNFTTrait's update path) naturally
+// overwrites the same owner-index entry with the same id.
+func putNFT(txn *badger.Txn, nft types.ValidatorNFT) error {
+	if err := setJSON(txn, prefixNFT, nft.ID.String(), nft); err != nil {
+		return err
+	}
+	return setJSON(txn, prefixNFTByOwner, nft.Owner.String(), nft.ID)
+}
+
+func getNFTByOwner(txn *badger.Txn, owner types.Address) (types.ValidatorNFT, bool, error) {
+	var id types.NFTID
+	found, err := getJSON(txn, prefixNFTByOwner, owner.String(), &id)
+	if err != nil || !found {
+		return types.ValidatorNFT{}, false, err
+	}
+	var nft types.ValidatorNFT
+	found, err = getJSON(txn, prefixNFT, id.String(), &nft)
+	return nft, found, err
+}
+
 func (s *Store) PutNFT(nft types.ValidatorNFT) error {
-	return s.db.Update(func(txn *badger.Txn) error { return setJSON(txn, prefixNFT, nft.ID.String(), nft) })
+	return s.db.Update(func(txn *badger.Txn) error { return putNFT(txn, nft) })
 }
 
 func (s *Store) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
@@ -236,6 +267,17 @@ func (s *Store) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
 	err := s.db.View(func(txn *badger.Txn) error {
 		var err error
 		found, err = getJSON(txn, prefixNFT, id.String(), &nft)
+		return err
+	})
+	return nft, found, err
+}
+
+func (s *Store) GetNFTByOwner(owner types.Address) (types.ValidatorNFT, bool, error) {
+	var nft types.ValidatorNFT
+	var found bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		nft, found, err = getNFTByOwner(txn, owner)
 		return err
 	})
 	return nft, found, err

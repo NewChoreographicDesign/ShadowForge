@@ -37,6 +37,17 @@ const (
 	// commit-reveal scheme is this build's own implementation decision,
 	// documented here rather than left unspecified).
 	TxVoteReveal
+	// TxNFTMint claims the free, one-per-wallet soulbound validator NFT
+	// spec 10.1 describes ("User requests a micro-drop of SFG... Mint UI
+	// presents CAPTCHA and a proof-of-humanity challenge... Contract
+	// enforces one NFT per wallet"). It is the real, live origination
+	// path this build was missing for ValidatorNFT records — see
+	// NFTMintPublicInputs and pkg/nft.Mint, which pkg/tx's pipeline calls
+	// to enforce a real, signed proof-of-humanity attestation rather than
+	// a caller-supplied bool. Holding a real NFT minted this way is also
+	// what makes TxVote/TxVoteReveal's voter eligibility real instead of
+	// an unchecked, freely-forgeable identity.
+	TxNFTMint
 )
 
 func (k TxKind) String() string {
@@ -57,6 +68,8 @@ func (k TxKind) String() string {
 		return "ContainerSync"
 	case TxVoteReveal:
 		return "VoteReveal"
+	case TxNFTMint:
+		return "NFTMint"
 	default:
 		return "Unknown"
 	}
@@ -99,6 +112,7 @@ type ShieldedTx struct {
 	VotePublicInputs       *VotePublicInputs
 	VoteRevealPublicInputs *VoteRevealPublicInputs
 	TraitPublicInputs      *TraitPublicInputs
+	NFTMintPublicInputs    *NFTMintPublicInputs
 
 	// TransferPublicInputs carries the exact, fixed-shape public inputs
 	// pkg/zk's TransferCircuit was actually proved and must be verified
@@ -188,6 +202,29 @@ func ComputeVoteCommitment(voter NFTID, approve bool, nonce Hash) Hash {
 type TraitPublicInputs struct {
 	Key             string
 	DeltaCommitment Hash
+}
+
+// NFTMintPublicInputs carries a real, signed proof-of-humanity
+// attestation binding a TxNFTMint to one specific owner/mint attempt
+// (spec 10.1). Fields mirror pkg/nft.PoHAttestation field-for-field
+// rather than embedding it directly: pkg/nft already imports pkg/types,
+// so the reverse import would cycle. pkg/tx's pipeline reconstructs a
+// real pkg/nft.PoHAttestation from these fields and verifies it exactly
+// the same way pkg/nft's own tests do.
+type NFTMintPublicInputs struct {
+	Owner Address
+	// Nonce is a caller-chosen uniqueness salt for this mint attempt
+	// (e.g. a wallet-local counter) — it must match Attestation's own
+	// Nonce, binding one specific attestation to one specific mint
+	// attempt so it can't be replayed against a different one.
+	Nonce uint64
+	// AttestationIssuedAtMs/Attestor/AttestationSig are the real signed
+	// claim's fields (pkg/nft.PoHAttestation.IssuedAtMs/Attestor/Sig) —
+	// Attestor is the attestor's real Dilithium public key, AttestationSig
+	// its real signature over Hash(Owner, Nonce, AttestationIssuedAtMs).
+	AttestationIssuedAtMs int64
+	Attestor              []byte
+	AttestationSig        DilithiumSig
 }
 
 // Vote is a single BFT signature from an assigned stage validator (spec 4.3).

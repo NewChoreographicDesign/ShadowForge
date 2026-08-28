@@ -53,7 +53,7 @@ func TestVotingOnlyNodePrunesCommittedTxFromLocalMempool(t *testing.T) {
 	// This node independently received the same tx via gossip (e.g. a
 	// wallet submitted it directly to this node before the proposer's
 	// version reached it) and admitted it to its own mempool.
-	voteTx := mustSignVote(t, "prune-proposal", 1)
+	voteTx := mustSignVote(t, n, "prune-proposal", 1)
 	if err := n.mempool.Submit(voteTx, time.Now()); err != nil {
 		t.Fatalf("submit to local mempool: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestVotingOnlyNodePrunesCommittedTxFromLocalMempool(t *testing.T) {
 	// Confirm the fix is real, not just "the field is now empty": submit
 	// a distinct second tx and prove it's unaffected — pruning must be
 	// selective, not a blanket mempool wipe.
-	other := mustSignVote(t, "unrelated-proposal", 2)
+	other := mustSignVote(t, n, "unrelated-proposal", 2)
 	if err := n.mempool.Submit(other, time.Now()); err != nil {
 		t.Fatalf("submit unrelated tx: %v", err)
 	}

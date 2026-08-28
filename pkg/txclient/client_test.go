@@ -520,6 +520,13 @@ func TestSubmitAndConfirmEndToEnd(t *testing.T) {
 	}
 
 	txn := mustSignedVote(t, "e2e-proof")
+	// Real voter eligibility (pkg/tx's requireEligibleVoter) is
+	// unconditional: this Vote's signer needs a real, minted NFT before
+	// the pipeline goroutine above will accept it.
+	txnOwner := types.AddressFromPubkey(txn.SignerPubKey)
+	if err := store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(txnOwner[:])), Owner: txnOwner}); err != nil {
+		t.Fatalf("seed voter nft: %v", err)
+	}
 	st, err := c.SubmitAndConfirm(context.Background(), txn, 5*time.Second)
 	if err != nil {
 		t.Fatalf("submit and confirm: %v", err)

@@ -56,6 +56,19 @@ func newDeps(t *testing.T) tx.Deps {
 	}
 }
 
+// seedVoterNFT gives signerPubKey a real, minted ValidatorNFT directly in
+// deps' store — real voter eligibility (pkg/tx's own requireEligibleVoter)
+// is unconditional, so any test exercising TxVote/TxVoteReveal behavior
+// other than eligibility itself needs this first, exactly the way a real
+// wallet would need a real Kind NFTMint to have succeeded beforehand.
+func seedVoterNFT(t *testing.T, deps tx.Deps, signerPubKey []byte) {
+	t.Helper()
+	owner := types.AddressFromPubkey(signerPubKey)
+	if err := deps.Store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
+		t.Fatalf("seed voter nft: %v", err)
+	}
+}
+
 // mustSign computes t's TxID from Hash(proof || commitments || nullifier)
 // (spec 4.1) and produces a real Dilithium signature over it, so every
 // test transaction passes Stage 2's actual cryptographic checks rather
@@ -630,6 +643,57 @@ func TestPipelineNFTTraitMissingTargetRejected(t *testing.T) {
 	}
 }
 
+// TestPipelineVoteRejectsUnmintedWallet is a direct regression test for
+// the real Sybil-voting gap this session closed: a freshly generated
+// keypair with no minted ValidatorNFT must not be able to cast a ballot
+// at all, let alone single-handedly pass a proposal. Before
+// requireEligibleVoter existed, "voter" was derived from nothing but the
+// signer's own public key, so ANY number of throwaway keypairs could
+// each cast one self-approving vote for free.
+func TestPipelineVoteRejectsUnmintedWallet(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+
+	voteTx := mustSign(t, types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("sybil-proposal"),
+			Commitment: types.Hash{1},
+		},
+	})
+	results := p.ProcessBatch([]tx.Entry{{Tx: voteTx, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a vote from a wallet with no minted NFT to be rejected")
+	}
+	se, ok := results[0].Error.(*tx.StageError)
+	if !ok || se.Stage != 4 {
+		t.Fatalf("expected a stage-4 StageError (voter eligibility), got %v", results[0].Error)
+	}
+
+	// The real attack this closes: a flood of distinct, freshly generated
+	// keypairs each attempting to self-approve — every single one must be
+	// rejected, and none of their ballots ever get recorded, proving a
+	// Sybil flood costs an attacker nothing but also gains them nothing.
+	for i := 0; i < 5; i++ {
+		sybilTx := mustSign(t, types.ShieldedTx{
+			Kind: types.TxVote,
+			VotePublicInputs: &types.VotePublicInputs{
+				ProposalID: types.ID("sybil-proposal"),
+				Commitment: types.Hash{byte(i + 2)},
+			},
+		})
+		if r := p.ProcessBatch([]tx.Entry{{Tx: sybilTx, SubmittedAt: time.Now()}}); r[0].Error == nil {
+			t.Fatalf("expected sybil attempt %d (fresh unminted keypair) to be rejected", i)
+		}
+	}
+
+	if _, found, err := deps.Store.GetProposal("sybil-proposal"); err != nil {
+		t.Fatalf("get proposal: %v", err)
+	} else if found {
+		t.Fatalf("expected no proposal record to exist at all — every attempted ballot was ineligible")
+	}
+}
+
 func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
@@ -640,6 +704,7 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 			Commitment: types.Hash{1, 2, 3},
 		},
 	})
+	seedVoterNFT(t, deps, voteTx.SignerPubKey)
 	voter1 := types.NFTID(types.SumHash(voteTx.SignerPubKey))
 	results := p.ProcessBatch([]tx.Entry{{Tx: voteTx, SubmittedAt: time.Now()}})
 	if results[0].Error != nil {
@@ -661,6 +726,7 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 			Commitment: types.Hash{4, 5, 6},
 		},
 	})
+	seedVoterNFT(t, deps, voteTx2.SignerPubKey)
 	results2 := p.ProcessBatch([]tx.Entry{{Tx: voteTx2, SubmittedAt: time.Now()}})
 	if results2[0].Error != nil {
 		t.Fatalf("expected second vote to succeed: %v", results2[0].Error)
@@ -683,6 +749,7 @@ func TestPipelineVoteRejectsDoubleVoteFromSameVoter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk)
 	first := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
@@ -719,6 +786,7 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk)
 	voter := types.NFTID(types.SumHash([]byte(pk)))
 	nonce := types.Hash{7, 7, 7}
 	commitment := types.ComputeVoteCommitment(voter, true, nonce)
@@ -804,6 +872,7 @@ func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate signer key: %v", err)
 		}
+		seedVoterNFT(t, deps, pk)
 		voter := types.NFTID(types.SumHash([]byte(pk)))
 		nonce := types.Hash{byte(len(pk))}
 		commitment := types.ComputeVoteCommitment(voter, approve, nonce)
@@ -866,11 +935,15 @@ func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
 		t.Fatalf("expected an already-tallied proposal to be skipped, got %d", len(tallied))
 	}
 
-	// Voting/revealing on an already-tallied proposal is closed.
+	// Voting/revealing on an already-tallied proposal is closed — real
+	// eligibility for this new key first, so the rejection below
+	// genuinely exercises the "already tallied" check this test is
+	// about, not just any rejection.
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk)
 	lateVote := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind:             types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("tally-proposal"), Commitment: types.Hash{1}},
@@ -898,6 +971,7 @@ func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk1)
 	voter1 := types.NFTID(types.SumHash([]byte(pk1)))
 	nonce1 := types.Hash{1}
 	commit1 := mustSignWithKey(t, pk1, sk1, types.ShieldedTx{
@@ -929,6 +1003,7 @@ func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk2)
 	voter2 := types.NFTID(types.SumHash([]byte(pk2)))
 	nonce2 := types.Hash{2}
 	commit2 := mustSignWithKey(t, pk2, sk2, types.ShieldedTx{
@@ -1015,6 +1090,7 @@ func TestTallyDueProposalsAppliesVaultShareChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk)
 	voter := types.NFTID(types.SumHash([]byte(pk)))
 	nonce := types.Hash{3}
 	commit := mustSignWithKey(t, pk, sk, types.ShieldedTx{
@@ -1084,6 +1160,7 @@ func TestPipelineSpikeDetectionHoldsFloodingWallet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, pk)
 	addr := types.Address(types.SumHash([]byte(pk)))
 	deps.Silent.SetBaseline(addr, decimal.FromInt(1)) // 1 tx/min normal
 
@@ -1134,6 +1211,7 @@ func TestPipelineSpikeDetectionHoldsFloodingWallet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate other signer key: %v", err)
 	}
+	seedVoterNFT(t, deps, otherPK)
 	otherTx := mustSignWithKey(t, otherPK, otherSK, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{

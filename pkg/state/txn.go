@@ -47,13 +47,17 @@ func (t *Txn) IsNullifierSpent(nullifier types.Hash) (bool, error) {
 }
 
 func (t *Txn) PutNFT(nft types.ValidatorNFT) error {
-	return setJSON(t.txn, prefixNFT, nft.ID.String(), nft)
+	return putNFT(t.txn, nft)
 }
 
 func (t *Txn) GetNFT(id types.NFTID) (types.ValidatorNFT, bool, error) {
 	var nft types.ValidatorNFT
 	found, err := getJSON(t.txn, prefixNFT, id.String(), &nft)
 	return nft, found, err
+}
+
+func (t *Txn) GetNFTByOwner(owner types.Address) (types.ValidatorNFT, bool, error) {
+	return getNFTByOwner(t.txn, owner)
 }
 
 func (t *Txn) PutHold(hold types.BankHold) error {

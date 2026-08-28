@@ -10,6 +10,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
 	"github.com/shadowforge/shadowforge-l1/pkg/governance"
+	"github.com/shadowforge/shadowforge-l1/pkg/nft"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/silent"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
@@ -78,7 +79,21 @@ type Deps struct {
 	// stamped with this Epoch, anchoring when it's due for an
 	// epoch-boundary tally.
 	Epoch types.EpochNumber
-	Now   func() time.Time
+	// Height is the height of the block this batch belongs to — stamped
+	// onto a freshly minted ValidatorNFT's MintedAt (Kind NFTMint), the
+	// same way Epoch is stamped onto a freshly created proposal record.
+	Height types.BlockHeight
+	// TrustedPoHAttestors is the currently-recognized proof-of-humanity
+	// attestor public key set (spec 10.1) Kind NFTMint's real signed
+	// attestation must be signed by one of. Unlike every other Deps
+	// field above, nil here is NOT "check disabled" — it means no
+	// attestor is trusted yet, so every NFTMint attempt is rejected
+	// (fail closed): silently treating "not configured" as "skip the
+	// check" would silently let anyone mint the very credential real
+	// governance-Sybil-resistance (TxVote/TxVoteReveal below) now
+	// depends on.
+	TrustedPoHAttestors []crypto.DilithiumPublicKey
+	Now                 func() time.Time
 }
 
 func (d Deps) now() time.Time {
@@ -272,7 +287,7 @@ func (p *Pipeline) finalize(t *types.ShieldedTx) {
 // "Well-formedness: kind, fee commitment, circuit public inputs, Dilithium
 // signature, not expired. Writes: Tx admitted to the working batch."
 func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) error {
-	if t.Kind > types.TxVoteReveal {
+	if t.Kind > types.TxNFTMint {
 		return fmt.Errorf("unknown tx kind %d", t.Kind)
 	}
 	if !submittedAt.IsZero() && p.deps.now().Sub(submittedAt) > TxTTL {
@@ -346,6 +361,10 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 	case types.TxNFTTrait:
 		if t.TraitPublicInputs == nil {
 			return fmt.Errorf("NFTTrait tx missing public inputs")
+		}
+	case types.TxNFTMint:
+		if t.NFTMintPublicInputs == nil {
+			return fmt.Errorf("NFTMint tx missing public inputs")
 		}
 	}
 	t.StageHints = t.StageHints.With(2)
@@ -486,26 +505,15 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		// only what got revealed — see types.ComputeVoteCommitment and
 		// the TxVoteReveal case below.
 		//
-		// A real, disclosed gap, not spec 9.1's "one NFT, one vote"
-		// actually enforced: voter is derived from the signer's own
-		// public key with no check that it corresponds to a real,
-		// minted ValidatorNFT (governance.Tally's own eligibleNFTs
-		// parameter is a turnout-percentage denominator, not a
-		// membership set either). Any freshly generated keypair can cast
-		// one ballot, and with no turnout floor configured a single
-		// self-approving vote currently passes a proposal. This isn't
-		// simply an oversight to patch with a lookup: cmd/walletsim's
-		// own real, tested design deliberately casts votes from a fresh
-		// throwaway identity per session ("Wallets create throw-away
-		// 'mirror' addresses ... and burn them afterward" — its own doc,
-		// citing docs/SPEC_SOURCE.md) precisely so a ballot can't be
-		// linked back to a voter's long-lived identity; requiring the
-		// signer itself to hold the NFT would close the Sybil gap at the
-		// cost of that anonymity. A real fix needs a privacy-preserving
-		// eligibility proof (prove NFT ownership without revealing
-		// which one) that this build's ZK circuit doesn't implement —
-		// left for a dedicated follow-up rather than a same-session
-		// change to consensus-critical code.
+		// Real voter eligibility (spec 9.1's "one NFT, one vote"): the
+		// signer must actually own a real, minted, non-slashed
+		// ValidatorNFT — see requireEligibleVoter's own doc for why this
+		// is a pure additional gate rather than a change to the
+		// commitment/dedup scheme below (voter stays SumHash(pubkey),
+		// exactly as every existing client already computes it).
+		if err := p.requireEligibleVoter(t.SignerPubKey); err != nil {
+			return err
+		}
 		pub := t.VotePublicInputs
 		voter := types.NFTID(types.SumHash(t.SignerPubKey))
 		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
@@ -542,7 +550,13 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		// Opens a sealed TxVote ballot: Approve/Nonce must reproduce the
 		// Commitment that voter's earlier TxVote bound, or the reveal is
 		// rejected outright — this is a real cryptographic check against
-		// stored on-chain state, not a trust-the-caller flag.
+		// stored on-chain state, not a trust-the-caller flag. Eligibility
+		// is re-checked here too (not just at commit time): an NFT
+		// slashed between a TxVote and its TxVoteReveal must not have its
+		// ballot count.
+		if err := p.requireEligibleVoter(t.SignerPubKey); err != nil {
+			return err
+		}
 		pub := t.VoteRevealPublicInputs
 		voter := types.NFTID(types.SumHash(t.SignerPubKey))
 		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
@@ -607,9 +621,65 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		if err := p.deps.Store.PutContainerRoot(string(*t.ContainerID), newRoot); err != nil {
 			return fmt.Errorf("persist container root: %w", err)
 		}
+
+	case types.TxNFTMint:
+		pub := t.NFTMintPublicInputs
+		_, alreadyHasNFT, err := p.deps.Store.GetNFTByOwner(pub.Owner)
+		if err != nil {
+			return fmt.Errorf("nft-by-owner lookup: %w", err)
+		}
+		minted, err := nft.Mint(nft.MintParams{
+			Owner:         pub.Owner,
+			AlreadyHasNFT: alreadyHasNFT,
+			Attestation: nft.PoHAttestation{
+				Owner:      pub.Owner,
+				Nonce:      pub.Nonce,
+				IssuedAtMs: pub.AttestationIssuedAtMs,
+				Attestor:   crypto.DilithiumPublicKey(pub.Attestor),
+				Sig:        crypto.DilithiumSignature(pub.AttestationSig),
+			},
+			TrustedAttestors: p.deps.TrustedPoHAttestors,
+			MintedAt:         p.deps.Height,
+			Now:              p.deps.now(),
+			Nonce:            pub.Nonce,
+		})
+		if err != nil {
+			return fmt.Errorf("nft mint: %w", err)
+		}
+		if err := p.deps.Store.PutNFT(minted); err != nil {
+			return fmt.Errorf("persist minted nft: %w", err)
+		}
 	}
 
 	t.StageHints = t.StageHints.With(4)
+	return nil
+}
+
+// requireEligibleVoter enforces spec 9.1's "one NFT, one vote" for real:
+// signerPubKey must belong to a wallet that actually holds a real,
+// minted, non-slashed ValidatorNFT (via GetNFTByOwner's real secondary
+// index — see Kind NFTMint for the only live path that creates one).
+// Deliberately a pure additional gate, not a change to the ballot
+// commitment/dedup scheme (pkg/tx's TxVote/TxVoteReveal cases still key
+// everything off types.NFTID(types.SumHash(signerPubKey)), exactly as
+// every existing client — pkg/txbuilder.Vote included — already
+// computes it): the commitment hash a client builds locally must still
+// match what a later reveal recomputes, and changing what value feeds
+// that hash would break every existing, already-signed ballot's ability
+// to ever be revealed. Requiring eligibility here instead ties a vote to
+// a real Sybil-resistant credential without touching that math at all.
+func (p *Pipeline) requireEligibleVoter(signerPubKey []byte) error {
+	owner := types.AddressFromPubkey(signerPubKey)
+	rec, found, err := p.deps.Store.GetNFTByOwner(owner)
+	if err != nil {
+		return fmt.Errorf("voter eligibility lookup: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("wallet holds no minted NFT — governance voting requires a real, PoH-verified NFT (see Kind NFTMint)")
+	}
+	if rec.Slashed {
+		return fmt.Errorf("wallet's NFT is slashed and cannot vote")
+	}
 	return nil
 }
 

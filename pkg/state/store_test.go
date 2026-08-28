@@ -76,6 +76,58 @@ func TestNFTRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGetNFTByOwnerFindsRealRecord(t *testing.T) {
+	s := openTestStore(t)
+	nft := types.ValidatorNFT{ID: types.NFTID{1, 2, 3}, Owner: types.Address{4, 5, 6}, TP: 7}
+	if err := s.PutNFT(nft); err != nil {
+		t.Fatalf("put nft: %v", err)
+	}
+	got, found, err := s.GetNFTByOwner(nft.Owner)
+	if err != nil || !found {
+		t.Fatalf("get nft by owner: found=%v err=%v", found, err)
+	}
+	if got.ID != nft.ID || got.TP != 7 {
+		t.Fatalf("owner-index lookup mismatch: %+v", got)
+	}
+}
+
+func TestGetNFTByOwnerFalseForUnknownOwner(t *testing.T) {
+	s := openTestStore(t)
+	_, found, err := s.GetNFTByOwner(types.Address{9, 9, 9})
+	if err != nil {
+		t.Fatalf("get nft by owner: %v", err)
+	}
+	if found {
+		t.Fatalf("expected found=false for an owner that never minted")
+	}
+}
+
+// TestGetNFTByOwnerReflectsUpdateNotDuplication is a direct regression
+// test for the real "one per wallet" enforcement TxNFTMint's Stage 4
+// needs: re-saving the same owner's NFT (e.g. a later TxNFTTrait update)
+// must overwrite the owner index in place, not accumulate a stale or
+// duplicate entry that could let a second, different NFT silently
+// coexist for the same owner.
+func TestGetNFTByOwnerReflectsUpdateNotDuplication(t *testing.T) {
+	s := openTestStore(t)
+	owner := types.Address{1, 1, 1}
+	nft := types.ValidatorNFT{ID: types.NFTID{2, 2, 2}, Owner: owner, TP: 1}
+	if err := s.PutNFT(nft); err != nil {
+		t.Fatalf("put nft: %v", err)
+	}
+	nft.TP = 5
+	if err := s.PutNFT(nft); err != nil {
+		t.Fatalf("update nft: %v", err)
+	}
+	got, found, err := s.GetNFTByOwner(owner)
+	if err != nil || !found {
+		t.Fatalf("get nft by owner: found=%v err=%v", found, err)
+	}
+	if got.ID != nft.ID || got.TP != 5 {
+		t.Fatalf("expected the owner index to reflect the updated record, got %+v", got)
+	}
+}
+
 func TestBankHoldRoundTrip(t *testing.T) {
 	s := openTestStore(t)
 	hold := types.BankHold{

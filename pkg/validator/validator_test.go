@@ -78,7 +78,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		OnlineTimeout:     time.Minute,
 		Genesis:           consensus.GenesisTime(genesisMs),
 	}
-	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, mempool, pk, sk, false, testLogf(t))
+	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, mempool, pk, sk, false, testLogf(t))
 }
 
 type peerKey struct {
@@ -99,12 +99,21 @@ func genPeer(t *testing.T) peerKey {
 // mustSignVote builds a real, correctly-signed, minimal-cost TxVote
 // transaction: TxVote needs no ZK system (unlike TxTransfer), so it keeps
 // these tests fast while still exercising the pipeline's real signature
-// and stage checks.
-func mustSignVote(t *testing.T, proposalID string, commitment byte) types.ShieldedTx {
+// and stage checks. It also seeds a real, minted ValidatorNFT for the
+// fresh signer key directly into n's store — real voter eligibility
+// (pkg/tx's requireEligibleVoter) is unconditional, not something these
+// pipeline-behavior tests are trying to exercise, so giving every
+// generated voter a real NFT up front keeps them passing exactly as
+// before that check existed.
+func mustSignVote(t *testing.T, n *Node, proposalID string, commitment byte) types.ShieldedTx {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
+	}
+	owner := types.AddressFromPubkey(pk)
+	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
+		t.Fatalf("seed voter nft: %v", err)
 	}
 	in := types.ShieldedTx{
 		Kind: types.TxVote,
@@ -157,7 +166,7 @@ func TestFullRoundReachesQuorumAndCommits(t *testing.T) {
 		t.Fatalf("expected all 4 online validators in the committee, got %d", len(committee))
 	}
 
-	voteTx := mustSignVote(t, "proposal-1", 1)
+	voteTx := mustSignVote(t, n, "proposal-1", 1)
 	prop := shadownet.BlockProposalPayload{
 		Height:    height,
 		Epoch:     0,
@@ -230,7 +239,7 @@ func TestMaybeProposeRespectsMaxBatchSize(t *testing.T) {
 
 	const submitted = 10
 	for i := 0; i < submitted; i++ {
-		if err := n.mempool.Submit(mustSignVote(t, "proposal-cap", byte(i)), time.Now()); err != nil {
+		if err := n.mempool.Submit(mustSignVote(t, n, "proposal-cap", byte(i)), time.Now()); err != nil {
 			t.Fatalf("submit %d: %v", i, err)
 		}
 	}
@@ -314,7 +323,7 @@ func TestTryFinalizeReinsertsBatchOnChainAppendFailure(t *testing.T) {
 
 	// Advance the head past `height` first, via a real, independent round
 	// — so a second round still targeting `height` is now stale.
-	firstTx := mustSignVote(t, "proposal-first", 1)
+	firstTx := mustSignVote(t, n, "proposal-first", 1)
 	n.handleBlockProposal(shadownet.BlockProposalPayload{
 		Height: height, Proposer: committee[0], Batch: []types.ShieldedTx{firstTx}, Timestamp: time.Now().UnixMilli(),
 	})
@@ -352,7 +361,7 @@ func TestTryFinalizeReinsertsBatchOnChainAppendFailure(t *testing.T) {
 	// straight to tryFinalizeLocked — bypassing handleBlockProposal's own
 	// height check, since this test needs the round to exist so
 	// tryFinalizeLocked's own chain.Append call is what fails.
-	staleTx := mustSignVote(t, "proposal-stale", 2)
+	staleTx := mustSignVote(t, n, "proposal-stale", 2)
 	txn := n.store.BeginTxn()
 	entries := []tx.Entry{{Tx: staleTx, SubmittedAt: time.Now()}}
 	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, Vault: n.vlt, Now: time.Now})
@@ -412,7 +421,7 @@ func TestForgedVoteDoesNotCountTowardQuorum(t *testing.T) {
 	height := n.chn.NextHeight()
 	committee := registerOnline(n, height, p1, p2, p3)
 
-	voteTx := mustSignVote(t, "proposal-2", 2)
+	voteTx := mustSignVote(t, n, "proposal-2", 2)
 	prop := shadownet.BlockProposalPayload{
 		Height: height, Proposer: committee[0], Batch: []types.ShieldedTx{voteTx}, Timestamp: time.Now().UnixMilli(),
 	}
@@ -474,7 +483,7 @@ func TestRoundRollsBackOnTimeout(t *testing.T) {
 	committee := registerOnline(n, height, p1, p2, p3)
 
 	const proposalID = "proposal-3"
-	voteTx := mustSignVote(t, proposalID, 3)
+	voteTx := mustSignVote(t, n, proposalID, 3)
 	prop := shadownet.BlockProposalPayload{
 		Height: height, Proposer: committee[0], Batch: []types.ShieldedTx{voteTx}, Timestamp: time.Now().UnixMilli(),
 	}
@@ -576,7 +585,7 @@ func TestHandleBlockProposalRecoversValidTxsFromRejectedBatch(t *testing.T) {
 	height := n.chn.NextHeight()
 	committee := registerOnline(n, height, p1, p2, p3)
 
-	goodTx := mustSignVote(t, "proposal-recover", 1)
+	goodTx := mustSignVote(t, n, "proposal-recover", 1)
 	badTx := types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
@@ -626,7 +635,7 @@ func TestHandleBlockProposalRejectsWrongProposer(t *testing.T) {
 		}
 	}
 
-	voteTx := mustSignVote(t, "proposal-5", 5)
+	voteTx := mustSignVote(t, n, "proposal-5", 5)
 	prop := shadownet.BlockProposalPayload{
 		Height: height, Proposer: impostor, Batch: []types.ShieldedTx{voteTx}, Timestamp: time.Now().UnixMilli(),
 	}
@@ -651,7 +660,7 @@ func TestMaybeProposeOnlySelfProposesOnItsOwnTurn(t *testing.T) {
 	height := n.chn.NextHeight()
 	committee := registerOnline(n, height, p1, p2, p3)
 
-	voteTx := mustSignVote(t, "proposal-6", 6)
+	voteTx := mustSignVote(t, n, "proposal-6", 6)
 	if err := n.mempool.Submit(voteTx, time.Now()); err != nil {
 		t.Fatalf("submit to mempool: %v", err)
 	}
@@ -701,7 +710,15 @@ func TestHandleBlockAnnounceAdoptsIndependentlyVerifiedBlock(t *testing.T) {
 		adopter.recordOnline(e.id, e.pk, false, time.Now())
 	}
 
-	voteTx := mustSignVote(t, "proposal-7", 7)
+	// voteTx's real voter NFT must exist on BOTH nodes' stores: adopter
+	// independently re-verifies this transaction (including real voter
+	// eligibility) while replay-adopting the block below, exactly as
+	// proposer does while first processing it.
+	voteTx := mustSignVote(t, proposer, "proposal-7", 7)
+	owner := types.AddressFromPubkey(voteTx.SignerPubKey)
+	if err := adopter.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
+		t.Fatalf("seed voter nft on adopter: %v", err)
+	}
 	prop := shadownet.BlockProposalPayload{
 		Height: height, Proposer: committeeProposer[0], Batch: []types.ShieldedTx{voteTx}, Timestamp: time.Now().UnixMilli(),
 	}
@@ -829,6 +846,10 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate voter key: %v", err)
 	}
+	owner := types.AddressFromPubkey(pk)
+	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
+		t.Fatalf("seed voter nft: %v", err)
+	}
 	voter := types.NFTID(types.SumHash(pk))
 	nonce := types.Hash{5}
 	commitment := types.ComputeVoteCommitment(voter, true, nonce)
@@ -885,6 +906,10 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 	dummyPK, dummySK, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate second signer key: %v", err)
+	}
+	dummyOwner := types.AddressFromPubkey(dummyPK)
+	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(dummyOwner[:])), Owner: dummyOwner}); err != nil {
+		t.Fatalf("seed dummy voter nft: %v", err)
 	}
 	dummyTx := signVoteTx(t, dummyPK, dummySK, types.ShieldedTx{
 		Kind:             types.TxVote,

@@ -71,6 +71,14 @@ func TestTxnReadsItsOwnUncommittedWrites(t *testing.T) {
 	if got.TP != 7 {
 		t.Fatalf("unexpected TP: %d", got.TP)
 	}
+
+	byOwner, found, err := txn.GetNFTByOwner(nft.Owner)
+	if err != nil || !found {
+		t.Fatalf("expected to read back own uncommitted owner-index write: found=%v err=%v", found, err)
+	}
+	if byOwner.ID != nft.ID {
+		t.Fatalf("expected owner-index lookup to find the same nft, got %+v", byOwner)
+	}
 }
 
 func TestTxnDoubleSpendRejectedWithinSameTxn(t *testing.T) {
