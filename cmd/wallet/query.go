@@ -35,6 +35,7 @@ func runIdentity(args []string) error {
 		return err
 	}
 	fmt.Printf("identity: %s\n", ks.Identity())
+	fmt.Printf("address: %s\n", types.AddressFromPubkey(ks.PublicKey()))
 	fmt.Printf("public key: %s\n", ks.PublicKey())
 	fmt.Printf("shielded public key: %s\n", hex.EncodeToString(ks.ShieldedPublicKey().Bytes()))
 	return nil

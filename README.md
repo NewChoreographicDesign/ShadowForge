@@ -145,6 +145,25 @@ package — this is not a stub with comments describing intended behavior.
   unwired: it needs an App-layer proposer-path choice (direct vs.
   staked) this L1-core build doesn't implement, a real, documented
   boundary rather than a fabricated mechanism.
+- **Real, enforced voter eligibility — closing a genuine Sybil-voting
+  gap live testing found.** Casting a ballot originally needed nothing
+  but a freshly generated keypair: `requireEligibleVoter`
+  (`pkg/tx/pipeline.go`) now requires the signer to hold a real,
+  non-slashed `ValidatorNFT`, looked up via a real secondary store index
+  (`state.Store.GetNFTByOwner`). That NFT itself now has a real, live
+  origination path this build was previously missing entirely: `Kind
+  NFTMint` claims spec 10.1's free, one-per-wallet soulbound NFT,
+  enforced against a real, signed proof-of-humanity attestation
+  (`pkg/nft.PoHAttestation`/`SignPoHAttestation`, checked against a
+  node's configured `-poh-attestor-keys`) — the actual CAPTCHA/human-
+  verification challenge stays App-layer/out of scope per spec, but the
+  cryptographic chain proving an attestor really vouched for a specific
+  wallet is real and enforced. `cmd/wallet poh-attest`/`nft-mint` are
+  the two-role CLI for it. A real, disclosed follow-up: this ties a
+  ballot to a wallet's long-lived identity rather than a fully anonymous
+  eligibility proof, a deliberate trade-off against `cmd/walletsim`'s
+  own throwaway-per-session identity design — see that command's own
+  doc and `pkg/tx`'s `TxVote` case for the reasoning.
 
 ## Security
 

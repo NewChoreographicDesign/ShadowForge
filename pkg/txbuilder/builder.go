@@ -48,6 +48,14 @@ func (b *Builder) Identity() types.NFTID {
 	return types.NFTID(types.SumHash(b.pk))
 }
 
+// PublicKey is this builder's real Dilithium public key — needed
+// wherever a caller must derive something other than Identity()'s own
+// hash from it, e.g. types.AddressFromPubkey for an NFTMint's Owner
+// field (see NFTMint's own doc).
+func (b *Builder) PublicKey() crypto.DilithiumPublicKey {
+	return b.pk
+}
+
 // randomHash draws a fresh, unpredictable Hash from a real CSPRNG — used
 // wherever a transaction just needs a unique value (a nullifier for a
 // kind Stage 1 never double-spend-checks) rather than one that must be

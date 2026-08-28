@@ -2,9 +2,11 @@ package txbuilder_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/nft"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
@@ -44,6 +46,24 @@ func newIdentity(t *testing.T) *txbuilder.Builder {
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate identity: %v", err)
+	}
+	return txbuilder.New(pk, sk)
+}
+
+// newVoterIdentity is newIdentity plus a real, minted ValidatorNFT seeded
+// directly into deps.Store — real voter eligibility (pkg/tx's
+// requireEligibleVoter) is unconditional, so any test proving TxVote/
+// TxVoteReveal acceptance through the real pipeline needs this instead
+// of newIdentity.
+func newVoterIdentity(t *testing.T, deps tx.Deps) *txbuilder.Builder {
+	t.Helper()
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate identity: %v", err)
+	}
+	owner := types.AddressFromPubkey(pk)
+	if err := deps.Store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
+		t.Fatalf("seed voter nft: %v", err)
 	}
 	return txbuilder.New(pk, sk)
 }
@@ -89,7 +109,7 @@ func TestBuilderIdentityMatchesConsensusConvention(t *testing.T) {
 
 func TestVoteAcceptedByRealPipelineAndRecordsCommitment(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
-	b := newIdentity(t)
+	b := newVoterIdentity(t, deps)
 
 	votetx, err := b.Vote("prop-1", true, "", "")
 	if err != nil {
@@ -112,8 +132,8 @@ func TestVoteAcceptedByRealPipelineAndRecordsCommitment(t *testing.T) {
 
 func TestVoteWithParamKeyBindsFirstVoteOnly(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
-	first := newIdentity(t)
-	second := newIdentity(t)
+	first := newVoterIdentity(t, deps)
+	second := newVoterIdentity(t, deps)
 
 	firstVote, err := first.Vote("prop-param", true, "DepositATRMultiple", "4")
 	if err != nil {
@@ -141,8 +161,8 @@ func TestVoteWithParamKeyBindsFirstVoteOnly(t *testing.T) {
 }
 
 func TestSecondVoteFromSameIdentityRejectedByRealPipeline(t *testing.T) {
-	p, _ := newRealPipeline(t, tx.Deps{})
-	b := newIdentity(t)
+	p, deps := newRealPipeline(t, tx.Deps{})
+	b := newVoterIdentity(t, deps)
 
 	first, err := b.Vote("prop-dup", true, "", "")
 	if err != nil {
@@ -170,7 +190,7 @@ func TestSecondVoteFromSameIdentityRejectedByRealPipeline(t *testing.T) {
 
 func TestVoteRevealRoundTripAcceptedByRealPipeline(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
-	b := newIdentity(t)
+	b := newVoterIdentity(t, deps)
 
 	votetx, err := b.Vote("prop-reveal", true, "", "")
 	if err != nil {
@@ -199,8 +219,8 @@ func TestVoteRevealRoundTripAcceptedByRealPipeline(t *testing.T) {
 }
 
 func TestVoteRevealRejectsWrongApproveValue(t *testing.T) {
-	p, _ := newRealPipeline(t, tx.Deps{})
-	b := newIdentity(t)
+	p, deps := newRealPipeline(t, tx.Deps{})
+	b := newVoterIdentity(t, deps)
 
 	votetx, err := b.Vote("prop-mismatch", true, "", "")
 	if err != nil {
@@ -221,8 +241,8 @@ func TestVoteRevealRejectsWrongApproveValue(t *testing.T) {
 }
 
 func TestVoteRevealWithoutPriorVoteRejectedByRealPipeline(t *testing.T) {
-	p, _ := newRealPipeline(t, tx.Deps{})
-	b := newIdentity(t)
+	p, deps := newRealPipeline(t, tx.Deps{})
+	b := newVoterIdentity(t, deps)
 
 	revealtx, err := b.VoteReveal("prop-never-voted", true)
 	if err != nil {
@@ -360,6 +380,151 @@ func TestTwoMintsFromSameIdentityHaveDistinctTxIDs(t *testing.T) {
 	}
 	if a.TxID == c.TxID {
 		t.Fatalf("expected two separate Mint calls to produce distinct TxIDs (random nullifier)")
+	}
+}
+
+// --- NFTMint ---
+
+func genAttestor(t *testing.T) (crypto.DilithiumPublicKey, crypto.DilithiumPrivateKey) {
+	t.Helper()
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate attestor key: %v", err)
+	}
+	return pk, sk
+}
+
+// ownerOf derives b's real types.Address the same way pkg/tx's pipeline
+// does when checking a TxNFTMint (types.AddressFromPubkey), so a test's
+// locally-signed PoHAttestation binds to exactly the owner the pipeline
+// will look up.
+func ownerOf(b *txbuilder.Builder) types.Address {
+	return types.AddressFromPubkey(b.PublicKey())
+}
+
+func TestNFTMintAcceptedByRealPipelineWithTrustedAttestation(t *testing.T) {
+	attestorPK, attestorSK := genAttestor(t)
+	_, deps := newRealPipeline(t, tx.Deps{})
+	deps.TrustedPoHAttestors = []crypto.DilithiumPublicKey{attestorPK}
+	p := tx.NewPipeline(deps)
+
+	b := newIdentity(t)
+	now := time.Now()
+	att, err := nft.SignPoHAttestation(attestorPK, attestorSK, ownerOf(b), 1, now.UnixMilli())
+	if err != nil {
+		t.Fatalf("sign attestation: %v", err)
+	}
+
+	mintTx, err := b.NFTMint(1, att.IssuedAtMs, att.Attestor, att.Sig)
+	if err != nil {
+		t.Fatalf("build nft mint: %v", err)
+	}
+	assertRealSignature(t, mintTx)
+	if err := runOne(p, mintTx); err != nil {
+		t.Fatalf("expected the real pipeline to accept a well-formed, trusted-attestor-signed mint: %v", err)
+	}
+
+	minted, found, err := deps.Store.GetNFTByOwner(ownerOf(b))
+	if err != nil || !found {
+		t.Fatalf("expected a real minted NFT: found=%v err=%v", found, err)
+	}
+	if minted.Slashed {
+		t.Fatalf("expected a freshly minted NFT to not be slashed")
+	}
+}
+
+func TestNFTMintRejectedByUntrustedAttestor(t *testing.T) {
+	_, untrustedSK := genAttestor(t)
+	untrustedPK, _ := genAttestor(t)
+	trustedPK, _ := genAttestor(t)
+	_, deps := newRealPipeline(t, tx.Deps{})
+	deps.TrustedPoHAttestors = []crypto.DilithiumPublicKey{trustedPK}
+	p := tx.NewPipeline(deps)
+
+	b := newIdentity(t)
+	now := time.Now()
+	att, err := nft.SignPoHAttestation(untrustedPK, untrustedSK, ownerOf(b), 1, now.UnixMilli())
+	if err != nil {
+		t.Fatalf("sign attestation: %v", err)
+	}
+	mintTx, err := b.NFTMint(1, att.IssuedAtMs, att.Attestor, att.Sig)
+	if err != nil {
+		t.Fatalf("build nft mint: %v", err)
+	}
+	if err := runOne(p, mintTx); err == nil {
+		t.Fatalf("expected the real pipeline to reject a mint attested by an untrusted attestor")
+	}
+}
+
+func TestNFTMintRejectedWhenNoAttestorTrusted(t *testing.T) {
+	attestorPK, attestorSK := genAttestor(t)
+	p, _ := newRealPipeline(t, tx.Deps{}) // deps.TrustedPoHAttestors left nil: fail closed
+	b := newIdentity(t)
+	now := time.Now()
+	att, err := nft.SignPoHAttestation(attestorPK, attestorSK, ownerOf(b), 1, now.UnixMilli())
+	if err != nil {
+		t.Fatalf("sign attestation: %v", err)
+	}
+	mintTx, err := b.NFTMint(1, att.IssuedAtMs, att.Attestor, att.Sig)
+	if err != nil {
+		t.Fatalf("build nft mint: %v", err)
+	}
+	if err := runOne(p, mintTx); err == nil {
+		t.Fatalf("expected a mint attempt to be rejected when no attestor is trusted (fail closed)")
+	}
+}
+
+func TestNFTMintRejectsSecondMintForSameWallet(t *testing.T) {
+	attestorPK, attestorSK := genAttestor(t)
+	_, deps := newRealPipeline(t, tx.Deps{})
+	deps.TrustedPoHAttestors = []crypto.DilithiumPublicKey{attestorPK}
+	p := tx.NewPipeline(deps)
+
+	b := newIdentity(t)
+	now := time.Now()
+	att1, err := nft.SignPoHAttestation(attestorPK, attestorSK, ownerOf(b), 1, now.UnixMilli())
+	if err != nil {
+		t.Fatalf("sign attestation 1: %v", err)
+	}
+	first, err := b.NFTMint(1, att1.IssuedAtMs, att1.Attestor, att1.Sig)
+	if err != nil {
+		t.Fatalf("build first mint: %v", err)
+	}
+	if err := runOne(p, first); err != nil {
+		t.Fatalf("expected the first mint to succeed: %v", err)
+	}
+
+	att2, err := nft.SignPoHAttestation(attestorPK, attestorSK, ownerOf(b), 2, now.UnixMilli())
+	if err != nil {
+		t.Fatalf("sign attestation 2: %v", err)
+	}
+	second, err := b.NFTMint(2, att2.IssuedAtMs, att2.Attestor, att2.Sig)
+	if err != nil {
+		t.Fatalf("build second mint: %v", err)
+	}
+	if err := runOne(p, second); err == nil {
+		t.Fatalf("expected a second mint attempt from the same wallet to be rejected (one per wallet)")
+	}
+}
+
+func TestNFTMintRejectsExpiredAttestation(t *testing.T) {
+	attestorPK, attestorSK := genAttestor(t)
+	_, deps := newRealPipeline(t, tx.Deps{})
+	deps.TrustedPoHAttestors = []crypto.DilithiumPublicKey{attestorPK}
+	p := tx.NewPipeline(deps)
+
+	b := newIdentity(t)
+	stale := time.Now().Add(-2 * nft.PoHAttestationTTL)
+	att, err := nft.SignPoHAttestation(attestorPK, attestorSK, ownerOf(b), 1, stale.UnixMilli())
+	if err != nil {
+		t.Fatalf("sign attestation: %v", err)
+	}
+	mintTx, err := b.NFTMint(1, att.IssuedAtMs, att.Attestor, att.Sig)
+	if err != nil {
+		t.Fatalf("build nft mint: %v", err)
+	}
+	if err := runOne(p, mintTx); err == nil {
+		t.Fatalf("expected the real pipeline to reject an expired attestation")
 	}
 }
 

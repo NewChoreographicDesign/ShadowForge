@@ -66,6 +66,10 @@ func main() {
 		err = runTransfer(args)
 	case "zk-setup":
 		err = runZKSetup(args)
+	case "poh-attest":
+		err = runPoHAttest(args)
+	case "nft-mint":
+		err = runNFTMint(args)
 	default:
 		usage()
 		os.Exit(2)
@@ -93,8 +97,18 @@ Read-only queries (talk to one live node's pkg/query API):
   wallet proposal     -query <url> -id <string>
   wallet proposals    -query <url>
 
+Claim your free, one-per-wallet validator NFT (spec 10.1) — required for
+real governance voting eligibility (see 'wallet vote' below). The actual
+proof-of-humanity challenge is out of this L1 core's scope; an attestor
+you (or the network) trust runs 'poh-attest' after doing that check by
+its own real means, and hands you the resulting flags:
+  wallet poh-attest -keystore <attestor-file> -owner <hex-address> -nonce <n>
+  wallet nft-mint   -keystore <file> -bootstrap <addr> -query <url> -nonce <n> -attestation-issued-at-ms <n> -attestor-pubkey <hex> -attestation-sig <hex>
+
 Submit a real, signed, no-proof transaction (needs a bootstrap peer to
-broadcast to, and a query endpoint to confirm against):
+broadcast to, and a query endpoint to confirm against). Vote/vote-reveal
+require a real, minted NFT (see 'wallet nft-mint' above) — this is a
+real, enforced Sybil-resistance check, not a formality:
   wallet vote          -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve
   wallet vote-reveal    -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve
   wallet mint           -keystore <file> -bootstrap <addr> -query <url>

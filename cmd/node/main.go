@@ -23,6 +23,7 @@ package main
 import (
 	"context"
 	cryptorand "crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -76,6 +77,7 @@ func main() {
 	disableOracle := flag.Bool("disable-oracle", false, "disable real oracle price/ATR verification of BankDeposit/BankWithdraw claims (spec 11.3) — for isolated test networks without internet access")
 	oracleMaxDisagreement := flag.String("oracle-max-disagreement", "0.02", "fractional bound (e.g. 0.02 = 2%) beyond which the oracle quorum's real sources are treated as disagreeing (spec 11.3)")
 	queryListen := flag.String("query-listen", "127.0.0.1:8081", "address for the read-only HTTP query API (chain status, tx status, balances-equivalent lookups) — empty disables it. Binding a non-loopback address deliberately exposes it beyond this machine; see pkg/query's doc for exactly what it does and does not reveal")
+	pohAttestorKeys := flag.String("poh-attestor-keys", "", "comma-separated hex-encoded Dilithium public keys this node trusts to sign real proof-of-humanity attestations (spec 10.1) for Kind NFTMint. Empty (the default) means no attestor is trusted, so every NFTMint attempt is rejected — this also means nobody can newly qualify for real governance voting eligibility (TxVote/TxVoteReveal now require a real, PoH-verified NFT) until at least one is configured; see 'wallet zk-setup'-adjacent 'wallet poh-attest' for the attestor-side tool")
 	flag.Parse()
 
 	role := "civilian"
@@ -172,8 +174,16 @@ func main() {
 		}
 	}
 
+	trustedPoHAttestors, err := parsePoHAttestorKeys(*pohAttestorKeys)
+	if err != nil {
+		log.Fatalf("parse -poh-attestor-keys: %v", err)
+	}
+	if len(trustedPoHAttestors) == 0 {
+		log.Println("no -poh-attestor-keys configured: Kind NFTMint will reject every attempt, so no wallet can newly qualify for real governance voting eligibility on this node")
+	}
+
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, mempool, pk, sk, *sentinelFlag, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, mempool, pk, sk, *sentinelFlag, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {
@@ -254,6 +264,30 @@ func main() {
 // doesn't resolve — start the first node (or run `wallet zk-setup`)
 // alone to generate it once, then point every other node/wallet at the
 // resulting file.
+// parsePoHAttestorKeys decodes -poh-attestor-keys's comma-separated,
+// hex-encoded Dilithium public keys into the real trusted-attestor set
+// Kind NFTMint checks a proof-of-humanity attestation's signer against.
+// An empty string is a real, valid, fail-closed configuration (no
+// attestor trusted yet), not an error.
+func parsePoHAttestorKeys(csv string) ([]crypto.DilithiumPublicKey, error) {
+	if csv == "" {
+		return nil, nil
+	}
+	var out []crypto.DilithiumPublicKey
+	for _, part := range strings.Split(csv, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		b, err := hex.DecodeString(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex attestor key %q: %w", part, err)
+		}
+		out = append(out, crypto.DilithiumPublicKey(b))
+	}
+	return out, nil
+}
+
 func loadOrCreateZKSystem(path string) (*zk.System, error) {
 	if path == "" {
 		log.Println("running Groth16 trusted setup (development setup, unshared — see pkg/zk doc for the production-ceremony requirement)...")

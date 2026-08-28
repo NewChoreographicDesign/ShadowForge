@@ -5,6 +5,21 @@
 // transactions as TxOffer messages, simulating real wallet traffic without
 // needing a full ZK proving setup (Kind Transfer requires the Groth16
 // trusted setup; Vote does not).
+//
+// A real, disclosed limitation as of this build's real voter-eligibility
+// check (pkg/tx's requireEligibleVoter, closing a real Sybil-voting gap):
+// every ballot this tool casts will now be rejected by any node that
+// enforces it, since submitRandomVote's fresh, throwaway-per-session
+// identity (see that function's own doc on why that's deliberate) never
+// holds a real, PoH-verified ValidatorNFT. This tool still exercises the
+// real commit-reveal wire mechanics and signature checks end to end —
+// useful for load/liveness testing the pipeline's earlier stages — but
+// no longer demonstrates a ballot actually being tallied. Giving it a
+// persistent, pre-minted identity would fix that at the cost of the
+// very throwaway-identity behavior it exists to model; this reference
+// build leaves that tension for whoever wires a real anonymous
+// eligibility proof (see pkg/tx's own doc on TxVote) rather than
+// resolving it here.
 package main
 
 import (

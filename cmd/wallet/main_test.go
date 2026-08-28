@@ -7,6 +7,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -282,6 +283,14 @@ type testBackend struct {
 	v1pk crypto.DilithiumPublicKey
 	v1sk crypto.DilithiumPrivateKey
 	logf func(format string, args ...any)
+
+	// attestorKeystorePath is a real, saved walletkey.Keystore this
+	// backend's pipeline trusts as a proof-of-humanity attestor — tests
+	// mint real NFTs through the actual 'wallet poh-attest'/'wallet
+	// nft-mint' CLI commands using it, before exercising anything that
+	// now needs real voter eligibility.
+	attestorKeystorePath       string
+	attestorKeystorePassphrase string
 }
 
 func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *zk.Tree, zkRoots *zk.RootHistory) *testBackend {
@@ -299,12 +308,14 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	if err != nil {
 		t.Fatalf("open chain: %v", err)
 	}
+	attestorPath, attestorKS := newTestKeystore(t, "attestor-passphrase")
 	pipeline := tx.NewPipeline(tx.Deps{
-		Store:     store,
-		StateTree: state.NewMerkleTree(),
-		ZK:        zkSys,
-		ZKTree:    zkTree,
-		ZKRoots:   zkRoots,
+		Store:               store,
+		StateTree:           state.NewMerkleTree(),
+		ZK:                  zkSys,
+		ZKTree:              zkTree,
+		ZKRoots:             zkRoots,
+		TrustedPoHAttestors: []crypto.DilithiumPublicKey{attestorKS.PublicKey()},
 	})
 
 	v1pk, v1sk, err := crypto.GenerateDilithiumKey()
@@ -313,7 +324,10 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	}
 	v1id := types.NFTID(types.SumHash(v1pk))
 
-	b := &testBackend{store: store, chn: chn, pipeline: pipeline, v1id: v1id, v1pk: v1pk, v1sk: v1sk, logf: t.Logf}
+	b := &testBackend{
+		store: store, chn: chn, pipeline: pipeline, v1id: v1id, v1pk: v1pk, v1sk: v1sk, logf: t.Logf,
+		attestorKeystorePath: attestorPath, attestorKeystorePassphrase: "attestor-passphrase",
+	}
 
 	h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
 	if err != nil {
@@ -377,9 +391,59 @@ func (b *testBackend) handle(_ peer.ID, env shadownet.Envelope) {
 	}
 }
 
+// mustExtractFlagValue parses one "  -flagName value" line out of a real
+// CLI command's captured stdout — real output format, not a mock.
+func mustExtractFlagValue(t *testing.T, output, flagName string) string {
+	t.Helper()
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, flagName+" ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, flagName))
+		}
+	}
+	t.Fatalf("expected output to contain %s, got:\n%s", flagName, output)
+	return ""
+}
+
+// mintNFTViaCLI drives the real, two-role CLI flow end to end: backend's
+// real trusted attestor keystore signs a real attestation via 'wallet
+// poh-attest', and the requester submits it via 'wallet nft-mint' —
+// proving both new commands work together against a real running
+// backend, not just that each independently doesn't error.
+func mintNFTViaCLI(t *testing.T, backend *testBackend, requesterPK crypto.DilithiumPublicKey, requesterPath, requesterPassphrase string) {
+	t.Helper()
+	owner := types.AddressFromPubkey(requesterPK)
+	const nonce = 1
+
+	withStdin(t, backend.attestorKeystorePassphrase)
+	out, err := captureStdout(t, func() error {
+		return runPoHAttest([]string{
+			"-keystore", backend.attestorKeystorePath, "-passphrase-stdin",
+			"-owner", hex.EncodeToString(owner[:]), "-nonce", fmt.Sprintf("%d", nonce),
+		})
+	})
+	if err != nil {
+		t.Fatalf("runPoHAttest: %v", err)
+	}
+
+	withStdin(t, requesterPassphrase)
+	err = runNFTMint([]string{
+		"-keystore", requesterPath, "-passphrase-stdin",
+		"-nonce", fmt.Sprintf("%d", nonce),
+		"-attestation-issued-at-ms", mustExtractFlagValue(t, out, "-attestation-issued-at-ms"),
+		"-attestor-pubkey", mustExtractFlagValue(t, out, "-attestor-pubkey"),
+		"-attestation-sig", mustExtractFlagValue(t, out, "-attestation-sig"),
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runNFTMint: %v", err)
+	}
+}
+
 func TestCLIVoteAndVoteRevealEndToEnd(t *testing.T) {
 	backend := newTestBackend(t, 0x01, nil, nil, nil)
-	path, _ := newTestKeystore(t, "vote-passphrase")
+	path, ks := newTestKeystore(t, "vote-passphrase")
+	mintNFTViaCLI(t, backend, ks.PublicKey(), path, "vote-passphrase")
 
 	withStdin(t, "vote-passphrase")
 	err := runVote([]string{
@@ -401,8 +465,8 @@ func TestCLIVoteAndVoteRevealEndToEnd(t *testing.T) {
 		t.Fatalf("runVoteReveal: %v", err)
 	}
 
-	if backend.chn.HeadHeight() != 2 {
-		t.Fatalf("expected 2 real committed blocks (vote + reveal), got height %d", backend.chn.HeadHeight())
+	if backend.chn.HeadHeight() != 3 {
+		t.Fatalf("expected 3 real committed blocks (nft-mint + vote + reveal), got height %d", backend.chn.HeadHeight())
 	}
 }
 
@@ -442,6 +506,29 @@ func TestCLINFTTraitEndToEnd(t *testing.T) {
 	}
 	if backend.chn.HeadHeight() != 1 {
 		t.Fatalf("expected 1 real committed block, got height %d", backend.chn.HeadHeight())
+	}
+}
+
+// TestCLIVoteRejectedWithoutRealNFT is the CLI-level proof of the same
+// real Sybil-voting fix TestPipelineVoteRejectsUnmintedWallet covers at
+// the pipeline layer: a real 'wallet vote' submission from a keystore
+// that never ran 'wallet nft-mint' must be rejected by a real running
+// backend, not silently accepted.
+func TestCLIVoteRejectedWithoutRealNFT(t *testing.T) {
+	backend := newTestBackend(t, 0x05, nil, nil, nil)
+	path, _ := newTestKeystore(t, "no-nft-passphrase")
+
+	withStdin(t, "no-nft-passphrase")
+	err := runVote([]string{
+		"-keystore", path, "-passphrase-stdin",
+		"-proposal", "cli-sybil-proposal", "-approve",
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "3s",
+	})
+	if err == nil {
+		t.Fatalf("expected a vote from a wallet with no minted NFT to be rejected")
+	}
+	if backend.chn.HeadHeight() != 0 {
+		t.Fatalf("expected no block to have been committed, got height %d", backend.chn.HeadHeight())
 	}
 }
 
