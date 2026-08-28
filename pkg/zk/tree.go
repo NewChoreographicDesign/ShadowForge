@@ -48,6 +48,16 @@ func (t *Tree) Insert(commitment FieldElement) (int, error) {
 	return idx, nil
 }
 
+// Remaining reports how many more commitments this Tree can accept
+// before ErrTreeFull. A real caller that must insert several commitments
+// as one atomic unit (pkg/tx's pipeline commits every output of one
+// transaction together) checks this first, so a transaction whose
+// outputs wouldn't all fit is rejected outright — before any of its
+// outputs are inserted — rather than partially applied.
+func (t *Tree) Remaining() int {
+	return TreeSize - t.used
+}
+
 func (t *Tree) reader() *bytes.Buffer {
 	var buf bytes.Buffer
 	for _, l := range t.leaves {

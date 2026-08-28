@@ -164,6 +164,17 @@ type Node struct {
 	zkSys   *zk.System
 	vlt     *vault.Vault
 	chn     *chain.Chain
+	// zkTree/zkRoots are the real, canonical BN254/MiMC commitment tree
+	// and its historical root set (zk.RootHistory) — the closed gap that
+	// used to let a Transfer proof anchor to any root the prover claimed,
+	// verified for internal consistency but never checked against what
+	// the network actually committed. Constructed internally, not a
+	// NewNode parameter: like governanceParams below, this is the node's
+	// own consensus-derived runtime state, built fresh (matching tree's
+	// own fresh-per-process construction above) rather than an external
+	// dependency a caller configures.
+	zkTree  *zk.Tree
+	zkRoots *zk.RootHistory
 	// oracleQuorum is the real quorum-verified price/ATR feed the pipeline
 	// cross-checks BankDeposit/BankWithdraw claims against (spec 11.3). Nil
 	// disables the cross-check entirely (e.g. a local test network with no
@@ -243,6 +254,18 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 	if logf == nil {
 		logf = log.Printf
 	}
+	zkTree := zk.NewTree()
+	initialRoot, err := zkTree.Root()
+	if err != nil {
+		// A fresh, fully-zero-padded tree computing its root is a pure,
+		// deterministic operation with no I/O or randomness — this
+		// should be unreachable. If it somehow isn't, every node still
+		// needs to agree, so fall back to the deterministic zero value
+		// rather than letting divergent nodes seed different histories;
+		// NewNode's signature has no error return to surface this
+		// through instead.
+		logf("validator: BUG: fresh zk.Tree root computation failed (%v); seeding RootHistory with the zero element", err)
+	}
 	n := &Node{
 		cfg:          cfg,
 		mempool:      mempool,
@@ -251,6 +274,8 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		zkSys:        zkSys,
 		vlt:          vlt,
 		chn:          chn,
+		zkTree:       zkTree,
+		zkRoots:      zk.NewRootHistory(initialRoot),
 		oracleQuorum: oracleQuorum,
 		governanceParams: func() *governance.Params {
 			p := governance.Default()

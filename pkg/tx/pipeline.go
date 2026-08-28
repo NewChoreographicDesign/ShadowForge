@@ -29,7 +29,20 @@ type Deps struct {
 	Store     state.Accessor
 	StateTree *state.MerkleTree
 	ZK        *zk.System
-	Vault     *vault.Vault
+	// ZKTree is the real, canonical BN254/MiMC commitment tree every
+	// honest node builds identically by inserting each committed
+	// Transfer's real output commitments in the same order (Stage 4
+	// below). Nil disables tree-membership bookkeeping entirely
+	// (existing tests that never submit a Transfer keep working
+	// unchanged).
+	ZKTree *zk.Tree
+	// ZKRoots is the historical root set Stage 1 checks a Transfer
+	// proof's claimed MerkleRoot against — see zk.RootHistory's own doc
+	// for the real gap this closes. Nil disables the check (existing
+	// tests keep working unchanged); wiring it is what makes Kind
+	// Transfer actually sound rather than merely internally consistent.
+	ZKRoots *zk.RootHistory
+	Vault   *vault.Vault
 	// Silent is spec 15.4's per-wallet rate monitor. Nil disables spike
 	// detection entirely (existing single-tx tests that don't care about
 	// it keep working unchanged); when set, Stage 2 records every
@@ -195,8 +208,19 @@ func (p *Pipeline) stage1SenderLeave(t *types.ShieldedTx) error {
 	if p.deps.ZK == nil {
 		return fmt.Errorf("no ZK system configured; cannot verify a Transfer proof")
 	}
+
+	rootElem := zk.FieldElementFromBytes32(pub.MerkleRoot)
+	if p.deps.ZKRoots != nil && !p.deps.ZKRoots.Contains(rootElem) {
+		// Checked before the expensive Groth16 verification below, both
+		// because it's the cheaper check and because it's real DoS
+		// resistance: a proof anchored to a root nobody ever produced is
+		// rejected without spending CPU on a proof that was never going
+		// to matter regardless of whether it verifies.
+		return fmt.Errorf("proof anchored to an unrecognized commitment tree root")
+	}
+
 	zkPub := zk.TransferPublic{
-		MerkleRoot: zk.FieldElementFromBytes32(pub.MerkleRoot),
+		MerkleRoot: rootElem,
 		Fee:        pub.FeeAmount,
 	}
 	for _, n := range pub.Nullifiers {
@@ -360,8 +384,35 @@ func (p *Pipeline) stage3ReceiverCheck(t *types.ShieldedTx) error {
 func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 	switch t.Kind {
 	case types.TxTransfer:
-		for _, c := range t.TransferPublicInputs.OutCommits {
+		outCommits := t.TransferPublicInputs.OutCommits
+		if p.deps.ZKTree != nil && p.deps.ZKTree.Remaining() < len(outCommits) {
+			// Checked before any mutation (of StateTree or ZKTree) so a
+			// transaction whose outputs wouldn't all fit is rejected
+			// outright, per the atomicity rule, rather than leaving a
+			// partially-inserted commitment behind for a transaction
+			// that ultimately fails.
+			return fmt.Errorf("canonical commitment tree has no room for %d more output commitment(s)", len(outCommits))
+		}
+		for _, c := range outCommits {
 			p.deps.StateTree.Append(c)
+		}
+		if p.deps.ZKTree != nil {
+			for _, c := range outCommits {
+				if _, err := p.deps.ZKTree.Insert(zk.FieldElementFromBytes32(c)); err != nil {
+					// Remaining() was already checked above under this
+					// same call's single-threaded processing, so reaching
+					// here would mean that invariant broke somewhere —
+					// fail loudly rather than silently proceed.
+					return fmt.Errorf("insert output commitment into canonical tree: %w", err)
+				}
+			}
+			if p.deps.ZKRoots != nil {
+				newRoot, err := p.deps.ZKTree.Root()
+				if err != nil {
+					return fmt.Errorf("compute canonical tree root: %w", err)
+				}
+				p.deps.ZKRoots.Record(newRoot)
+			}
 		}
 
 	case types.TxBankDeposit, types.TxBankWithdraw:
