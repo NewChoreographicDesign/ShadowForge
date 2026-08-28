@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
+	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
 
 // voteNonceDomain separates the deterministic vote-nonce derivation below
@@ -88,6 +89,73 @@ func (b *Builder) Vote(proposalID types.ID, approve bool, paramKey, newValue str
 		Nullifier: types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("commit")),
 	}
 	return b.finalize(t)
+}
+
+// ProposeMint is Vote's real spec-17.4 epoch-mint counterpart: it casts
+// a real sealed ballot for proposalID exactly like Vote does, and also
+// binds it to a real, Groth16-proven request to mint amount SFG on the
+// "direct with 10 percent fee" proposer path (see types.
+// VotePublicInputs.MintAmount's own doc for why this build implements
+// only that path, not the spec's staked-yield alternative). Like
+// ParamKey/NewValue, the mint claim only matters on the first Vote/
+// ProposeMint call to ever reference proposalID; the pipeline verifies
+// it once, right there, and ignores a later caller's own claim.
+//
+// sys must be the exact same real, shared zk.MintSystem every validator
+// verifying this proposal loads (mirroring every other real proof this
+// package or pkg/shieldedwallet builds — see 'wallet mint-zk-setup').
+// amount must be > 0. Returns the real zk.NoteSecret opening the
+// resulting output note (MintOutCommit) alongside the transaction: this
+// package never persists anything (see the package doc), so the caller
+// alone is responsible for remembering it — it is the only way to ever
+// spend the minted value later, exactly like remembering a Transfer's
+// own change note.
+func (b *Builder) ProposeMint(proposalID types.ID, approve bool, amount uint64, sys *zk.MintSystem, eligibility types.VoteEligibilityProof) (types.ShieldedTx, zk.NoteSecret, error) {
+	if proposalID == "" {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: proposal id must not be empty")
+	}
+	if amount == 0 {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: mint amount must be greater than 0")
+	}
+	ownerSK, err := zk.NewSpendKey()
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: generate mint note owner key: %w", err)
+	}
+	rho, err := zk.NewRho()
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: generate mint note rho: %w", err)
+	}
+	secret := zk.NoteSecret{Value: types.MintNetAmount(amount), OwnerSK: ownerSK, Rho: rho}
+
+	proof, err := sys.Prove(secret)
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: prove mint: %w", err)
+	}
+	proofBytes, err := zk.ProofToBytes(proof)
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, fmt.Errorf("txbuilder: serialize mint proof: %w", err)
+	}
+
+	nonce := voteNonce(proposalID, eligibility.Nullifier)
+	commitment := types.ComputeVoteCommitment(eligibility.Nullifier, approve, nonce)
+
+	t := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID:    proposalID,
+			Commitment:    commitment,
+			MintAmount:    amount,
+			MintOutCommit: types.Hash(zk.ToBytes32(secret.Commitment())),
+			MintProof:     proofBytes,
+		},
+		VoteEligibility: &eligibility,
+		Nullifier:       types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("mint-commit")),
+	}
+	finalized, err := b.finalize(t)
+	if err != nil {
+		return types.ShieldedTx{}, zk.NoteSecret{}, err
+	}
+	return finalized, secret, nil
 }
 
 // VoteReveal opens the sealed ballot Vote(proposalID, approve, ...)

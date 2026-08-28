@@ -18,11 +18,49 @@ func ComputeTxID(proof []byte, commitments []Hash, nullifier Hash) Hash {
 	return SumHash(parts...)
 }
 
+// MintFeeNumerator/MintFeeDenominator implement spec 17.4's "direct with
+// 10 percent fee" proposer path as an exact integer fraction — a fixed
+// protocol constant, not a governance.Params field: spec 22's genesis-
+// defaults table lists no such parameter, unlike the ATR multiples or
+// Vault splits it does list as governance-adjustable, so this build
+// treats it the same way as governance.MinTurnout (see that constant's
+// own doc for the identical reasoning).
+const (
+	MintFeeNumerator   = 1
+	MintFeeDenominator = 10
+)
+
+// MintNetAmount returns the real, exact SFG amount a passed mint
+// proposal's direct-with-fee path (spec 17.4) delivers to the
+// proposer's own new output note after the Vault's cut. Integer floor
+// division: an amount that doesn't divide evenly rounds the fee down,
+// so the newly-minted note — never the Vault — gets the extra unit,
+// consistent with this build's exact-integer approach to fee math
+// elsewhere (no fabricated fractional SFG). MintFeeAmount is the exact
+// complement the Vault collects.
+func MintNetAmount(amount uint64) uint64 {
+	return amount - MintFeeAmount(amount)
+}
+
+func MintFeeAmount(amount uint64) uint64 {
+	return amount * MintFeeNumerator / MintFeeDenominator
+}
+
 // TxKind enumerates the kinds a ShieldedTx can be (spec 4.2).
 type TxKind uint8
 
 const (
 	TxTransfer TxKind = iota
+	// TxMint predates this build's real spec-17.4 epoch-mint mechanism
+	// and is not it: pkg/tx's pipeline accepts a well-formed TxMint (no
+	// MintPublicInputs structure exists for it) but it has never had any
+	// effect, and the real mechanism now lives entirely in TxVote — see
+	// VotePublicInputs.MintAmount's own doc. TxMint is kept, unchanged,
+	// as an inert, already-tested no-op kind rather than removed, since
+	// real callers (txbuilder.Builder.Mint, and tests proving a
+	// no-effect kind still round-trips TxID/signature checks correctly)
+	// already depend on that exact behavior; it is not a request to
+	// mint anything, real or otherwise.
 	TxMint
 	TxVote
 	TxBankDeposit
@@ -184,6 +222,34 @@ type VotePublicInputs struct {
 	// direct protocol effect (a plain up/down vote).
 	ParamKey string
 	NewValue string // decimal literal, e.g. "0.03" — see governance.ApplyParamChange
+
+	// MintAmount/MintOutCommit/MintProof optionally bind this proposal to
+	// a real spec-17.4 epoch mint (the "direct with 10 percent fee"
+	// proposer path — see MintNetAmount's own doc; this build does not
+	// implement the spec's staked-2%-yield alternative, a real, disclosed
+	// scope cut, not a silent omission). Like ParamKey/NewValue, they are
+	// only meaningful — and only ever checked — on the first TxVote to
+	// reference a given ProposalID: pkg/tx's Stage 4 verifies MintProof
+	// once, at that first vote, and rejects the vote outright if it
+	// doesn't real-and-truly bind MintOutCommit to MintAmount (pkg/zk.
+	// MintSystem); every later voter's own claims are ignored, exactly
+	// like ParamKey/NewValue. MintAmount == 0 means this proposal
+	// requests no mint (a plain up/down vote, or a ParamKey change).
+	//
+	// MintOutCommit is a real shielded note commitment for MintNetAmount
+	// (Amount minus the Vault's fee) — the same commitment formula every
+	// other note in this codebase uses (zk.NoteSecret.Commitment()) — so
+	// once this proposal passes and is tallied, MintOutCommit becomes a
+	// real, spendable note in the canonical tree, exactly like a
+	// Transfer's own output commitments. The proposer alone knows this
+	// note's real opening (they built it), so no separate discovery
+	// mechanism is needed for them to later spend it — a real, disclosed
+	// limitation: an observer other than the proposer has no automatic
+	// way to learn this note exists via wallet sync (see pkg/tx's Stage 4
+	// TxVote case for the full disclosure).
+	MintAmount    uint64
+	MintOutCommit Hash
+	MintProof     []byte // gnark Groth16 proof bytes (pkg/zk.MintSystem)
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

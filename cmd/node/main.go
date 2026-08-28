@@ -72,6 +72,8 @@ func main() {
 	zkParamsPath := flag.String("zk-params", "", "path to a shared Groth16 parameters file (pkg/zk.System.WriteTo's format). If it exists, load it; if not, run a fresh trusted setup and write it there for other nodes/wallets to load. Empty (the default) runs an independent, unshared setup — fine for a single node, but a proof any wallet builds will never verify here unless every party loads the exact same params file (see 'wallet zk-setup' to generate one)")
 	skipEligibilityZK := flag.Bool("skip-eligibility-zk-setup", false, "skip the anonymous voter-eligibility Groth16 trusted setup (TxVote/TxVoteReveal will be rejected — no wallet can vote at all on this node, not even anonymously)")
 	eligibilityZKParamsPath := flag.String("eligibility-zk-params", "", "path to a shared Groth16 parameters file for the anonymous voter-eligibility circuit (pkg/zk.EligibilitySystem.WriteTo's format; a distinct file from -zk-params — different circuit, different keys). Same load-or-create-and-share behavior as -zk-params; see 'wallet eligibility-zk-setup' to generate one")
+	skipMintZK := flag.Bool("skip-mint-zk-setup", false, "skip the real spec-17.4 epoch-mint Groth16 trusted setup (a TxVote binding a mint claim will be rejected — ordinary up/down and ParamKey votes are unaffected)")
+	mintZKParamsPath := flag.String("mint-zk-params", "", "path to a shared Groth16 parameters file for the epoch-mint circuit (pkg/zk.MintSystem.WriteTo's format; a distinct file from -zk-params/-eligibility-zk-params — different circuit, different keys). Same load-or-create-and-share behavior; see 'wallet mint-zk-setup' to generate one")
 	announceFile := flag.String("announce-file", "", "write this node's dialable multiaddr to this path once listening (for peer discovery over a shared volume, e.g. Docker Compose)")
 	bootstrapFile := flag.String("bootstrap-file", "", "comma-separated paths to wait for and read bootstrap multiaddrs from (pairs with -announce-file on other nodes) — a full mesh among validators needs one entry per peer, since this reference build doesn't relay heartbeats or messages beyond directly connected peers")
 	keyFile := flag.String("key-file", "", "path to this node's persisted Dilithium identity keypair (empty = generate a fresh, ephemeral identity every start)")
@@ -126,6 +128,16 @@ func main() {
 		}
 	} else {
 		log.Println("skipping eligibility ZK setup: TxVote/TxVoteReveal transactions will be rejected fail-closed")
+	}
+
+	var mintZK *zk.MintSystem
+	if !*skipMintZK {
+		mintZK, err = loadOrCreateMintZKSystem(*mintZKParamsPath)
+		if err != nil {
+			log.Fatalf("mint zk setup: %v", err)
+		}
+	} else {
+		log.Println("skipping mint ZK setup: a TxVote binding a real epoch-mint claim will be rejected (ordinary votes are unaffected)")
 	}
 
 	v := vault.New(vault.DefaultSplits())
@@ -195,7 +207,7 @@ func main() {
 	}
 
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mempool, pk, sk, *sentinelFlag, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mintZK, mempool, pk, sk, *sentinelFlag, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {
@@ -386,6 +398,54 @@ func loadOrCreateEligibilityZKSystem(path string) (*zk.EligibilitySystem, error)
 	defer func() { _ = f.Close() }()
 	if _, err := sys.WriteTo(f); err != nil {
 		return nil, fmt.Errorf("write eligibility zk params file %s: %w", path, err)
+	}
+	return sys, nil
+}
+
+// loadOrCreateMintZKSystem is loadOrCreateEligibilityZKSystem's
+// counterpart for the real spec-17.4 epoch-mint circuit
+// (pkg/zk.MintCircuit) — a distinct circuit from both TransferCircuit
+// and EligibilityCircuit, so it needs its own, separately-shared
+// proving/verifying keys and params file.
+func loadOrCreateMintZKSystem(path string) (*zk.MintSystem, error) {
+	if path == "" {
+		log.Println("running Groth16 trusted setup for the real epoch-mint circuit (development setup, unshared — see pkg/zk doc for the production-ceremony requirement)...")
+		start := time.Now()
+		sys, err := zk.SetupMint()
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("mint zk setup complete in %s", time.Since(start))
+		return sys, nil
+	}
+
+	if f, err := os.Open(path); err == nil {
+		defer func() { _ = f.Close() }()
+		sys, err := zk.ReadMintSystem(f)
+		if err != nil {
+			return nil, fmt.Errorf("load mint zk params from %s: %w", path, err)
+		}
+		log.Printf("loaded shared mint Groth16 params from %s", path)
+		return sys, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read mint zk params file %s: %w", path, err)
+	}
+
+	log.Printf("running Groth16 trusted setup for the real epoch-mint circuit (development setup — see pkg/zk doc for the production-ceremony requirement) and saving it to %s for other nodes/wallets to share...", path)
+	start := time.Now()
+	sys, err := zk.SetupMint()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("mint zk setup complete in %s", time.Since(start))
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create mint zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return nil, fmt.Errorf("write mint zk params file %s: %w", path, err)
 	}
 	return sys, nil
 }

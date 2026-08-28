@@ -52,6 +52,8 @@ func main() {
 		err = runVote(args)
 	case "vote-reveal":
 		err = runVoteReveal(args)
+	case "propose-mint":
+		err = runProposeMint(args)
 	case "mint":
 		err = runMint(args)
 	case "nft-trait":
@@ -68,6 +70,8 @@ func main() {
 		err = runZKSetup(args)
 	case "eligibility-zk-setup":
 		err = runEligibilityZKSetup(args)
+	case "mint-zk-setup":
+		err = runMintZKSetup(args)
 	case "poh-attest":
 		err = runPoHAttest(args)
 	case "nft-mint":
@@ -108,25 +112,48 @@ its own real means, and hands you the resulting flags:
   wallet nft-mint   -keystore <file> -bootstrap <addr> -query <url> -nonce <n> -attestation-issued-at-ms <n> -attestor-pubkey <hex> -attestation-sig <hex>
 
 Submit a real, signed, no-proof transaction (needs a bootstrap peer to
-broadcast to, and a query endpoint to confirm against). Vote/vote-reveal
-require a real, minted NFT (see 'wallet nft-mint' above) and prove it
-anonymously — a real zero-knowledge membership proof, not a formality,
-and needing its own one-time shared setup (like 'wallet zk-setup' below,
-but a separate circuit and file):
+broadcast to, and a query endpoint to confirm against). Vote/vote-reveal/
+propose-mint require a real, minted NFT (see 'wallet nft-mint' above) and
+prove it anonymously — a real zero-knowledge membership proof, not a
+formality, and needing its own one-time shared setup (like 'wallet
+zk-setup' below, but a separate circuit and file):
   wallet eligibility-zk-setup -out <file>
   wallet vote          -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve -eligibility-zk-params <file>
   wallet vote-reveal    -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve -eligibility-zk-params <file>
-  wallet mint           -keystore <file> -bootstrap <addr> -query <url>
   wallet nft-trait      -keystore <file> -bootstrap <addr> -query <url> -target <hex> -key <string> -delta <int>
   wallet bank-deposit    -keystore <file> -bootstrap <addr> -query <url> -asset SFG
   wallet bank-withdraw   -keystore <file> -bootstrap <addr> -query <url> -asset SFG
 
-'vote'/'vote-reveal' sign the transaction itself with a fresh, throwaway
-key — never the keystore identity that minted the NFT — and prove
-eligibility instead via a real anonymous ZK proof built by syncing that
-keystore's minted NFT from the live network (pkg/govwallet). An observer
-of the resulting transaction learns only that some real, minted NFT
-voted, never which one.
+'vote'/'vote-reveal'/'propose-mint' sign the transaction itself with a
+fresh, throwaway key — never the keystore identity that minted the NFT —
+and prove eligibility instead via a real anonymous ZK proof built by
+syncing that keystore's minted NFT from the live network (pkg/govwallet).
+An observer of the resulting transaction learns only that some real,
+minted NFT voted, never which one.
+
+Real spec-17.4 epoch mint (the "direct with 10 percent fee" proposer
+path — this build has no staking subsystem, so the spec's alternative
+staked-yield path is not implemented): submitting a proposal both casts
+its own first ballot and binds a real Groth16-proven mint request; other
+holders approve/reject it with ordinary 'vote'/'vote-reveal' against the
+same -proposal id. Needs its own one-time shared setup, like
+eligibility above:
+  wallet mint-zk-setup -out <file>
+  wallet propose-mint -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -amount <n> -eligibility-zk-params <file> -mint-zk-params <file>
+Once tallied, check 'wallet proposal -id <id>' for real Passed/
+MintApplied status. The proposer alone knows the minted note's real
+opening (they built it), so, like a shielded transfer's own bootstrap
+gap, this build has no wallet-sync mechanism to auto-discover somebody
+else's mint; save what propose-mint prints — it is the only record of
+that note's opening this build ever produces. ('wallet note' does not
+verify this: this build's note-existence index is only ever populated
+by a wallet's own optional PutNote call, which nothing in this CLI — for
+Transfer's own outputs either — currently makes, a real, separate,
+pre-existing gap rather than one this fix introduces.)
+
+  wallet mint -keystore <file> -bootstrap <addr> -query <url>
+'wallet mint' is a different, older, and now-vestigial no-op kind — not
+the real mint mechanism above; see types.TxMint's own doc.
 
 Real shielded transfers (Kind Transfer — a genuine Groth16 proof; needs
 a shared params file every validator and wallet load identically — run

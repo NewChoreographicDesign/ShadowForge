@@ -192,18 +192,27 @@ type Proposal struct {
 	Reject     int
 	Passed     bool
 	Applied    bool
+	// MintAmount/MintOutCommit/MintApplied are a real spec-17.4 epoch
+	// mint's bound claim and execution status — see types.
+	// VotePublicInputs.MintAmount's own doc.
+	MintAmount    uint64
+	MintOutCommit string
+	MintApplied   bool
 }
 
 type proposalResponse struct {
-	ProposalID string `json:"proposal_id"`
-	Epoch      uint64 `json:"epoch"`
-	ParamKey   string `json:"param_key,omitempty"`
-	NewValue   string `json:"new_value,omitempty"`
-	Tallied    bool   `json:"tallied"`
-	Approve    int    `json:"approve"`
-	Reject     int    `json:"reject"`
-	Passed     bool   `json:"passed"`
-	Applied    bool   `json:"applied"`
+	ProposalID    string `json:"proposal_id"`
+	Epoch         uint64 `json:"epoch"`
+	ParamKey      string `json:"param_key,omitempty"`
+	NewValue      string `json:"new_value,omitempty"`
+	Tallied       bool   `json:"tallied"`
+	Approve       int    `json:"approve"`
+	Reject        int    `json:"reject"`
+	Passed        bool   `json:"passed"`
+	Applied       bool   `json:"applied"`
+	MintAmount    uint64 `json:"mint_amount,omitempty"`
+	MintOutCommit string `json:"mint_out_commit,omitempty"`
+	MintApplied   bool   `json:"mint_applied"`
 }
 
 func (p proposalResponse) toProposal() Proposal { return Proposal(p) }

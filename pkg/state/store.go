@@ -331,6 +331,19 @@ type ProposalRecord struct {
 	ParamKey string
 	NewValue string
 
+	// MintAmount/MintOutCommit are a real spec-17.4 epoch mint's bound
+	// claim, taken from whichever TxVote first referenced ProposalID —
+	// see types.VotePublicInputs' own doc. MintAmount == 0 means this
+	// proposal requests no mint. MintApplied mirrors Applied, but for the
+	// mint execution step (real note-commitment insertion into the
+	// canonical tree plus Vault fee collection): kept distinct from
+	// Passed for the identical reason Applied is — TallyDueProposals only
+	// ever visits an untallied proposal once, so this is the durable
+	// record of whether that step already ran.
+	MintAmount    uint64
+	MintOutCommit types.Hash
+	MintApplied   bool
+
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch
 	// moves past this proposal's own Epoch. Turnout isn't recorded here:

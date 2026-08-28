@@ -33,6 +33,23 @@ func getTestEligibilitySystem(t *testing.T) *zk.EligibilitySystem {
 	return testEligSys
 }
 
+// testMintSystem is likewise expensive to Setup; build it once for the
+// whole package's tests.
+var (
+	testMintOnce sync.Once
+	testMintSys  *zk.MintSystem
+	testMintErr  error
+)
+
+func getTestMintSystem(t *testing.T) *zk.MintSystem {
+	t.Helper()
+	testMintOnce.Do(func() { testMintSys, testMintErr = zk.SetupMint() })
+	if testMintErr != nil {
+		t.Fatalf("mint zk setup: %v", testMintErr)
+	}
+	return testMintSys
+}
+
 // These are white-box tests (package validator, not validator_test): they
 // call unexported methods (handleBlockProposal, handleStageVote,
 // tryFinalize, sweepTimeouts, recordOnline) directly to exercise the
@@ -97,7 +114,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		OnlineTimeout:     time.Minute,
 		Genesis:           consensus.GenesisTime(genesisMs),
 	}
-	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), mempool, pk, sk, false, testLogf(t))
+	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), getTestMintSystem(t), mempool, pk, sk, false, testLogf(t))
 }
 
 type peerKey struct {

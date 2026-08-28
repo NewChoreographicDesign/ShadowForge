@@ -3,6 +3,8 @@ package query
 import (
 	"net/http"
 	"strconv"
+
+	"github.com/shadowforge/shadowforge-l1/pkg/state"
 )
 
 // statusResponse answers /v1/status.
@@ -185,6 +187,22 @@ type proposalResponse struct {
 	Reject     int    `json:"reject"`
 	Passed     bool   `json:"passed"`
 	Applied    bool   `json:"applied"`
+	// MintAmount/MintOutCommit/MintApplied are a real spec-17.4 epoch
+	// mint's bound claim and execution status — see types.
+	// VotePublicInputs.MintAmount's own doc. MintOutCommit is safe to
+	// expose here: it's already public the moment the binding TxVote
+	// itself is gossiped, long before any tally, so this read-only
+	// aggregate endpoint isn't a new leak.
+	MintAmount    uint64 `json:"mint_amount,omitempty"`
+	MintOutCommit string `json:"mint_out_commit,omitempty"`
+	MintApplied   bool   `json:"mint_applied"`
+}
+
+func mintOutCommitJSON(p state.ProposalRecord) string {
+	if p.MintAmount == 0 {
+		return ""
+	}
+	return p.MintOutCommit.String()
 }
 
 func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
@@ -204,15 +222,18 @@ func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, proposalResponse{
-		ProposalID: p.ProposalID,
-		Epoch:      p.Epoch,
-		ParamKey:   p.ParamKey,
-		NewValue:   p.NewValue,
-		Tallied:    p.Tallied,
-		Approve:    p.Approve,
-		Reject:     p.Reject,
-		Passed:     p.Passed,
-		Applied:    p.Applied,
+		ProposalID:    p.ProposalID,
+		Epoch:         p.Epoch,
+		ParamKey:      p.ParamKey,
+		NewValue:      p.NewValue,
+		Tallied:       p.Tallied,
+		Approve:       p.Approve,
+		Reject:        p.Reject,
+		Passed:        p.Passed,
+		Applied:       p.Applied,
+		MintAmount:    p.MintAmount,
+		MintOutCommit: mintOutCommitJSON(p),
+		MintApplied:   p.MintApplied,
 	})
 }
 
@@ -226,15 +247,18 @@ func (s *Server) handleProposals(w http.ResponseWriter, r *http.Request) {
 	out := make([]proposalResponse, 0, len(list))
 	for _, p := range list {
 		out = append(out, proposalResponse{
-			ProposalID: p.ProposalID,
-			Epoch:      p.Epoch,
-			ParamKey:   p.ParamKey,
-			NewValue:   p.NewValue,
-			Tallied:    p.Tallied,
-			Approve:    p.Approve,
-			Reject:     p.Reject,
-			Passed:     p.Passed,
-			Applied:    p.Applied,
+			ProposalID:    p.ProposalID,
+			Epoch:         p.Epoch,
+			ParamKey:      p.ParamKey,
+			NewValue:      p.NewValue,
+			Tallied:       p.Tallied,
+			Approve:       p.Approve,
+			Reject:        p.Reject,
+			Passed:        p.Passed,
+			Applied:       p.Applied,
+			MintAmount:    p.MintAmount,
+			MintOutCommit: mintOutCommitJSON(p),
+			MintApplied:   p.MintApplied,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

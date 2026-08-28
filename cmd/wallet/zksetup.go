@@ -120,3 +120,58 @@ func loadEligibilitySystem(path string) (*zk.EligibilitySystem, error) {
 	}
 	return sys, nil
 }
+
+// runMintZKSetup is runZKSetup's counterpart for the real spec-17.4
+// epoch-mint circuit (pkg/zk.MintCircuit) — a separate Groth16 setup and
+// shared params file, since it's a distinct circuit from both
+// TransferCircuit and EligibilityCircuit and needs its own
+// proving/verifying keys every validator and minting wallet must agree
+// on.
+func runMintZKSetup(args []string) error {
+	fs := flag.NewFlagSet("mint-zk-setup", flag.ExitOnError)
+	out := fs.String("out", "mint-zk-params.bin", "where to write the real Groth16 parameters")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if _, err := os.Stat(*out); err == nil {
+		return fmt.Errorf("%s already exists — refusing to overwrite an existing, possibly already-shared params file", *out)
+	}
+
+	fmt.Println("running Groth16 trusted setup for the real epoch-mint circuit (development setup — see pkg/zk doc for the production-ceremony requirement)...")
+	start := time.Now()
+	sys, err := zk.SetupMint()
+	if err != nil {
+		return fmt.Errorf("mint zk setup: %w", err)
+	}
+	fmt.Printf("setup complete in %s\n", time.Since(start))
+
+	f, err := os.Create(*out)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", *out, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return fmt.Errorf("write %s: %w", *out, err)
+	}
+	fmt.Printf("wrote %s — point every validator node (-mint-zk-params) and every wallet propose-mint (-mint-zk-params) at this same file\n", *out)
+	return nil
+}
+
+// loadMintSystem loads real, previously-generated Groth16 parameters
+// for the mint circuit from path — see loadZKSystem's own doc for why
+// this must always be a shared file, never a fresh per-process setup.
+func loadMintSystem(path string) (*zk.MintSystem, error) {
+	if path == "" {
+		return nil, fmt.Errorf("-mint-zk-params is required: a wallet must prove against the exact same Groth16 parameters the network's validators verify against (run 'wallet mint-zk-setup' once to generate a shared params file if one doesn't exist yet)")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open mint zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	sys, err := zk.ReadMintSystem(f)
+	if err != nil {
+		return nil, fmt.Errorf("load mint zk params from %s: %w", path, err)
+	}
+	return sys, nil
+}

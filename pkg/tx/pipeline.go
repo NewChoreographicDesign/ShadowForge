@@ -110,7 +110,20 @@ type Deps struct {
 	EligibilityZK    *zk.EligibilitySystem
 	EligibilityTree  *zk.Tree
 	EligibilityRoots *zk.RootHistory
-	Now              func() time.Time
+	// MintZK verifies a real spec-17.4 epoch-mint proof
+	// (types.VotePublicInputs.MintProof) the moment a TxVote first binds
+	// a proposal to a mint claim (Stage 4) — never lazily at tally time,
+	// so a forged claim is rejected immediately rather than sitting in a
+	// real proposal record un-caught until an epoch boundary. Nil is NOT
+	// "mint checking disabled": a TxVote that actually carries a nonzero
+	// MintAmount is rejected outright if MintZK is nil, for the identical
+	// fail-closed reason EligibilityZK is — a nil-tolerant default here
+	// would let anyone claim an unverified mint amount. A TxVote that
+	// carries no mint claim at all (the overwhelming majority — ordinary
+	// up/down votes and ParamKey changes) is entirely unaffected either
+	// way.
+	MintZK *zk.MintSystem
+	Now    func() time.Time
 }
 
 func (d Deps) now() time.Time {
@@ -374,6 +387,14 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 		if t.VoteEligibility == nil {
 			return fmt.Errorf("vote tx missing real anonymous eligibility proof (VoteEligibility)")
 		}
+		if t.VotePublicInputs.MintAmount != 0 {
+			if len(t.VotePublicInputs.MintProof) == 0 {
+				return fmt.Errorf("vote tx claims a mint amount but is missing MintProof")
+			}
+			if t.VotePublicInputs.MintOutCommit.IsZero() {
+				return fmt.Errorf("vote tx claims a mint amount but MintOutCommit is empty")
+			}
+		}
 	case types.TxVoteReveal:
 		if t.VoteRevealPublicInputs == nil {
 			return fmt.Errorf("vote reveal tx missing public inputs")
@@ -544,6 +565,27 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 			return fmt.Errorf("proposal lookup: %w", err)
 		}
 		if !found {
+			// Real epoch-mint claim (spec 17.4), checked once, right
+			// here, at the exact point its claim becomes durable — not
+			// lazily at tally time — for the same reason every other
+			// real proof in this pipeline is checked at submission, not
+			// deferred: a forged claim must never be allowed to sit in a
+			// real proposal record un-caught. Only the first vote to
+			// reference this ProposalID binds what it does (types.
+			// VotePublicInputs' own doc) — a later voter's own MintAmount/
+			// MintOutCommit/MintProof are never consulted.
+			if pub.MintAmount != 0 {
+				if p.deps.MintZK == nil {
+					return fmt.Errorf("no mint ZK system configured; cannot verify a real epoch-mint claim")
+				}
+				mintPub := zk.MintPublic{
+					Amount:    types.MintNetAmount(pub.MintAmount),
+					OutCommit: zk.FieldElementFromBytes32(pub.MintOutCommit),
+				}
+				if err := p.deps.MintZK.VerifyPublicProofBytes(pub.MintProof, mintPub); err != nil {
+					return fmt.Errorf("mint proof invalid: %w", err)
+				}
+			}
 			record = state.ProposalRecord{
 				ProposalID:  string(pub.ProposalID),
 				Epoch:       p.deps.Epoch,
@@ -554,8 +596,10 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				// later voter's own ParamKey/NewValue are never
 				// consulted, since record is only mutated here on
 				// creation.
-				ParamKey: pub.ParamKey,
-				NewValue: pub.NewValue,
+				ParamKey:      pub.ParamKey,
+				NewValue:      pub.NewValue,
+				MintAmount:    pub.MintAmount,
+				MintOutCommit: pub.MintOutCommit,
 			}
 		}
 		if record.Tallied {
@@ -609,11 +653,10 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		}
 
 	case types.TxMint:
-		// A mint proposal is accepted into the pipeline (its
-		// well-formedness was already checked at Stage 2) but, like Vote,
-		// its effect — actually minting SFG — is an epoch-boundary
-		// decision (spec 17.4: "At epoch end, if votes pass ... SFG is
-		// minted"), not a per-transaction one. Nothing to apply here.
+		// Not the real spec-17.4 epoch-mint mechanism — see types.
+		// TxMint's own doc. Accepted (well-formedness already checked at
+		// Stage 2) but genuinely has no effect; the real mechanism is the
+		// TxVote case above, when VotePublicInputs.MintAmount != 0.
 
 	case types.TxContainerSync:
 		if t.ContainerID == nil || len(t.Commitments) == 0 {
@@ -846,13 +889,22 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 // on the running protocol (closing the gap where a tally's outcome was
 // persisted but never changed anything live); Deps.Governance == nil
 // skips this step entirely (existing tests that don't wire it up keep
-// working unchanged). It never mints SFG — that "proposer path chosen in
-// the App" (direct with a fee, or staked for yield) is a wallet/App-layer
-// choice this L1-core build doesn't implement (see README's Scope
-// section); slashing/unlock-transfer/container-asset proposal kinds are
-// tallied like any other but have no execution wired here either — see
-// governance.ProposalKind's own doc for the remaining kinds this build
-// does not yet apply.
+// working unchanged). A passed proposal bound to a real MintAmount (spec
+// 17.4's "direct with 10 percent fee" proposer path — see
+// types.VotePublicInputs.MintAmount's own doc) really does mint SFG now:
+// MintOutCommit — already proof-verified once, at Stage 4, when the
+// first vote bound it — is inserted into the same canonical tree a
+// Transfer's own outputs live in, becoming a real, spendable note, and
+// the Vault collects its real fee share (types.MintFeeAmount). The
+// spec's alternative "staked 2 percent yield path" is a real, disclosed
+// scope cut: this build has no staking subsystem at all, so only the
+// direct path is implemented — a mint proposal requests it or is not a
+// mint proposal. Deps.ZKTree == nil (never true on a real node) skips
+// this step the same way Deps.Governance == nil skips ParamKey
+// application. Slashing/unlock-transfer/container-asset proposal kinds
+// are tallied like any other but have no execution wired here either —
+// see governance.ProposalKind's own doc for the remaining kinds this
+// build does not yet apply.
 //
 // This runs deterministically off already-committed proposal state plus
 // the caller's own block Epoch, so every honest node reaches the same
@@ -895,6 +947,34 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 				record.Applied = true
 				if governance.IsVaultShareKey(record.ParamKey) && p.deps.Vault != nil {
 					p.deps.Vault.Splits = vault.SplitsFromParams(*p.deps.Governance)
+				}
+			}
+		}
+
+		if record.Passed && record.MintAmount > 0 {
+			// Real spec-17.4 mint execution: MintOutCommit's real Groth16
+			// proof was already verified once, at Stage 4, the moment
+			// this proposal's first vote bound it (see that case's own
+			// doc) — nothing here re-proves soundness, it only makes a
+			// governance-authorized amount of new SFG real by inserting
+			// the same commitment into the same canonical tree a
+			// Transfer's own output commitments live in, so it becomes a
+			// genuinely spendable note. ZKTree == nil (never true on a
+			// real node — see Deps.ZKTree's own doc) leaves MintApplied
+			// false, the durable signal this mint never actually
+			// executed, mirroring Applied's identical treatment above.
+			if p.deps.ZKTree != nil {
+				if _, err := p.deps.ZKTree.Insert(zk.FieldElementFromBytes32(record.MintOutCommit)); err == nil {
+					p.deps.StateTree.Append(record.MintOutCommit)
+					record.MintApplied = true
+					if p.deps.ZKRoots != nil {
+						if newRoot, rootErr := p.deps.ZKTree.Root(); rootErr == nil {
+							p.deps.ZKRoots.Record(newRoot)
+						}
+					}
+					if p.deps.Vault != nil {
+						p.deps.Vault.CollectFee(decimal.FromInt(int64(types.MintFeeAmount(record.MintAmount))))
+					}
 				}
 			}
 		}

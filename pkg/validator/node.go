@@ -190,6 +190,13 @@ type Node struct {
 	// EligibilityRoots' own doc).
 	eligibilityTree  *zk.Tree
 	eligibilityRoots *zk.RootHistory
+	// mintZK is the real Groth16 system for the spec-17.4 epoch-mint
+	// circuit (pkg/zk.MintCircuit) — a NewNode parameter for the same
+	// reason eligibilityZK is: it carries real proving/verifying keys
+	// every node and minting wallet must share. No tree/root state of
+	// its own — a passed mint's real output note lands in the same
+	// canonical zkTree/zkRoots above (tx.Deps.MintZK's own doc).
+	mintZK *zk.MintSystem
 	// oracleQuorum is the real quorum-verified price/ATR feed the pipeline
 	// cross-checks BankDeposit/BankWithdraw claims against (spec 11.3). Nil
 	// disables the cross-check entirely (e.g. a local test network with no
@@ -271,7 +278,7 @@ type Node struct {
 // keypair; the node's consensus identity (types.NFTID) is derived from the
 // public key (types.NFTID(types.SumHash(pk))) — a genuine cryptographic
 // binding, not an arbitrary label.
-func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
+func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mintZK *zk.MintSystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -305,6 +312,7 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		eligibilityZK:       eligibilityZK,
 		eligibilityTree:     eligibilityTree,
 		eligibilityRoots:    zk.NewRootHistory(initialEligibilityRoot),
+		mintZK:              mintZK,
 		oracleQuorum:        oracleQuorum,
 		trustedPoHAttestors: trustedPoHAttestors,
 		governanceParams: func() *governance.Params {

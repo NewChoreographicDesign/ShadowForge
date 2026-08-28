@@ -14,6 +14,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/txbuilder"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/walletkey"
+	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
 
 // loadBuilder unlocks path's Dilithium identity (real terminal prompt, or
@@ -164,6 +165,64 @@ func runVoteReveal(args []string) error {
 	if err != nil {
 		return err
 	}
+	return submitTx(ctx, &nf, txn)
+}
+
+// runProposeMint drives the real spec-17.4 epoch-mint proposer path
+// (txbuilder.Builder.ProposeMint): a real Groth16 proof binds the
+// requested amount to a real output note commitment, both submitted
+// inside an ordinary sealed-ballot TxVote. Like vote/vote-reveal, it
+// signs the transaction envelope with a fresh, throwaway key.
+func runProposeMint(args []string) error {
+	fs := flag.NewFlagSet("propose-mint", flag.ExitOnError)
+	path := fs.String("keystore", "walletkey.json", "keystore to unlock — the identity that minted the real NFT this proposal proves eligibility from")
+	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
+	proposal := fs.String("proposal", "", "proposal id (required)")
+	approve := fs.Bool("approve", true, "cast an approve ballot for this proposal's own first vote (default: true — proposing without approving is unusual but allowed)")
+	amount := fs.Uint64("amount", 0, "SFG amount requested (required, > 0) — the real note this mint creates, once passed, holds amount minus the real Vault fee (see types.MintNetAmount)")
+	eligibilityParams := fs.String("eligibility-zk-params", "", "path to the real, shared Groth16 params file for anonymous voter eligibility (see 'wallet eligibility-zk-setup' and cmd/node's -eligibility-zk-params) — required")
+	mintParams := fs.String("mint-zk-params", "", "path to the real, shared Groth16 params file for the epoch-mint circuit (see 'wallet mint-zk-setup' and cmd/node's -mint-zk-params) — required")
+	var nf networkFlags
+	nf.register(fs)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *proposal == "" {
+		return fmt.Errorf("-proposal is required")
+	}
+	if *amount == 0 {
+		return fmt.Errorf("-amount must be greater than 0")
+	}
+	ctx := context.Background()
+	queryURL, err := nf.firstQueryURL()
+	if err != nil {
+		return err
+	}
+	eligibility, err := buildVoteEligibility(ctx, *path, *fromStdin, queryURL, *eligibilityParams, types.ID(*proposal))
+	if err != nil {
+		return err
+	}
+	mintSys, err := loadMintSystem(*mintParams)
+	if err != nil {
+		return err
+	}
+	b, err := throwawayVoteSigner()
+	if err != nil {
+		return err
+	}
+	txn, secret, err := b.ProposeMint(types.ID(*proposal), *approve, *amount, mintSys, eligibility)
+	if err != nil {
+		return err
+	}
+	commitBytes := zk.ToBytes32(secret.Commitment())
+	ownerSKBytes := zk.ToBytes32(secret.OwnerSK)
+	rhoBytes := zk.ToBytes32(secret.Rho)
+	fmt.Println("real mint proposal built and proved — save this note opening, it is the ONLY way to ever spend the minted value once this proposal passes:")
+	fmt.Printf("  -commitment %s\n", hex.EncodeToString(commitBytes[:]))
+	fmt.Printf("  -value %d\n", secret.Value)
+	fmt.Printf("  -owner-sk %s\n", hex.EncodeToString(ownerSKBytes[:]))
+	fmt.Printf("  -rho %s\n", hex.EncodeToString(rhoBytes[:]))
+	fmt.Println("check 'wallet proposal -id <id>' for real Passed/MintApplied status once tallied")
 	return submitTx(ctx, &nf, txn)
 }
 

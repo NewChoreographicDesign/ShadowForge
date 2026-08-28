@@ -299,6 +299,10 @@ type testBackend struct {
 	// on why the CLI must load real, shared params from a file rather
 	// than run its own independent setup.
 	eligibilityZKParamsPath string
+	// mintZKParamsPath is eligibilityZKParamsPath's counterpart for the
+	// real spec-17.4 epoch-mint circuit — see 'wallet propose-mint' own
+	// doc.
+	mintZKParamsPath string
 }
 
 func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *zk.Tree, zkRoots *zk.RootHistory) *testBackend {
@@ -344,6 +348,26 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		t.Fatalf("initial eligibility root: %v", err)
 	}
 
+	// Real, shared epoch-mint params — every propose-mint-exercising
+	// test in this file needs this backend's pipeline and the CLI's own
+	// loaded copy to verify against identical Groth16 keys, exactly like
+	// eligSys above.
+	mintSys, err := zk.SetupMint()
+	if err != nil {
+		t.Fatalf("mint zk setup: %v", err)
+	}
+	mintParamsPath := filepath.Join(t.TempDir(), "mint-zk-params.bin")
+	mintParamsFile, err := os.Create(mintParamsPath)
+	if err != nil {
+		t.Fatalf("create mint zk params file: %v", err)
+	}
+	if _, err := mintSys.WriteTo(mintParamsFile); err != nil {
+		t.Fatalf("write mint zk params: %v", err)
+	}
+	if err := mintParamsFile.Close(); err != nil {
+		t.Fatalf("close mint zk params file: %v", err)
+	}
+
 	pipeline := tx.NewPipeline(tx.Deps{
 		Store:               store,
 		StateTree:           state.NewMerkleTree(),
@@ -354,6 +378,7 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		EligibilityZK:       eligSys,
 		EligibilityTree:     eligTree,
 		EligibilityRoots:    zk.NewRootHistory(initialEligRoot),
+		MintZK:              mintSys,
 	})
 
 	v1pk, v1sk, err := crypto.GenerateDilithiumKey()
@@ -366,6 +391,7 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		store: store, chn: chn, pipeline: pipeline, v1id: v1id, v1pk: v1pk, v1sk: v1sk, logf: t.Logf,
 		attestorKeystorePath: attestorPath, attestorKeystorePassphrase: "attestor-passphrase",
 		eligibilityZKParamsPath: eligParamsPath,
+		mintZKParamsPath:        mintParamsPath,
 	}
 
 	h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
@@ -579,6 +605,89 @@ func TestCLISubmitWithoutBootstrapFails(t *testing.T) {
 	err := runMint([]string{"-keystore", path, "-passphrase-stdin"})
 	if err == nil {
 		t.Fatalf("expected an error when neither -bootstrap nor -bootstrap-file is set")
+	}
+}
+
+// TestCLIProposeMintEndToEnd proves the real spec-17.4 epoch-mint path
+// end to end through the actual CLI: a real minted NFT gives a voter
+// real anonymous eligibility, 'wallet propose-mint' builds and submits a
+// real Groth16-proven mint claim bound to a fresh output note, a matching
+// 'wallet vote-reveal' opens the sealed ballot, and — since this build's
+// CLI deliberately exposes no epoch-boundary/tally command of its own
+// (spec 17.4's tally is a validator-side, not a wallet-side, operation) —
+// the test drives the same real backend.pipeline.TallyDueProposals the
+// actual validator runs at epoch end, then proves the real note landed in
+// the same canonical tree Transfer's own outputs live in.
+func TestCLIProposeMintEndToEnd(t *testing.T) {
+	zkTree := zk.NewTree()
+	initialRoot, err := zkTree.Root()
+	if err != nil {
+		t.Fatalf("initial root: %v", err)
+	}
+	zkRoots := zk.NewRootHistory(initialRoot)
+	backend := newTestBackend(t, 0x06, nil, zkTree, zkRoots)
+
+	path, ks := newTestKeystore(t, "mint-voter-passphrase")
+	mintNFTViaCLI(t, backend, ks.PublicKey(), path, "mint-voter-passphrase")
+
+	const amount = 2000
+
+	withStdin(t, "mint-voter-passphrase")
+	out, err := captureStdout(t, func() error {
+		return runProposeMint([]string{
+			"-keystore", path, "-passphrase-stdin",
+			"-proposal", "cli-mint-1", "-approve", "-amount", fmt.Sprintf("%d", amount),
+			"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+			"-mint-zk-params", backend.mintZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runProposeMint: %v", err)
+	}
+	if !strings.Contains(out, "real mint proposal built and proved") {
+		t.Fatalf("expected propose-mint output to describe the real note opening, got:\n%s", out)
+	}
+	wantCommitHex := mustExtractFlagValue(t, out, "-commitment")
+
+	withStdin(t, "mint-voter-passphrase")
+	err = runVoteReveal([]string{
+		"-keystore", path, "-passphrase-stdin",
+		"-proposal", "cli-mint-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runVoteReveal: %v", err)
+	}
+
+	if backend.chn.HeadHeight() != 3 {
+		t.Fatalf("expected 3 real committed blocks (nft-mint + propose-mint + reveal), got height %d", backend.chn.HeadHeight())
+	}
+
+	remainingBefore := zkTree.Remaining()
+	tallied, err := backend.pipeline.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed || !tallied[0].MintApplied {
+		t.Fatalf("expected the real proposal to pass and the real mint to be applied, got %+v", tallied)
+	}
+	if got := zkTree.Remaining(); got != remainingBefore-1 {
+		t.Fatalf("expected the real note the CLI proved to be inserted into the canonical tree, remaining went from %d to %d", remainingBefore, got)
+	}
+	if got := hex.EncodeToString(tallied[0].MintOutCommit[:]); got != wantCommitHex {
+		t.Fatalf("expected the tallied MintOutCommit %s to match the CLI's own reported commitment %s", got, wantCommitHex)
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runProposal([]string{"-query", backend.queryURL, "-id", "cli-mint-1"})
+	})
+	if err != nil {
+		t.Fatalf("runProposal: %v", err)
+	}
+	if !strings.Contains(out, "mint applied: true") {
+		t.Fatalf("expected 'wallet proposal' to report the real mint as applied, got:\n%s", out)
 	}
 }
 

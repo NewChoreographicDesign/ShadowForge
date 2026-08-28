@@ -248,4 +248,9 @@ func printProposal(p queryclient.Proposal) {
 	fmt.Printf("reject: %d\n", p.Reject)
 	fmt.Printf("passed: %v\n", p.Passed)
 	fmt.Printf("applied: %v\n", p.Applied)
+	if p.MintAmount != 0 {
+		fmt.Printf("mint amount: %d\n", p.MintAmount)
+		fmt.Printf("mint out commit: %s\n", p.MintOutCommit)
+		fmt.Printf("mint applied: %v\n", p.MintApplied)
+	}
 }

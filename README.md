@@ -141,10 +141,7 @@ package — this is not a stub with comments describing intended behavior.
   deterministic across every honest node and wired into both
   `pkg/validator`'s propose and announce-replay paths — proven with a
   test that waits for a genuine wall-clock epoch boundary to arrive
-  before asserting the tally ran. Actual SFG token minting stays
-  unwired: it needs an App-layer proposer-path choice (direct vs.
-  staked) this L1-core build doesn't implement, a real, documented
-  boundary rather than a fabricated mechanism.
+  before asserting the tally ran.
 - **Real, enforced, anonymous voter eligibility — closing a genuine
   Sybil-voting gap live testing found, then closing the identity leak
   the first fix itself introduced.** Casting a ballot originally needed
@@ -180,6 +177,45 @@ package — this is not a stub with comments describing intended behavior.
   `requireEligibleVoterZK`'s own doc. `cmd/walletsim`'s throwaway-per-
   session identities still can't vote (no real NFT ever backs them), a
   disclosed trade-off unrelated to this fix — see that command's own doc.
+- **Real spec-17.4 epoch-mint execution — closing the last "passes tally
+  but does nothing" gap.** A mint proposal used to reach exactly the same
+  dead end every proposal type once did: it could be built, voted on, and
+  pass tally, with no code ever crediting SFG to anyone. This build wires
+  the proposer-direct path (spec 17.4's other option, a staked 2% yield
+  path, is left out on the same disclosed boundary as before — it needs a
+  staking subsystem this L1-core build doesn't implement anywhere).
+  `pkg/zk.MintCircuit` (a real Groth16 circuit, deliberately the simplest
+  one in this codebase — it proves only `OutCommit == MiMC(Amount,
+  OwnerPK, Rho)`, no Merkle membership, since minting creates value rather
+  than conserving it) binds a requested amount to a fresh output note
+  using the exact same commitment formula the Transfer circuit's own
+  outputs use, so a minted note is an ordinary spendable `zk.NoteSecret`
+  — zero new note types, zero changes to the spend path. Following the
+  same "a proposal is whatever the first `TxVote` claims" pattern the
+  existing ParamChange handling already established, `types.
+  VotePublicInputs` gained optional `MintAmount`/`MintOutCommit`/
+  `MintProof` fields rather than a new proposal-submission transaction
+  kind; the real proof is checked once, at the moment the first vote
+  binds the claim (fail-fast, never deferred to tally time), and the note
+  is actually inserted into the canonical tree — with a real 10% Vault
+  fee collected (`types.MintFeeAmount`, exact-integer floor division) —
+  only in `TallyDueProposals`, gated on the proposal having passed, with
+  `state.ProposalRecord.MintApplied` as the idempotency marker mirroring
+  `Applied`'s existing role for ParamChange. `pkg/txbuilder.
+  Builder.ProposeMint`/`cmd/wallet propose-mint`/`mint-zk-setup` are the
+  real CLI, reusing the same two-signer separation `vote`/`vote-reveal`
+  already established (a throwaway key signs the envelope; the real
+  anonymous eligibility proof is built separately against the identity
+  that minted the NFT). The pre-existing `types.TxMint`/`Builder.Mint`/
+  `wallet mint` are untouched, vestigial scaffolding that predates this
+  pattern — not the real mechanism, and documented as such everywhere
+  they appear. A real, disclosed, pre-existing gap this work surfaced
+  while checking how a landed note could be verified: `state.
+  Store.PutNote` is never called by any production code path for any
+  note kind, so the `/v1/note/{commitment}` query endpoint cannot confirm
+  a minted (or transferred) note landed — `wallet proposal -id` showing
+  `mint applied: true` is the real, working way to confirm a mint
+  executed.
 
 ## Security
 
