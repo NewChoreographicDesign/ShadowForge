@@ -47,7 +47,7 @@ func NewEnvelope(t MessageType, payload interface{}) (Envelope, error) {
 // identity registry real StageVote/Block verification needs
 // (pkg/chain.PubKeyLookup) — a trust-on-first-heartbeat substitute for a
 // real on-chain NFT-mint identity binding, which this reference build
-// doesn't wire end to end (see docs/ARCHITECTURE.md's scope notes).
+// doesn't wire end to end (see README's Scope section).
 type HeartbeatPayload struct {
 	NFT       types.NFTID `json:"nft"`
 	PubKey    []byte      `json:"pub_key"`

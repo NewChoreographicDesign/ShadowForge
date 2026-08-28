@@ -1,11 +1,17 @@
 // Package runtime is the hand-written surface that ShadowRust-generated Go
-// code calls into. Concrete implementations live in pkg/tx (mempool +
-// 5-stage pipeline), pkg/zk (circuit build/proof), pkg/bank, and
-// pkg/consensus (queue insert). Generated code never talks to gnark,
-// Badger, or libp2p directly — codegen output stays a thin, readable
-// orchestration layer, with the heavy lifting done by hand-written Go, per
-// spec 14.1 ("The L1 node software itself is that generated Go, plus a
-// small amount of hand-written Go for networking and storage").
+// code calls into: codegen output is a thin, readable orchestration layer
+// (never talking to gnark, Badger, or libp2p directly) built against this
+// interface, per spec 14.1 ("The L1 node software itself is that generated
+// Go, plus a small amount of hand-written Go for networking and storage").
+//
+// A real, disclosed gap: no concrete type in this repository implements
+// Node. The intended concrete implementations — wiring Transfer into
+// pkg/tx's pipeline + pkg/zk's circuit, BankDeposit into pkg/bank,
+// QueueInsert into pkg/consensus's revolver, and so on — were never
+// built, so ShadowRust-generated Go compiles against this interface but
+// has no real adapter to actually run against a live node; like
+// pkg/interp's own sandbox (see that package's doc), the codegen path
+// is a language-tooling preview, not a production path yet.
 package runtime
 
 import "math/big"

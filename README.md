@@ -226,7 +226,7 @@ JS codebase), the following are **not** implemented here:
   runtime subspace mechanics (validator counts, hybrid split, sync
   triggers, shadow verification) that tooling would drive.
 
-Within the L1 core, two things are implemented but intentionally scoped
+Within the L1 core, one thing is implemented but intentionally scoped
 down, documented at the point of decision in code:
 
 - **ZK circuit size.** `pkg/zk.MerkleDepth` is 4 (16 leaves), not a
@@ -234,13 +234,18 @@ down, documented at the point of decision in code:
   the explicit Year-1 mitigation for "gnark / circuit bugs" — this
   follows that directive. Raising it is a one-constant change plus a new
   trusted setup.
-- **Outage/megabatch recovery not yet wired into live consensus.**
-  `pkg/consensus` implements and tests spec 5.6's outage detection and
-  megabatch recovery logic, but `pkg/validator`'s round loop doesn't yet
-  call into it — a validator that misses blocks while offline currently
-  has no automated catch-up path beyond the single-block replay-adoption
-  `handleBlockAnnounce` already does. Wiring the already-tested recovery
-  logic into the round loop is the natural next step, not a redesign.
+
+Outage detection and megabatch recovery (spec 5.6) are wired into live
+consensus: `pkg/validator`'s round loop calls `pkg/consensus`'s outage
+controller every tick (`evaluateOutage`), and a validator that detects an
+outage builds a real dual-track proposal (`buildProposalBatch`'s
+`dualTrack` path, `OutageController.BuildMegabatch`) until a clean cycle
+reaches real BFT quorum. Still intentionally out of scope, per
+`pkg/validator/node.go`'s own doc: multi-block catch-up sync for a node
+that falls more than one block behind (`handleBlockAnnounce` only
+replay-adopts one block at a time), and `MegabatchPart`'s chunked
+wire-format reassembly for a recovery batch too large for a single
+`MaxBatchBytes`-bounded proposal.
 
 Cross-process BFT finality (spec 5.7) is fully wired and network-tested:
 `pkg/validator` runs a real propose/vote/commit state machine — genuine
