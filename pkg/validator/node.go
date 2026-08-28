@@ -175,6 +175,21 @@ type Node struct {
 	// dependency a caller configures.
 	zkTree  *zk.Tree
 	zkRoots *zk.RootHistory
+	// eligibilityZK is the real Groth16 system for the anonymous
+	// voter-eligibility circuit (pkg/zk.EligibilityCircuit) — a NewNode
+	// parameter, not built internally, because unlike zkTree/zkRoots
+	// below it carries real proving/verifying keys that must be loaded
+	// from the exact same shared setup file every node and voting
+	// wallet uses (see zkSys's own analogous constraint for Transfer).
+	eligibilityZK *zk.EligibilitySystem
+	// eligibilityTree/eligibilityRoots are the real, canonical
+	// eligibility-commitment tree and its historical root set — the
+	// anonymous-membership counterpart of zkTree/zkRoots above, built
+	// fresh per process the same way and populated by every real Kind
+	// NFTMint this node ever processes (tx.Deps.EligibilityTree/
+	// EligibilityRoots' own doc).
+	eligibilityTree  *zk.Tree
+	eligibilityRoots *zk.RootHistory
 	// oracleQuorum is the real quorum-verified price/ATR feed the pipeline
 	// cross-checks BankDeposit/BankWithdraw claims against (spec 11.3). Nil
 	// disables the cross-check entirely (e.g. a local test network with no
@@ -256,7 +271,7 @@ type Node struct {
 // keypair; the node's consensus identity (types.NFTID) is derived from the
 // public key (types.NFTID(types.SumHash(pk))) — a genuine cryptographic
 // binding, not an arbitrary label.
-func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
+func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -272,6 +287,11 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		// through instead.
 		logf("validator: BUG: fresh zk.Tree root computation failed (%v); seeding RootHistory with the zero element", err)
 	}
+	eligibilityTree := zk.NewTree()
+	initialEligibilityRoot, err := eligibilityTree.Root()
+	if err != nil {
+		logf("validator: BUG: fresh eligibility zk.Tree root computation failed (%v); seeding RootHistory with the zero element", err)
+	}
 	n := &Node{
 		cfg:                 cfg,
 		mempool:             mempool,
@@ -282,6 +302,9 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 		chn:                 chn,
 		zkTree:              zkTree,
 		zkRoots:             zk.NewRootHistory(initialRoot),
+		eligibilityZK:       eligibilityZK,
+		eligibilityTree:     eligibilityTree,
+		eligibilityRoots:    zk.NewRootHistory(initialEligibilityRoot),
 		oracleQuorum:        oracleQuorum,
 		trustedPoHAttestors: trustedPoHAttestors,
 		governanceParams: func() *governance.Params {
@@ -313,6 +336,28 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 // Identity is this node's consensus identity (derived from its Dilithium
 // public key).
 func (n *Node) Identity() types.NFTID { return n.identity }
+
+// SeedEligibility registers commitment as a real leaf in this node's
+// eligibility-commitment tree directly, advancing both the tree and its
+// root history exactly as a live Kind NFTMint would (pkg/tx's Stage 4) —
+// the eligibility-tree counterpart of the same real, disclosed bootstrap
+// need pkg/shieldedwallet.Wallet.SeedKnownCommitment documents for the
+// note tree: a multi-node test proving real independent verification
+// (e.g. TestFourNodesConvergeOnSameChain) needs identical real state
+// seeded across several independently-constructed nodes without
+// individually replaying a live NFTMint through each one's own pipeline.
+func (n *Node) SeedEligibility(commitment types.Hash) (int, error) {
+	idx, err := n.eligibilityTree.Insert(zk.FieldElementFromBytes32(commitment))
+	if err != nil {
+		return 0, err
+	}
+	root, err := n.eligibilityTree.Root()
+	if err != nil {
+		return 0, err
+	}
+	n.eligibilityRoots.Record(root)
+	return idx, nil
+}
 
 // Chain exposes the underlying chain for read access (height, hash, head
 // block) by callers such as cmd/node's logging.

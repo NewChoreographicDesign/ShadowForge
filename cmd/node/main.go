@@ -70,6 +70,8 @@ func main() {
 	sentinelFlag := flag.Bool("sentinel", false, "run as a protocol sentinel validator")
 	skipZK := flag.Bool("skip-zk-setup", false, "skip the Groth16 trusted setup (Kind Transfer proofs will be rejected)")
 	zkParamsPath := flag.String("zk-params", "", "path to a shared Groth16 parameters file (pkg/zk.System.WriteTo's format). If it exists, load it; if not, run a fresh trusted setup and write it there for other nodes/wallets to load. Empty (the default) runs an independent, unshared setup — fine for a single node, but a proof any wallet builds will never verify here unless every party loads the exact same params file (see 'wallet zk-setup' to generate one)")
+	skipEligibilityZK := flag.Bool("skip-eligibility-zk-setup", false, "skip the anonymous voter-eligibility Groth16 trusted setup (TxVote/TxVoteReveal will be rejected — no wallet can vote at all on this node, not even anonymously)")
+	eligibilityZKParamsPath := flag.String("eligibility-zk-params", "", "path to a shared Groth16 parameters file for the anonymous voter-eligibility circuit (pkg/zk.EligibilitySystem.WriteTo's format; a distinct file from -zk-params — different circuit, different keys). Same load-or-create-and-share behavior as -zk-params; see 'wallet eligibility-zk-setup' to generate one")
 	announceFile := flag.String("announce-file", "", "write this node's dialable multiaddr to this path once listening (for peer discovery over a shared volume, e.g. Docker Compose)")
 	bootstrapFile := flag.String("bootstrap-file", "", "comma-separated paths to wait for and read bootstrap multiaddrs from (pairs with -announce-file on other nodes) — a full mesh among validators needs one entry per peer, since this reference build doesn't relay heartbeats or messages beyond directly connected peers")
 	keyFile := flag.String("key-file", "", "path to this node's persisted Dilithium identity keypair (empty = generate a fresh, ephemeral identity every start)")
@@ -114,6 +116,16 @@ func main() {
 		}
 	} else {
 		log.Println("skipping ZK setup: Kind Transfer transactions will be rejected at Stage 1")
+	}
+
+	var eligibilityZK *zk.EligibilitySystem
+	if !*skipEligibilityZK {
+		eligibilityZK, err = loadOrCreateEligibilityZKSystem(*eligibilityZKParamsPath)
+		if err != nil {
+			log.Fatalf("eligibility zk setup: %v", err)
+		}
+	} else {
+		log.Println("skipping eligibility ZK setup: TxVote/TxVoteReveal transactions will be rejected fail-closed")
 	}
 
 	v := vault.New(vault.DefaultSplits())
@@ -183,7 +195,7 @@ func main() {
 	}
 
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, mempool, pk, sk, *sentinelFlag, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mempool, pk, sk, *sentinelFlag, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {
@@ -327,6 +339,53 @@ func loadOrCreateZKSystem(path string) (*zk.System, error) {
 	defer func() { _ = f.Close() }()
 	if _, err := sys.WriteTo(f); err != nil {
 		return nil, fmt.Errorf("write zk params file %s: %w", path, err)
+	}
+	return sys, nil
+}
+
+// loadOrCreateEligibilityZKSystem is loadOrCreateZKSystem's counterpart
+// for the anonymous voter-eligibility circuit (pkg/zk.EligibilityCircuit)
+// — a distinct circuit from TransferCircuit, so it needs its own,
+// separately-shared proving/verifying keys and params file.
+func loadOrCreateEligibilityZKSystem(path string) (*zk.EligibilitySystem, error) {
+	if path == "" {
+		log.Println("running Groth16 trusted setup for anonymous voter eligibility (development setup, unshared — see pkg/zk doc for the production-ceremony requirement)...")
+		start := time.Now()
+		sys, err := zk.SetupEligibility()
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("eligibility zk setup complete in %s", time.Since(start))
+		return sys, nil
+	}
+
+	if f, err := os.Open(path); err == nil {
+		defer func() { _ = f.Close() }()
+		sys, err := zk.ReadEligibilitySystem(f)
+		if err != nil {
+			return nil, fmt.Errorf("load eligibility zk params from %s: %w", path, err)
+		}
+		log.Printf("loaded shared eligibility Groth16 params from %s", path)
+		return sys, nil
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read eligibility zk params file %s: %w", path, err)
+	}
+
+	log.Printf("running Groth16 trusted setup for anonymous voter eligibility (development setup — see pkg/zk doc for the production-ceremony requirement) and saving it to %s for other nodes/wallets to share...", path)
+	start := time.Now()
+	sys, err := zk.SetupEligibility()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("eligibility zk setup complete in %s", time.Since(start))
+
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create eligibility zk params file %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := sys.WriteTo(f); err != nil {
+		return nil, fmt.Errorf("write eligibility zk params file %s: %w", path, err)
 	}
 	return sys, nil
 }

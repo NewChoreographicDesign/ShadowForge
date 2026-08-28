@@ -1,6 +1,7 @@
 package validator
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -12,7 +13,25 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/vault"
+	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
+
+// testEligibilitySystem is expensive to Setup; build it once for the
+// whole package's tests, mirroring pkg/tx's own zkOnce pattern.
+var (
+	testEligOnce sync.Once
+	testEligSys  *zk.EligibilitySystem
+	testEligErr  error
+)
+
+func getTestEligibilitySystem(t *testing.T) *zk.EligibilitySystem {
+	t.Helper()
+	testEligOnce.Do(func() { testEligSys, testEligErr = zk.SetupEligibility() })
+	if testEligErr != nil {
+		t.Fatalf("eligibility zk setup: %v", testEligErr)
+	}
+	return testEligSys
+}
 
 // These are white-box tests (package validator, not validator_test): they
 // call unexported methods (handleBlockProposal, handleStageVote,
@@ -78,7 +97,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		OnlineTimeout:     time.Minute,
 		Genesis:           consensus.GenesisTime(genesisMs),
 	}
-	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, mempool, pk, sk, false, testLogf(t))
+	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), mempool, pk, sk, false, testLogf(t))
 }
 
 type peerKey struct {
@@ -105,22 +124,58 @@ func genPeer(t *testing.T) peerKey {
 // pipeline-behavior tests are trying to exercise, so giving every
 // generated voter a real NFT up front keeps them passing exactly as
 // before that check existed.
+// seedEligibilityFor mints a real ValidatorNFT for pk/sk directly in n's
+// store, registers its real VoterCommitment in n's eligibility tree
+// (Node.SeedEligibility), and builds a real, fresh anonymous
+// VoteEligibilityProof for proposalID — internal-package tests reach
+// n.eligibility* directly since they're white-box (package validator),
+// unlike pkg/validator_test's mustSignIntegrationVote.
+func seedEligibilityFor(t *testing.T, n *Node, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, proposalID string) *types.VoteEligibilityProof {
+	t.Helper()
+	owner := types.AddressFromPubkey(pk)
+	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
+		t.Fatalf("seed voter nft: %v", err)
+	}
+	voterSK := zk.DeriveVoterSK(sk)
+	idx, err := n.SeedEligibility(types.Hash(zk.ToBytes32(zk.VoterCommitment(voterSK))))
+	if err != nil {
+		t.Fatalf("seed eligibility: %v", err)
+	}
+	proof, err := n.eligibilityTree.Prove(idx)
+	if err != nil {
+		t.Fatalf("merkle proof: %v", err)
+	}
+	scope := zk.FieldElementFromBytes32(types.VoteEligibilityScope(types.ID(proposalID)))
+	in := zk.EligibilityInput{MerkleRoot: proof.Root, ProposalScope: scope, VoterSK: voterSK, Proof: proof}
+	zproof, err := n.eligibilityZK.Prove(in)
+	if err != nil {
+		t.Fatalf("prove eligibility: %v", err)
+	}
+	proofBytes, err := zk.ProofToBytes(zproof)
+	if err != nil {
+		t.Fatalf("proof to bytes: %v", err)
+	}
+	return &types.VoteEligibilityProof{
+		Proof:      proofBytes,
+		MerkleRoot: types.Hash(zk.ToBytes32(proof.Root)),
+		Nullifier:  types.Hash(zk.ToBytes32(in.Nullifier())),
+	}
+}
+
 func mustSignVote(t *testing.T, n *Node, proposalID string, commitment byte) types.ShieldedTx {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	owner := types.AddressFromPubkey(pk)
-	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
-		t.Fatalf("seed voter nft: %v", err)
-	}
+	elig := seedEligibilityFor(t, n, pk, sk, proposalID)
 	in := types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID(proposalID),
 			Commitment: types.Hash{commitment},
 		},
+		VoteEligibility: elig,
 		// TxID = Hash(proof || commitments || nullifier); none of those
 		// vary with proposalID/commitment for a Vote tx, so every call
 		// would otherwise collide on the same TxID (this is exactly the
@@ -364,7 +419,7 @@ func TestTryFinalizeReinsertsBatchOnChainAppendFailure(t *testing.T) {
 	staleTx := mustSignVote(t, n, "proposal-stale", 2)
 	txn := n.store.BeginTxn()
 	entries := []tx.Entry{{Tx: staleTx, SubmittedAt: time.Now()}}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, Vault: n.vlt, Now: time.Now})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, Vault: n.vlt, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, Now: time.Now})
 	if res := pipeline.ProcessBatch(entries); res[0].Error != nil {
 		t.Fatalf("pipeline: %v", res[0].Error)
 	}
@@ -710,15 +765,29 @@ func TestHandleBlockAnnounceAdoptsIndependentlyVerifiedBlock(t *testing.T) {
 		adopter.recordOnline(e.id, e.pk, false, time.Now())
 	}
 
-	// voteTx's real voter NFT must exist on BOTH nodes' stores: adopter
-	// independently re-verifies this transaction (including real voter
-	// eligibility) while replay-adopting the block below, exactly as
-	// proposer does while first processing it.
-	voteTx := mustSignVote(t, proposer, "proposal-7", 7)
-	owner := types.AddressFromPubkey(voteTx.SignerPubKey)
+	// voteTx's real voter NFT and eligibility-tree leaf must exist on
+	// BOTH nodes: adopter independently re-verifies this transaction
+	// (including a real anonymous ZK eligibility proof) while
+	// replay-adopting the block below, exactly as proposer does while
+	// first processing it — so it needs the identical real state, not
+	// just proposer's own.
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate voter key: %v", err)
+	}
+	elig := seedEligibilityFor(t, proposer, pk, sk, "proposal-7")
+	owner := types.AddressFromPubkey(pk)
 	if err := adopter.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
 		t.Fatalf("seed voter nft on adopter: %v", err)
 	}
+	if _, err := adopter.SeedEligibility(types.Hash(zk.ToBytes32(zk.VoterCommitment(zk.DeriveVoterSK(sk))))); err != nil {
+		t.Fatalf("seed eligibility on adopter: %v", err)
+	}
+	voteTx := signVoteTx(t, pk, sk, types.ShieldedTx{
+		Kind:             types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("proposal-7"), Commitment: types.Hash{7}},
+		VoteEligibility:  elig,
+	})
 	prop := shadownet.BlockProposalPayload{
 		Height: height, Proposer: committeeProposer[0], Batch: []types.ShieldedTx{voteTx}, Timestamp: time.Now().UnixMilli(),
 	}
@@ -846,22 +915,20 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate voter key: %v", err)
 	}
-	owner := types.AddressFromPubkey(pk)
-	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
-		t.Fatalf("seed voter nft: %v", err)
-	}
-	voter := types.NFTID(types.SumHash(pk))
+	elig := seedEligibilityFor(t, n, pk, sk, "epoch-tally-proposal")
 	nonce := types.Hash{5}
-	commitment := types.ComputeVoteCommitment(voter, true, nonce)
+	commitment := types.ComputeVoteCommitment(elig.Nullifier, true, nonce)
 	commitTx := signVoteTx(t, pk, sk, types.ShieldedTx{
 		Kind:             types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("epoch-tally-proposal"), Commitment: commitment},
+		VoteEligibility:  elig,
 	})
 	revealTx := signVoteTx(t, pk, sk, types.ShieldedTx{
 		Kind: types.TxVoteReveal,
 		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
 			ProposalID: types.ID("epoch-tally-proposal"), Approve: true, Nonce: nonce,
 		},
+		VoteEligibility: elig,
 	})
 
 	n.handleBlockProposal(shadownet.BlockProposalPayload{
@@ -907,13 +974,11 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate second signer key: %v", err)
 	}
-	dummyOwner := types.AddressFromPubkey(dummyPK)
-	if err := n.store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(dummyOwner[:])), Owner: dummyOwner}); err != nil {
-		t.Fatalf("seed dummy voter nft: %v", err)
-	}
+	dummyElig := seedEligibilityFor(t, n, dummyPK, dummySK, "unrelated-proposal")
 	dummyTx := signVoteTx(t, dummyPK, dummySK, types.ShieldedTx{
 		Kind:             types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("unrelated-proposal"), Commitment: types.Hash{9}},
+		VoteEligibility:  dummyElig,
 	})
 	nowEpoch := consensus.CurrentEpoch(n.cfg.Genesis, time.Now())
 	height2 := n.chn.NextHeight()

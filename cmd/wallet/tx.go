@@ -7,7 +7,9 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/govwallet"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/txbuilder"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -32,14 +34,72 @@ func loadBuilder(path string, fromStdin bool) (*txbuilder.Builder, error) {
 	return txbuilder.New(pk, sk), nil
 }
 
+// buildVoteEligibility syncs a real pkg/govwallet.Wallet for the identity
+// at path (the one that minted the real NFT — never the throwaway
+// vote-signing key runVote/runVoteReveal generate below) against a live
+// node, and uses it to build a real anonymous VoteEligibilityProof for
+// proposalID. Shared by runVote and runVoteReveal: both need this
+// exact same real Sync-then-prove flow, differing only in what tx kind
+// wraps the resulting proof.
+func buildVoteEligibility(ctx context.Context, keystorePath string, fromStdin bool, queryURL, eligibilityParams string, proposalID types.ID) (types.VoteEligibilityProof, error) {
+	if queryURL == "" {
+		return types.VoteEligibilityProof{}, fmt.Errorf("-query is required: proving real anonymous eligibility needs a live node to sync the eligibility-commitment tree from")
+	}
+	ks, err := walletkey.Load(keystorePath)
+	if err != nil {
+		return types.VoteEligibilityProof{}, err
+	}
+	passphrase, err := readExistingPassphrase(fromStdin)
+	if err != nil {
+		return types.VoteEligibilityProof{}, err
+	}
+	_, sk, err := ks.Unlock(passphrase)
+	if err != nil {
+		return types.VoteEligibilityProof{}, err
+	}
+
+	gw, err := govwallet.New(sk, govwallet.Config{QueryBase: queryURL})
+	if err != nil {
+		return types.VoteEligibilityProof{}, err
+	}
+	if err := gw.Sync(ctx); err != nil {
+		return types.VoteEligibilityProof{}, fmt.Errorf("sync eligibility tree: %w", err)
+	}
+	if !gw.Eligible() {
+		return types.VoteEligibilityProof{}, fmt.Errorf("this wallet's real, minted NFT was not found in any synced Kind NFTMint — run 'wallet nft-mint' first, then retry")
+	}
+	sys, err := loadEligibilitySystem(eligibilityParams)
+	if err != nil {
+		return types.VoteEligibilityProof{}, err
+	}
+	return gw.BuildEligibilityProof(sys, proposalID)
+}
+
+// throwawayVoteSigner generates a fresh, unlinked Dilithium keypair to
+// sign the Vote/VoteReveal transaction envelope itself — deliberately not
+// the same identity that minted the NFT (loaded separately in
+// buildVoteEligibility above). The real anonymous eligibility proof, not
+// the tx signature, is what proves eligibility now; signing with the
+// NFT-holder's own long-lived key here would defeat the whole point by
+// re-attaching a public identity to every ballot (see types.
+// VotePublicInputs' own doc).
+func throwawayVoteSigner() (*txbuilder.Builder, error) {
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		return nil, fmt.Errorf("generate throwaway vote-signing key: %w", err)
+	}
+	return txbuilder.New(pk, sk), nil
+}
+
 func runVote(args []string) error {
 	fs := flag.NewFlagSet("vote", flag.ExitOnError)
-	path := fs.String("keystore", "walletkey.json", "keystore to unlock")
+	path := fs.String("keystore", "walletkey.json", "keystore to unlock — the identity that minted the real NFT this vote proves eligibility from")
 	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
 	proposal := fs.String("proposal", "", "proposal id (required)")
 	approve := fs.Bool("approve", false, "cast an approve ballot (default: reject)")
 	paramKey := fs.String("param-key", "", "optional governance.Params field this proposal changes (only matters on the first Vote for this proposal id)")
 	newValue := fs.String("new-value", "", "new value for -param-key")
+	eligibilityParams := fs.String("eligibility-zk-params", "", "path to the real, shared Groth16 params file for anonymous voter eligibility (see 'wallet eligibility-zk-setup' and cmd/node's -eligibility-zk-params) — required")
 	var nf networkFlags
 	nf.register(fs)
 	if err := fs.Parse(args); err != nil {
@@ -48,23 +108,33 @@ func runVote(args []string) error {
 	if *proposal == "" {
 		return fmt.Errorf("-proposal is required")
 	}
-	b, err := loadBuilder(*path, *fromStdin)
+	ctx := context.Background()
+	queryURL, err := nf.firstQueryURL()
 	if err != nil {
 		return err
 	}
-	txn, err := b.Vote(types.ID(*proposal), *approve, *paramKey, *newValue)
+	eligibility, err := buildVoteEligibility(ctx, *path, *fromStdin, queryURL, *eligibilityParams, types.ID(*proposal))
 	if err != nil {
 		return err
 	}
-	return submitTx(context.Background(), &nf, txn)
+	b, err := throwawayVoteSigner()
+	if err != nil {
+		return err
+	}
+	txn, err := b.Vote(types.ID(*proposal), *approve, *paramKey, *newValue, eligibility)
+	if err != nil {
+		return err
+	}
+	return submitTx(ctx, &nf, txn)
 }
 
 func runVoteReveal(args []string) error {
 	fs := flag.NewFlagSet("vote-reveal", flag.ExitOnError)
-	path := fs.String("keystore", "walletkey.json", "keystore to unlock")
+	path := fs.String("keystore", "walletkey.json", "keystore to unlock — the identity that minted the real NFT this vote proves eligibility from")
 	fromStdin := fs.Bool("passphrase-stdin", false, "read the passphrase from stdin instead of prompting the terminal")
 	proposal := fs.String("proposal", "", "proposal id (required) — must match an earlier vote")
 	approve := fs.Bool("approve", false, "must be the exact same value passed to the matching vote")
+	eligibilityParams := fs.String("eligibility-zk-params", "", "path to the real, shared Groth16 params file for anonymous voter eligibility (see 'wallet eligibility-zk-setup' and cmd/node's -eligibility-zk-params) — required")
 	var nf networkFlags
 	nf.register(fs)
 	if err := fs.Parse(args); err != nil {
@@ -73,15 +143,28 @@ func runVoteReveal(args []string) error {
 	if *proposal == "" {
 		return fmt.Errorf("-proposal is required")
 	}
-	b, err := loadBuilder(*path, *fromStdin)
+	ctx := context.Background()
+	queryURL, err := nf.firstQueryURL()
 	if err != nil {
 		return err
 	}
-	txn, err := b.VoteReveal(types.ID(*proposal), *approve)
+	// Rebuilding a fresh eligibility proof here (rather than reusing
+	// Vote's) still reproduces the identical Nullifier — it's
+	// deterministic in (VoterSK, ProposalID) — which is what lets this
+	// reveal open the exact ballot the matching Vote committed.
+	eligibility, err := buildVoteEligibility(ctx, *path, *fromStdin, queryURL, *eligibilityParams, types.ID(*proposal))
 	if err != nil {
 		return err
 	}
-	return submitTx(context.Background(), &nf, txn)
+	b, err := throwawayVoteSigner()
+	if err != nil {
+		return err
+	}
+	txn, err := b.VoteReveal(types.ID(*proposal), *approve, eligibility)
+	if err != nil {
+		return err
+	}
+	return submitTx(ctx, &nf, txn)
 }
 
 func runMint(args []string) error {

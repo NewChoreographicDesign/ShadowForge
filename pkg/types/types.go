@@ -22,6 +22,26 @@ func (h Hash) MarshalJSON() ([]byte, error) { return marshalHexJSON(h[:]) }
 
 func (h *Hash) UnmarshalJSON(b []byte) error { return unmarshalHexJSON(b, h[:]) }
 
+// MarshalText/UnmarshalText let Hash serialize as a JSON object key (e.g.
+// state.ProposalRecord's per-ballot Commitments/Reveals maps, now keyed
+// by a real VoteEligibilityProof.Nullifier rather than an NFTID) —
+// encoding/json requires TextMarshaler for map keys, a distinct
+// interface from the MarshalJSON pair above, which only covers Hash as a
+// value. Mirrors NFTID's own identical pair — see that type's doc.
+func (h Hash) MarshalText() ([]byte, error) { return []byte(h.String()), nil }
+
+func (h *Hash) UnmarshalText(b []byte) error {
+	decoded, err := hex.DecodeString(string(b))
+	if err != nil {
+		return fmt.Errorf("types: decode Hash hex: %w", err)
+	}
+	if len(decoded) != len(h) {
+		return fmt.Errorf("types: Hash must be %d bytes, got %d", len(h), len(decoded))
+	}
+	copy(h[:], decoded)
+	return nil
+}
+
 // SumHash hashes an arbitrary sequence of byte slices with domain
 // separation between fields (length-prefixed), so H(a||b) cannot be
 // confused with H(a) when b is empty, or with H(ab) split differently.

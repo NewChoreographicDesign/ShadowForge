@@ -303,11 +303,14 @@ func (s *Store) GetHold(id types.Hash) (types.BankHold, bool, error) {
 // --- Proposals (sealed-ballot vote commitments + reveals + tally) ---
 
 // ProposalRecord tracks one proposal's ballots and, once tallied, its
-// outcome. Commitments/Reveals are keyed by voter NFTID (one NFT, one
-// vote — spec 9.1): a second TxVote from the same voter is rejected as
-// already-committed rather than silently overwriting the first, and a
-// reveal can only ever open the exact ballot that voter committed (see
-// types.ComputeVoteCommitment).
+// outcome. Commitments/Reveals are keyed by a real anonymous ZK
+// eligibility proof's Nullifier (types.VoteEligibilityProof.Nullifier),
+// not a voter identity (one NFT, one vote — spec 9.1): a second TxVote
+// bearing the same nullifier is rejected as already-committed rather than
+// silently overwriting the first, and a reveal can only ever open the
+// exact ballot that same nullifier committed (see
+// types.ComputeVoteCommitment). Keying by nullifier rather than NFTID is
+// what makes this dedup real without ever naming which NFT cast a ballot.
 //
 // Epoch is stamped from whichever transaction first references this
 // ProposalID (a TxVote's commit, in practice — this build has no
@@ -316,8 +319,8 @@ func (s *Store) GetHold(id types.Hash) (types.BankHold, bool, error) {
 type ProposalRecord struct {
 	ProposalID  string
 	Epoch       types.EpochNumber
-	Commitments map[types.NFTID]types.Hash
-	Reveals     map[types.NFTID]bool
+	Commitments map[types.Hash]types.Hash
+	Reveals     map[types.Hash]bool
 
 	// ParamKey/NewValue optionally bind this proposal to a concrete
 	// governance.Params field change, taken from whichever TxVote first

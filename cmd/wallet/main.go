@@ -66,6 +66,8 @@ func main() {
 		err = runTransfer(args)
 	case "zk-setup":
 		err = runZKSetup(args)
+	case "eligibility-zk-setup":
+		err = runEligibilityZKSetup(args)
 	case "poh-attest":
 		err = runPoHAttest(args)
 	case "nft-mint":
@@ -107,14 +109,24 @@ its own real means, and hands you the resulting flags:
 
 Submit a real, signed, no-proof transaction (needs a bootstrap peer to
 broadcast to, and a query endpoint to confirm against). Vote/vote-reveal
-require a real, minted NFT (see 'wallet nft-mint' above) — this is a
-real, enforced Sybil-resistance check, not a formality:
-  wallet vote          -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve
-  wallet vote-reveal    -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve
+require a real, minted NFT (see 'wallet nft-mint' above) and prove it
+anonymously — a real zero-knowledge membership proof, not a formality,
+and needing its own one-time shared setup (like 'wallet zk-setup' below,
+but a separate circuit and file):
+  wallet eligibility-zk-setup -out <file>
+  wallet vote          -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve -eligibility-zk-params <file>
+  wallet vote-reveal    -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -approve -eligibility-zk-params <file>
   wallet mint           -keystore <file> -bootstrap <addr> -query <url>
   wallet nft-trait      -keystore <file> -bootstrap <addr> -query <url> -target <hex> -key <string> -delta <int>
   wallet bank-deposit    -keystore <file> -bootstrap <addr> -query <url> -asset SFG
   wallet bank-withdraw   -keystore <file> -bootstrap <addr> -query <url> -asset SFG
+
+'vote'/'vote-reveal' sign the transaction itself with a fresh, throwaway
+key — never the keystore identity that minted the NFT — and prove
+eligibility instead via a real anonymous ZK proof built by syncing that
+keystore's minted NFT from the live network (pkg/govwallet). An observer
+of the resulting transaction learns only that some real, minted NFT
+voted, never which one.
 
 Real shielded transfers (Kind Transfer — a genuine Groth16 proof; needs
 a shared params file every validator and wallet load identically — run

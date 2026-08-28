@@ -319,26 +319,34 @@ func (n *Node) buildProposalBatch(dualTrack bool) []types.ShieldedTx {
 // reveal that's genuinely wrong (bad nonce/approve, already revealed,
 // already tallied) — those still fail hard, exactly as before.
 func (n *Node) filterReadyReveals(txs []types.ShieldedTx) (ready, deferred []types.ShieldedTx) {
-	seenThisBatch := map[types.ID]map[types.NFTID]bool{}
+	// voter correlates a same-batch TxVote/TxVoteReveal pair by the real
+	// anonymous eligibility proof's Nullifier — not by SignerPubKey
+	// (types.VoteEligibilityProof's own doc: a wallet should sign each
+	// vote with a fresh, unlinked key, so SumHash(SignerPubKey) can no
+	// longer be assumed to match between a commit and its own reveal).
+	// Nullifier is deterministic given the same (VoterSK, ProposalID)
+	// pair, so it still reliably identifies "the same real voter, same
+	// proposal" here exactly as SumHash(SignerPubKey) used to.
+	seenThisBatch := map[types.ID]map[types.Hash]bool{}
 	for _, t := range txs {
 		switch t.Kind {
 		case types.TxVote:
-			if t.VotePublicInputs != nil {
-				voter := types.NFTID(types.SumHash(t.SignerPubKey))
+			if t.VotePublicInputs != nil && t.VoteEligibility != nil {
+				voter := t.VoteEligibility.Nullifier
 				pid := t.VotePublicInputs.ProposalID
 				if seenThisBatch[pid] == nil {
-					seenThisBatch[pid] = map[types.NFTID]bool{}
+					seenThisBatch[pid] = map[types.Hash]bool{}
 				}
 				seenThisBatch[pid][voter] = true
 			}
 			ready = append(ready, t)
 
 		case types.TxVoteReveal:
-			if t.VoteRevealPublicInputs == nil {
+			if t.VoteRevealPublicInputs == nil || t.VoteEligibility == nil {
 				ready = append(ready, t) // malformed; let Stage 2 reject it normally
 				continue
 			}
-			voter := types.NFTID(types.SumHash(t.SignerPubKey))
+			voter := t.VoteEligibility.Nullifier
 			pid := t.VoteRevealPublicInputs.ProposalID
 			if seenThisBatch[pid][voter] {
 				ready = append(ready, t) // its commit is earlier in this very batch
@@ -436,7 +444,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	for i, t := range prop.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(prop.Epoch), Height: prop.Height, TrustedPoHAttestors: n.trustedPoHAttestors, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(prop.Epoch), Height: prop.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 
 	if failed := firstFailure(results); failed != nil {
@@ -643,7 +651,7 @@ func (n *Node) handleBlockAnnounce(ann shadownet.BlockAnnouncePayload) {
 	for i, t := range ann.Block.Batch {
 		entries[i] = tx.Entry{Tx: t, SubmittedAt: now}
 	}
-	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(ann.Block.Epoch), Height: ann.Block.Height, TrustedPoHAttestors: n.trustedPoHAttestors, Now: func() time.Time { return now }})
+	pipeline := tx.NewPipeline(tx.Deps{Store: txn, StateTree: n.tree, ZK: n.zkSys, ZKTree: n.zkTree, ZKRoots: n.zkRoots, Vault: n.vlt, Silent: n.silentMon, Oracle: n.oracleQuorum, Governance: n.governanceParams, Epoch: types.EpochNumber(ann.Block.Epoch), Height: ann.Block.Height, TrustedPoHAttestors: n.trustedPoHAttestors, EligibilityZK: n.eligibilityZK, EligibilityTree: n.eligibilityTree, EligibilityRoots: n.eligibilityRoots, Now: func() time.Time { return now }})
 	results := pipeline.ProcessBatch(entries)
 	for _, res := range results {
 		if res.Error != nil {

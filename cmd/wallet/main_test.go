@@ -291,6 +291,14 @@ type testBackend struct {
 	// now needs real voter eligibility.
 	attestorKeystorePath       string
 	attestorKeystorePassphrase string
+
+	// eligibilityZKParamsPath is a real, shared Groth16 params file for
+	// the anonymous voter-eligibility circuit, written from the exact
+	// same in-process zk.EligibilitySystem this backend's pipeline
+	// verifies against — see 'wallet vote'/'wallet vote-reveal' own doc
+	// on why the CLI must load real, shared params from a file rather
+	// than run its own independent setup.
+	eligibilityZKParamsPath string
 }
 
 func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *zk.Tree, zkRoots *zk.RootHistory) *testBackend {
@@ -309,6 +317,33 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		t.Fatalf("open chain: %v", err)
 	}
 	attestorPath, attestorKS := newTestKeystore(t, "attestor-passphrase")
+
+	// Real, shared anonymous-voter-eligibility params — every Vote/
+	// VoteReveal-exercising test in this file needs this backend's
+	// pipeline and the CLI's own loaded copy (from the file this writes)
+	// to verify against identical Groth16 keys, exactly like zkSys above
+	// for Kind Transfer.
+	eligSys, err := zk.SetupEligibility()
+	if err != nil {
+		t.Fatalf("eligibility zk setup: %v", err)
+	}
+	eligParamsPath := filepath.Join(t.TempDir(), "eligibility-zk-params.bin")
+	eligParamsFile, err := os.Create(eligParamsPath)
+	if err != nil {
+		t.Fatalf("create eligibility zk params file: %v", err)
+	}
+	if _, err := eligSys.WriteTo(eligParamsFile); err != nil {
+		t.Fatalf("write eligibility zk params: %v", err)
+	}
+	if err := eligParamsFile.Close(); err != nil {
+		t.Fatalf("close eligibility zk params file: %v", err)
+	}
+	eligTree := zk.NewTree()
+	initialEligRoot, err := eligTree.Root()
+	if err != nil {
+		t.Fatalf("initial eligibility root: %v", err)
+	}
+
 	pipeline := tx.NewPipeline(tx.Deps{
 		Store:               store,
 		StateTree:           state.NewMerkleTree(),
@@ -316,6 +351,9 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 		ZKTree:              zkTree,
 		ZKRoots:             zkRoots,
 		TrustedPoHAttestors: []crypto.DilithiumPublicKey{attestorKS.PublicKey()},
+		EligibilityZK:       eligSys,
+		EligibilityTree:     eligTree,
+		EligibilityRoots:    zk.NewRootHistory(initialEligRoot),
 	})
 
 	v1pk, v1sk, err := crypto.GenerateDilithiumKey()
@@ -327,6 +365,7 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	b := &testBackend{
 		store: store, chn: chn, pipeline: pipeline, v1id: v1id, v1pk: v1pk, v1sk: v1sk, logf: t.Logf,
 		attestorKeystorePath: attestorPath, attestorKeystorePassphrase: "attestor-passphrase",
+		eligibilityZKParamsPath: eligParamsPath,
 	}
 
 	h, err := shadownet.NewHost("/ip4/127.0.0.1/tcp/0")
@@ -449,6 +488,7 @@ func TestCLIVoteAndVoteRevealEndToEnd(t *testing.T) {
 	err := runVote([]string{
 		"-keystore", path, "-passphrase-stdin",
 		"-proposal", "cli-prop-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
 		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
 	})
 	if err != nil {
@@ -459,6 +499,7 @@ func TestCLIVoteAndVoteRevealEndToEnd(t *testing.T) {
 	err = runVoteReveal([]string{
 		"-keystore", path, "-passphrase-stdin",
 		"-proposal", "cli-prop-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
 		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
 	})
 	if err != nil {

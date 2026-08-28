@@ -23,9 +23,9 @@ func TestDefaultParamsMatchSpecTable(t *testing.T) {
 
 func TestTallySimpleMajority(t *testing.T) {
 	ballots := []governance.Ballot{
-		{Voter: types.NFTID{1}, Approve: true},
-		{Voter: types.NFTID{2}, Approve: true},
-		{Voter: types.NFTID{3}, Approve: false},
+		{Voter: types.Hash{1}, Approve: true},
+		{Voter: types.Hash{2}, Approve: true},
+		{Voter: types.Hash{3}, Approve: false},
 	}
 	res := governance.Tally(ballots, 10, decimal.Zero)
 	if !res.Passed {
@@ -38,8 +38,8 @@ func TestTallySimpleMajority(t *testing.T) {
 
 func TestTallyDeduplicatesVoter(t *testing.T) {
 	ballots := []governance.Ballot{
-		{Voter: types.NFTID{1}, Approve: true},
-		{Voter: types.NFTID{1}, Approve: false}, // duplicate vote, first counts
+		{Voter: types.Hash{1}, Approve: true},
+		{Voter: types.Hash{1}, Approve: false}, // duplicate vote, first counts
 	}
 	res := governance.Tally(ballots, 10, decimal.Zero)
 	if res.Approve != 1 || res.Reject != 0 {
@@ -48,7 +48,7 @@ func TestTallyDeduplicatesVoter(t *testing.T) {
 }
 
 func TestTallyFailsBelowMinTurnout(t *testing.T) {
-	ballots := []governance.Ballot{{Voter: types.NFTID{1}, Approve: true}}
+	ballots := []governance.Ballot{{Voter: types.Hash{1}, Approve: true}}
 	res := governance.Tally(ballots, 100, decimal.MustFromString("0.20"))
 	if res.Passed {
 		t.Fatalf("1%% turnout must fail a 20%% minimum-turnout requirement")

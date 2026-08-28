@@ -35,6 +35,23 @@ func getZKSystem(t *testing.T) *zk.System {
 	return zkSys
 }
 
+// eligibilitySystem is likewise expensive to Setup; build it once for the
+// whole package's tests.
+var (
+	eligOnce sync.Once
+	eligSys  *zk.EligibilitySystem
+	eligErr  error
+)
+
+func getEligibilitySystem(t *testing.T) *zk.EligibilitySystem {
+	t.Helper()
+	eligOnce.Do(func() { eligSys, eligErr = zk.SetupEligibility() })
+	if eligErr != nil {
+		t.Fatalf("eligibility zk setup: %v", eligErr)
+	}
+	return eligSys
+}
+
 func openStore(t *testing.T) *state.Store {
 	t.Helper()
 	var key [32]byte
@@ -48,24 +65,83 @@ func openStore(t *testing.T) *state.Store {
 }
 
 func newDeps(t *testing.T) tx.Deps {
+	eligTree := zk.NewTree()
+	initialRoot, err := eligTree.Root()
+	if err != nil {
+		t.Fatalf("fresh eligibility tree root: %v", err)
+	}
 	return tx.Deps{
-		Store:     openStore(t),
-		StateTree: state.NewMerkleTree(),
-		ZK:        getZKSystem(t),
-		Vault:     vault.New(vault.DefaultSplits()),
+		Store:            openStore(t),
+		StateTree:        state.NewMerkleTree(),
+		ZK:               getZKSystem(t),
+		Vault:            vault.New(vault.DefaultSplits()),
+		EligibilityZK:    getEligibilitySystem(t),
+		EligibilityTree:  eligTree,
+		EligibilityRoots: zk.NewRootHistory(initialRoot),
 	}
 }
 
-// seedVoterNFT gives signerPubKey a real, minted ValidatorNFT directly in
-// deps' store — real voter eligibility (pkg/tx's own requireEligibleVoter)
-// is unconditional, so any test exercising TxVote/TxVoteReveal behavior
-// other than eligibility itself needs this first, exactly the way a real
-// wallet would need a real Kind NFTMint to have succeeded beforehand.
-func seedVoterNFT(t *testing.T, deps tx.Deps, signerPubKey []byte) {
+// voterFixture is a real identity that has minted a ValidatorNFT
+// (deps.Store) and registered its real anonymous VoterCommitment in
+// deps.EligibilityTree, so a test can build a genuine
+// VoteEligibilityProof for any proposal via eligibilityFor — real voter
+// eligibility (pkg/tx's own requireEligibleVoterZK) is unconditional, so
+// any test exercising TxVote/TxVoteReveal behavior other than
+// eligibility itself needs this first, exactly the way a real wallet
+// would need a real Kind NFTMint (and a synced pkg/govwallet.Wallet) to
+// have succeeded beforehand.
+type voterFixture struct {
+	pk        crypto.DilithiumPublicKey
+	sk        crypto.DilithiumPrivateKey
+	voterSK   zk.FieldElement
+	treeIndex int
+	deps      tx.Deps
+}
+
+// seedVoter mints a real ValidatorNFT for pk/sk directly in deps.Store
+// and inserts its real VoterCommitment into deps.EligibilityTree.
+func seedVoter(t *testing.T, deps tx.Deps, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey) *voterFixture {
 	t.Helper()
-	owner := types.AddressFromPubkey(signerPubKey)
+	owner := types.AddressFromPubkey(pk)
 	if err := deps.Store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
 		t.Fatalf("seed voter nft: %v", err)
+	}
+	voterSK := zk.DeriveVoterSK(sk)
+	idx, err := deps.EligibilityTree.Insert(zk.VoterCommitment(voterSK))
+	if err != nil {
+		t.Fatalf("insert voter commitment: %v", err)
+	}
+	newRoot, err := deps.EligibilityTree.Root()
+	if err != nil {
+		t.Fatalf("eligibility tree root: %v", err)
+	}
+	deps.EligibilityRoots.Record(newRoot)
+	return &voterFixture{pk: pk, sk: sk, voterSK: voterSK, treeIndex: idx, deps: deps}
+}
+
+// eligibilityFor builds a real, fresh zk.EligibilitySystem proof that v
+// holds a real, minted NFT eligible to vote on proposalID, without
+// revealing which leaf it is.
+func (v *voterFixture) eligibilityFor(t *testing.T, proposalID types.ID) *types.VoteEligibilityProof {
+	t.Helper()
+	proof, err := v.deps.EligibilityTree.Prove(v.treeIndex)
+	if err != nil {
+		t.Fatalf("merkle proof: %v", err)
+	}
+	scope := zk.FieldElementFromBytes32(types.VoteEligibilityScope(proposalID))
+	in := zk.EligibilityInput{MerkleRoot: proof.Root, ProposalScope: scope, VoterSK: v.voterSK, Proof: proof}
+	zproof, err := v.deps.EligibilityZK.Prove(in)
+	if err != nil {
+		t.Fatalf("prove eligibility: %v", err)
+	}
+	proofBytes, err := zk.ProofToBytes(zproof)
+	if err != nil {
+		t.Fatalf("proof to bytes: %v", err)
+	}
+	return &types.VoteEligibilityProof{
+		Proof:      proofBytes,
+		MerkleRoot: types.Hash(zk.ToBytes32(proof.Root)),
+		Nullifier:  types.Hash(zk.ToBytes32(in.Nullifier())),
 	}
 }
 
@@ -654,12 +730,22 @@ func TestPipelineVoteRejectsUnmintedWallet(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
 
+	// A never-minted keypair's own claimed VoteEligibility: syntactically
+	// well-formed (so it clears Stage 2's mere "not nil" well-formedness
+	// check) but anchored to nothing real (an unrecognized/empty root and
+	// an unprovable proof), so real Stage 4 ZK verification — not just a
+	// missing-field check — is what rejects it.
+	forgedEligibility := func(seed byte) *types.VoteEligibilityProof {
+		return &types.VoteEligibilityProof{Nullifier: types.Hash{seed}}
+	}
+
 	voteTx := mustSign(t, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("sybil-proposal"),
 			Commitment: types.Hash{1},
 		},
+		VoteEligibility: forgedEligibility(1),
 	})
 	results := p.ProcessBatch([]tx.Entry{{Tx: voteTx, SubmittedAt: time.Now()}})
 	if results[0].Error == nil {
@@ -681,6 +767,7 @@ func TestPipelineVoteRejectsUnmintedWallet(t *testing.T) {
 				ProposalID: types.ID("sybil-proposal"),
 				Commitment: types.Hash{byte(i + 2)},
 			},
+			VoteEligibility: forgedEligibility(byte(i + 2)),
 		})
 		if r := p.ProcessBatch([]tx.Entry{{Tx: sybilTx, SubmittedAt: time.Now()}}); r[0].Error == nil {
 			t.Fatalf("expected sybil attempt %d (fresh unminted keypair) to be rejected", i)
@@ -697,15 +784,20 @@ func TestPipelineVoteRejectsUnmintedWallet(t *testing.T) {
 func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 	deps := newDeps(t)
 	p := tx.NewPipeline(deps)
-	voteTx := mustSign(t, types.ShieldedTx{
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	voter := seedVoter(t, deps, pk, sk)
+	elig := voter.eligibilityFor(t, "proposal-42")
+	voteTx := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("proposal-42"),
 			Commitment: types.Hash{1, 2, 3},
 		},
+		VoteEligibility: elig,
 	})
-	seedVoterNFT(t, deps, voteTx.SignerPubKey)
-	voter1 := types.NFTID(types.SumHash(voteTx.SignerPubKey))
 	results := p.ProcessBatch([]tx.Entry{{Tx: voteTx, SubmittedAt: time.Now()}})
 	if results[0].Error != nil {
 		t.Fatalf("expected vote to succeed: %v", results[0].Error)
@@ -714,19 +806,25 @@ func TestPipelineVoteRecordsBallotCommitment(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("expected a proposal record: found=%v err=%v", found, err)
 	}
-	if len(record.Commitments) != 1 || record.Commitments[voter1] != (types.Hash{1, 2, 3}) {
+	if len(record.Commitments) != 1 || record.Commitments[elig.Nullifier] != (types.Hash{1, 2, 3}) {
 		t.Fatalf("unexpected proposal commitments: %+v", record.Commitments)
 	}
 
 	// A second ballot from a different voter on the same proposal accumulates.
-	voteTx2 := mustSign(t, types.ShieldedTx{
+	pk2, sk2, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate signer key: %v", err)
+	}
+	voter2 := seedVoter(t, deps, pk2, sk2)
+	elig2 := voter2.eligibilityFor(t, "proposal-42")
+	voteTx2 := mustSignWithKey(t, pk2, sk2, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("proposal-42"),
 			Commitment: types.Hash{4, 5, 6},
 		},
+		VoteEligibility: elig2,
 	})
-	seedVoterNFT(t, deps, voteTx2.SignerPubKey)
 	results2 := p.ProcessBatch([]tx.Entry{{Tx: voteTx2, SubmittedAt: time.Now()}})
 	if results2[0].Error != nil {
 		t.Fatalf("expected second vote to succeed: %v", results2[0].Error)
@@ -749,13 +847,15 @@ func TestPipelineVoteRejectsDoubleVoteFromSameVoter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk)
+	voter := seedVoter(t, deps, pk, sk)
+	elig := voter.eligibilityFor(t, "proposal-double")
 	first := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("proposal-double"),
 			Commitment: types.Hash{1},
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: first, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("expected the first ballot to succeed: %v", r[0].Error)
@@ -767,6 +867,7 @@ func TestPipelineVoteRejectsDoubleVoteFromSameVoter(t *testing.T) {
 			ProposalID: types.ID("proposal-double"),
 			Commitment: types.Hash{2},
 		},
+		VoteEligibility: elig,
 	})
 	r := p.ProcessBatch([]tx.Entry{{Tx: second, SubmittedAt: time.Now()}})
 	if r[0].Error == nil {
@@ -786,10 +887,10 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk)
-	voter := types.NFTID(types.SumHash([]byte(pk)))
+	voter := seedVoter(t, deps, pk, sk)
+	elig := voter.eligibilityFor(t, "proposal-reveal")
 	nonce := types.Hash{7, 7, 7}
-	commitment := types.ComputeVoteCommitment(voter, true, nonce)
+	commitment := types.ComputeVoteCommitment(elig.Nullifier, true, nonce)
 
 	commitTx := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind: types.TxVote,
@@ -797,6 +898,7 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 			ProposalID: types.ID("proposal-reveal"),
 			Commitment: commitment,
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: commitTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("expected the commit to succeed: %v", r[0].Error)
@@ -810,6 +912,7 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 			Approve:    false,
 			Nonce:      nonce,
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: wrongApprove, SubmittedAt: time.Now()}}); r[0].Error == nil {
 		t.Fatalf("expected a reveal with the wrong Approve to be rejected")
@@ -823,6 +926,7 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 			Approve:    true,
 			Nonce:      types.Hash{9, 9, 9},
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: wrongNonce, SubmittedAt: time.Now()}}); r[0].Error == nil {
 		t.Fatalf("expected a reveal with the wrong nonce to be rejected")
@@ -836,6 +940,7 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 			Approve:    true,
 			Nonce:      nonce,
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("expected the genuine reveal to succeed: %v", r[0].Error)
@@ -845,7 +950,7 @@ func TestPipelineVoteRevealMatchingCommitmentRecordsChoice(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("expected a proposal record: found=%v err=%v", found, err)
 	}
-	approve, revealed := record.Reveals[voter]
+	approve, revealed := record.Reveals[elig.Nullifier]
 	if !revealed || !approve {
 		t.Fatalf("expected the voter's Approve=true reveal to be recorded, got revealed=%v approve=%v", revealed, approve)
 	}
@@ -872,13 +977,14 @@ func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate signer key: %v", err)
 		}
-		seedVoterNFT(t, deps, pk)
-		voter := types.NFTID(types.SumHash([]byte(pk)))
+		voter := seedVoter(t, deps, pk, sk)
+		elig := voter.eligibilityFor(t, "tally-proposal")
 		nonce := types.Hash{byte(len(pk))}
-		commitment := types.ComputeVoteCommitment(voter, approve, nonce)
+		commitment := types.ComputeVoteCommitment(elig.Nullifier, approve, nonce)
 		commitTx := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 			Kind:             types.TxVote,
 			VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("tally-proposal"), Commitment: commitment},
+			VoteEligibility:  elig,
 		})
 		if r := p.ProcessBatch([]tx.Entry{{Tx: commitTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
 			t.Fatalf("commit: %v", r[0].Error)
@@ -888,6 +994,7 @@ func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
 			VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
 				ProposalID: types.ID("tally-proposal"), Approve: approve, Nonce: nonce,
 			},
+			VoteEligibility: elig,
 		})
 		if r := p.ProcessBatch([]tx.Entry{{Tx: revealTx, SubmittedAt: time.Now()}}); r[0].Error != nil {
 			t.Fatalf("reveal: %v", r[0].Error)
@@ -943,10 +1050,11 @@ func TestTallyDueProposalsCountsRevealedBallots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk)
+	lateVoter := seedVoter(t, deps, pk, sk)
 	lateVote := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind:             types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{ProposalID: types.ID("tally-proposal"), Commitment: types.Hash{1}},
+		VoteEligibility:  lateVoter.eligibilityFor(t, "tally-proposal"),
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: lateVote, SubmittedAt: time.Now()}}); r[0].Error == nil {
 		t.Fatalf("expected a vote on an already-tallied proposal to be rejected")
@@ -971,17 +1079,18 @@ func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk1)
-	voter1 := types.NFTID(types.SumHash([]byte(pk1)))
+	voter1 := seedVoter(t, deps, pk1, sk1)
+	elig1 := voter1.eligibilityFor(t, "raise-deposit-atr")
 	nonce1 := types.Hash{1}
 	commit1 := mustSignWithKey(t, pk1, sk1, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("raise-deposit-atr"),
-			Commitment: types.ComputeVoteCommitment(voter1, true, nonce1),
+			Commitment: types.ComputeVoteCommitment(elig1.Nullifier, true, nonce1),
 			ParamKey:   "DepositATRMultiple",
 			NewValue:   "4",
 		},
+		VoteEligibility: elig1,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: commit1, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("commit1: %v", r[0].Error)
@@ -991,6 +1100,7 @@ func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
 		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
 			ProposalID: types.ID("raise-deposit-atr"), Approve: true, Nonce: nonce1,
 		},
+		VoteEligibility: elig1,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal1, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("reveal1: %v", r[0].Error)
@@ -1003,17 +1113,18 @@ func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk2)
-	voter2 := types.NFTID(types.SumHash([]byte(pk2)))
+	voter2 := seedVoter(t, deps, pk2, sk2)
+	elig2 := voter2.eligibilityFor(t, "raise-deposit-atr")
 	nonce2 := types.Hash{2}
 	commit2 := mustSignWithKey(t, pk2, sk2, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("raise-deposit-atr"),
-			Commitment: types.ComputeVoteCommitment(voter2, true, nonce2),
+			Commitment: types.ComputeVoteCommitment(elig2.Nullifier, true, nonce2),
 			ParamKey:   "SomethingElseEntirely",
 			NewValue:   "999",
 		},
+		VoteEligibility: elig2,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: commit2, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("commit2: %v", r[0].Error)
@@ -1023,6 +1134,7 @@ func TestTallyDueProposalsAppliesPassedParamChange(t *testing.T) {
 		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
 			ProposalID: types.ID("raise-deposit-atr"), Approve: true, Nonce: nonce2,
 		},
+		VoteEligibility: elig2,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal2, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("reveal2: %v", r[0].Error)
@@ -1090,17 +1202,18 @@ func TestTallyDueProposalsAppliesVaultShareChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk)
-	voter := types.NFTID(types.SumHash([]byte(pk)))
+	voter := seedVoter(t, deps, pk, sk)
+	elig := voter.eligibilityFor(t, "raise-burn-share")
 	nonce := types.Hash{3}
 	commit := mustSignWithKey(t, pk, sk, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("raise-burn-share"),
-			Commitment: types.ComputeVoteCommitment(voter, true, nonce),
+			Commitment: types.ComputeVoteCommitment(elig.Nullifier, true, nonce),
 			ParamKey:   "VaultBurnShare",
 			NewValue:   "0.25",
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: commit, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("commit: %v", r[0].Error)
@@ -1110,6 +1223,7 @@ func TestTallyDueProposalsAppliesVaultShareChange(t *testing.T) {
 		VoteRevealPublicInputs: &types.VoteRevealPublicInputs{
 			ProposalID: types.ID("raise-burn-share"), Approve: true, Nonce: nonce,
 		},
+		VoteEligibility: elig,
 	})
 	if r := p.ProcessBatch([]tx.Entry{{Tx: reveal, SubmittedAt: time.Now()}}); r[0].Error != nil {
 		t.Fatalf("reveal: %v", r[0].Error)
@@ -1160,7 +1274,8 @@ func TestPipelineSpikeDetectionHoldsFloodingWallet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, pk)
+	voter := seedVoter(t, deps, pk, sk)
+	elig := voter.eligibilityFor(t, "spike-test-proposal")
 	addr := types.Address(types.SumHash([]byte(pk)))
 	deps.Silent.SetBaseline(addr, decimal.FromInt(1)) // 1 tx/min normal
 
@@ -1172,6 +1287,7 @@ func TestPipelineSpikeDetectionHoldsFloodingWallet(t *testing.T) {
 				ProposalID: types.ID("spike-test-proposal"),
 				Commitment: types.Hash{commit},
 			},
+			VoteEligibility: elig,
 		})
 	}
 
@@ -1211,13 +1327,14 @@ func TestPipelineSpikeDetectionHoldsFloodingWallet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate other signer key: %v", err)
 	}
-	seedVoterNFT(t, deps, otherPK)
+	otherVoter := seedVoter(t, deps, otherPK, otherSK)
 	otherTx := mustSignWithKey(t, otherPK, otherSK, types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID("spike-test-proposal"),
 			Commitment: types.Hash{99},
 		},
+		VoteEligibility: otherVoter.eligibilityFor(t, "spike-test-proposal"),
 	})
 	otherRes := p.ProcessBatch([]tx.Entry{{Tx: otherTx, SubmittedAt: now}})
 	if otherRes[0].Error != nil {

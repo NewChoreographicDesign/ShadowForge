@@ -17,6 +17,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/txclient"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
+	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
 
 func openStore(t *testing.T) *state.Store {
@@ -449,7 +450,23 @@ func TestSubmitAndConfirmEndToEnd(t *testing.T) {
 		t.Fatalf("open chain: %v", err)
 	}
 	mempool := tx.NewMempool()
-	pipeline := tx.NewPipeline(tx.Deps{Store: store, StateTree: state.NewMerkleTree()})
+	eligSys, err := zk.SetupEligibility()
+	if err != nil {
+		t.Fatalf("eligibility zk setup: %v", err)
+	}
+	eligTree := zk.NewTree()
+	initialEligRoot, err := eligTree.Root()
+	if err != nil {
+		t.Fatalf("initial eligibility root: %v", err)
+	}
+	eligRoots := zk.NewRootHistory(initialEligRoot)
+	pipeline := tx.NewPipeline(tx.Deps{
+		Store:            store,
+		StateTree:        state.NewMerkleTree(),
+		EligibilityZK:    eligSys,
+		EligibilityTree:  eligTree,
+		EligibilityRoots: eligRoots,
+	})
 
 	v1pk, v1sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
@@ -519,14 +536,71 @@ func TestSubmitAndConfirmEndToEnd(t *testing.T) {
 		t.Fatalf("new client: %v", err)
 	}
 
-	txn := mustSignedVote(t, "e2e-proof")
-	// Real voter eligibility (pkg/tx's requireEligibleVoter) is
-	// unconditional: this Vote's signer needs a real, minted NFT before
-	// the pipeline goroutine above will accept it.
-	txnOwner := types.AddressFromPubkey(txn.SignerPubKey)
-	if err := store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(txnOwner[:])), Owner: txnOwner}); err != nil {
+	// Real, anonymous voter eligibility (pkg/tx's requireEligibleVoterZK)
+	// is unconditional: this Vote needs a real ZK proof, anchored to a
+	// real leaf this test itself registers directly in the pipeline's
+	// eligibility tree (mirroring what a real Kind NFTMint would do at
+	// Stage 4), before the pipeline goroutine above will accept it.
+	voterPK, voterSK, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("gen voter: %v", err)
+	}
+	if err := store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(voterPK)), Owner: types.AddressFromPubkey(voterPK)}); err != nil {
 		t.Fatalf("seed voter nft: %v", err)
 	}
+	voterFieldSK := zk.DeriveVoterSK(voterSK)
+	leafIdx, err := eligTree.Insert(zk.VoterCommitment(voterFieldSK))
+	if err != nil {
+		t.Fatalf("insert voter commitment: %v", err)
+	}
+	newEligRoot, err := eligTree.Root()
+	if err != nil {
+		t.Fatalf("eligibility tree root: %v", err)
+	}
+	// Nothing has gone through Stage 4 yet to record this root itself
+	// (that's the pipeline's own job on a real Kind NFTMint), so record
+	// it directly here — the same real, deterministic root such a mint
+	// would have produced — so the proof below anchors to a root Stage 4's
+	// real eligibility check actually recognizes.
+	eligRoots.Record(newEligRoot)
+
+	merkleProof, err := eligTree.Prove(leafIdx)
+	if err != nil {
+		t.Fatalf("merkle proof: %v", err)
+	}
+	scope := zk.FieldElementFromBytes32(types.VoteEligibilityScope(types.ID("e2e-proof")))
+	eligIn := zk.EligibilityInput{MerkleRoot: merkleProof.Root, ProposalScope: scope, VoterSK: voterFieldSK, Proof: merkleProof}
+	eligProof, err := eligSys.Prove(eligIn)
+	if err != nil {
+		t.Fatalf("prove eligibility: %v", err)
+	}
+	eligProofBytes, err := zk.ProofToBytes(eligProof)
+	if err != nil {
+		t.Fatalf("eligibility proof to bytes: %v", err)
+	}
+	elig := &types.VoteEligibilityProof{
+		Proof:      eligProofBytes,
+		MerkleRoot: types.Hash(zk.ToBytes32(merkleProof.Root)),
+		Nullifier:  types.Hash(zk.ToBytes32(eligIn.Nullifier())),
+	}
+
+	txn := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID: types.ID("e2e-proof"),
+			Commitment: types.ComputeVoteCommitment(elig.Nullifier, true, types.Hash{0x9}),
+		},
+		VoteEligibility: elig,
+		Nullifier:       types.Hash{0x2},
+	}
+	txn.TxID = types.ComputeTxID(txn.Proof, txn.Commitments, txn.Nullifier)
+	txnSig, err := crypto.DilithiumSign(voterSK, txn.TxID[:])
+	if err != nil {
+		t.Fatalf("sign vote: %v", err)
+	}
+	txn.Sig = types.DilithiumSig(txnSig)
+	txn.SignerPubKey = []byte(voterPK)
+
 	st, err := c.SubmitAndConfirm(context.Background(), txn, 5*time.Second)
 	if err != nil {
 		t.Fatalf("submit and confirm: %v", err)

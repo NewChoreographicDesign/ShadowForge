@@ -145,25 +145,41 @@ package — this is not a stub with comments describing intended behavior.
   unwired: it needs an App-layer proposer-path choice (direct vs.
   staked) this L1-core build doesn't implement, a real, documented
   boundary rather than a fabricated mechanism.
-- **Real, enforced voter eligibility — closing a genuine Sybil-voting
-  gap live testing found.** Casting a ballot originally needed nothing
-  but a freshly generated keypair: `requireEligibleVoter`
-  (`pkg/tx/pipeline.go`) now requires the signer to hold a real,
-  non-slashed `ValidatorNFT`, looked up via a real secondary store index
-  (`state.Store.GetNFTByOwner`). That NFT itself now has a real, live
-  origination path this build was previously missing entirely: `Kind
-  NFTMint` claims spec 10.1's free, one-per-wallet soulbound NFT,
-  enforced against a real, signed proof-of-humanity attestation
+- **Real, enforced, anonymous voter eligibility — closing a genuine
+  Sybil-voting gap live testing found, then closing the identity leak
+  the first fix itself introduced.** Casting a ballot originally needed
+  nothing but a freshly generated keypair. The first fix
+  (`requireEligibleVoter`) closed that by requiring the signer to hold a
+  real, minted `ValidatorNFT`, looked up via a real secondary store index
+  — sound, but it permanently tied every ballot to a public, long-lived
+  wallet address (the tx's own signature revealed who cast it). This
+  build now replaces that with a real anonymous zero-knowledge membership
+  proof: `pkg/zk.EligibilityCircuit` (a real Groth16 circuit, structurally
+  the same Merkle-membership-plus-nullifier shape as the shielded
+  Transfer circuit) proves "the caster holds a real, minted NFT" without
+  revealing which one, and `requireEligibleVoterZK`
+  (`pkg/tx/pipeline.go`) verifies it — an observer of a `TxVote`/
+  `TxVoteReveal` learns only that some real NFT voted, never which one,
+  because the transaction is signed with a fresh, throwaway key
+  unrelated to the identity that minted the NFT (`types.
+  VoteEligibilityProof`'s own doc). The eligibility-tree leaf a wallet
+  proves membership of (`NFTMintPublicInputs.VoterCommitment`) is
+  registered by the same real `Kind NFTMint` path spec 10.1 describes —
+  a real, signed proof-of-humanity attestation
   (`pkg/nft.PoHAttestation`/`SignPoHAttestation`, checked against a
-  node's configured `-poh-attestor-keys`) — the actual CAPTCHA/human-
-  verification challenge stays App-layer/out of scope per spec, but the
-  cryptographic chain proving an attestor really vouched for a specific
-  wallet is real and enforced. `cmd/wallet poh-attest`/`nft-mint` are
-  the two-role CLI for it. A real, disclosed follow-up: this ties a
-  ballot to a wallet's long-lived identity rather than a fully anonymous
-  eligibility proof, a deliberate trade-off against `cmd/walletsim`'s
-  own throwaway-per-session identity design — see that command's own
-  doc and `pkg/tx`'s `TxVote` case for the reasoning.
+  node's `-poh-attestor-keys`) still gates who can mint one; the actual
+  CAPTCHA/human-verification challenge stays App-layer/out of scope per
+  spec. `pkg/govwallet.Wallet` is the real, network-syncing client that
+  replays every committed `NFTMint`'s `VoterCommitment` to build a real
+  proof (mirroring `pkg/shieldedwallet`'s own sync-and-prove design for
+  shielded transfers); `cmd/wallet poh-attest`/`nft-mint`/`vote`/
+  `vote-reveal`/`eligibility-zk-setup` are the real CLI for the whole
+  flow. A real, disclosed limitation of the anonymous design: because a
+  valid proof never reveals which leaf it opens, a node cannot re-check
+  whether that specific NFT has since been slashed — see
+  `requireEligibleVoterZK`'s own doc. `cmd/walletsim`'s throwaway-per-
+  session identities still can't vote (no real NFT ever backs them), a
+  disclosed trade-off unrelated to this fix — see that command's own doc.
 
 ## Security
 
@@ -218,6 +234,7 @@ pkg/bank/ pkg/oracle/  ATR deposit/withdraw math, oracle quorum, hashed-IP corre
 pkg/vault/           fee treasury and splits
 pkg/nft/             soulbound mint/traits/Trust Points/slashing
 pkg/governance/       genesis parameters, NFT-weighted voting
+pkg/govwallet/         real network-syncing client for anonymous voter-eligibility proofs (Kind Vote/VoteReveal)
 pkg/container/        enterprise L1 container subspace
 pkg/silent/            Poisson silent-TX padding + wallet spike detection (spec 15.4)
 deployments/docker/   Dockerfile + docker-compose.yml (4-node network)

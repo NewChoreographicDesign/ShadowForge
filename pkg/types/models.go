@@ -114,6 +114,11 @@ type ShieldedTx struct {
 	TraitPublicInputs      *TraitPublicInputs
 	NFTMintPublicInputs    *NFTMintPublicInputs
 
+	// VoteEligibility is the real anonymous ZK proof of "one NFT, one
+	// vote" eligibility required alongside VotePublicInputs/
+	// VoteRevealPublicInputs — see VoteEligibilityProof's own doc.
+	VoteEligibility *VoteEligibilityProof
+
 	// TransferPublicInputs carries the exact, fixed-shape public inputs
 	// pkg/zk's TransferCircuit was actually proved and must be verified
 	// against, for Kind Transfer. The top-level Nullifier/Commitments
@@ -151,12 +156,18 @@ type BankPublicInputs struct {
 }
 
 // VotePublicInputs binds a proposal id and a yes/no commitment for Vote kind.
-// Commitment must equal ComputeVoteCommitment(voterNFTID, approve, nonce)
+// Commitment must equal ComputeVoteCommitment(nullifier, approve, nonce)
 // for some (approve, nonce) the voter keeps secret until they later reveal
-// it in a TxVoteReveal — a standard sealed-ballot commit-reveal, not a
-// zero-knowledge circuit: the voter's identity is already public (the
-// TxVote's own Dilithium signature reveals who cast it), only the choice
-// stays hidden until reveal.
+// it in a TxVoteReveal — a sealed-ballot commit-reveal on top of a real
+// zero-knowledge eligibility proof (ShieldedTx.VoteEligibility): nullifier
+// is that proof's own Nullifier, not a public identity. The TxVote's own
+// Dilithium Sig/SignerPubKey still authenticate the transaction bytes
+// against tampering, but — unlike this build's earlier design — need not
+// be, and for the anonymity property below to mean anything must not be,
+// the same keypair the voter's NFT was minted to; a wallet should sign
+// with a fresh, unlinked key per vote. Only VoteEligibility ties a ballot
+// to a real, minted NFT, and it does so without revealing which one (see
+// VoteEligibilityProof's own doc).
 type VotePublicInputs struct {
 	ProposalID ID
 	Commitment Hash
@@ -177,19 +188,60 @@ type VotePublicInputs struct {
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce
 // must reproduce the Commitment the voter's earlier TxVote for the same
-// ProposalID bound, via ComputeVoteCommitment.
+// ProposalID bound, via ComputeVoteCommitment. VoteEligibility is
+// re-proved here too, not just at commit time (see pkg/tx's Stage 4 for
+// why: the same nullifier must reappear, tying this reveal to the exact
+// ballot its matching TxVote committed).
 type VoteRevealPublicInputs struct {
 	ProposalID ID
 	Approve    bool
 	Nonce      Hash
 }
 
+// VoteEligibilityProof is a real, anonymous zero-knowledge proof of spec
+// 9.1's "one NFT, one vote": that the caster holds a leaf in the real
+// eligibility-commitment tree (populated only by real, PoH-verified Kind
+// NFTMint mints — see NFTMintPublicInputs.VoterCommitment) without
+// revealing which leaf, bound to one specific proposal via Nullifier so
+// the same NFT cannot cast two ballots on it while remaining free to vote
+// on a different one (a different proposal yields an unlinkable
+// nullifier — see VoteEligibilityScope). Proof is a real gnark Groth16
+// proof over pkg/zk.EligibilityCircuit; pkg/zk.EligibilitySystem verifies
+// it.
+//
+// This replaces this build's earlier plaintext SignerPubKey -> owner ->
+// NFT lookup, which permanently tied every ballot to a public, long-lived
+// wallet address. A real, disclosed trade-off of the anonymous design: a
+// verifier can no longer tell whether the specific NFT behind a valid
+// proof has since been slashed, since doing so would require learning
+// which leaf voted — see pkg/tx's Stage 4 doc for the full disclosure.
+type VoteEligibilityProof struct {
+	Proof      []byte // gnark Groth16 proof bytes (pkg/zk.EligibilitySystem)
+	MerkleRoot Hash   // claimed eligibility-tree root the proof anchors to
+	// Nullifier is the proof's own per-(voter secret, proposal) output —
+	// also the real per-proposal ballot dedup key (pkg/state.
+	// ProposalRecord.Commitments/Reveals), replacing the old NFTID key.
+	Nullifier Hash
+}
+
+// VoteEligibilityScope derives the public, proposal-scoping value a real
+// VoteEligibilityProof's Nullifier is bound to (MiMC(VoterSK, scope) in
+// pkg/zk.EligibilityCircuit). Both the prover (a wallet building a Vote/
+// VoteReveal) and the verifier (pkg/tx's pipeline, which already has
+// ProposalID on the tx) derive it identically from ProposalID alone, so
+// it never needs to be transmitted as a separate tx field.
+func VoteEligibilityScope(proposalID ID) Hash {
+	return SumHash([]byte("shadowforge-vote-eligibility-scope-v1"), []byte(proposalID))
+}
+
 // ComputeVoteCommitment is this build's canonical sealed-ballot commit
 // formula (see VotePublicInputs' doc: spec 17.4 names the commit step but
-// not a concrete scheme). voter is the caster's NFTID — binding it into
-// the hash ties a commitment to one specific voter, so a reveal can only
-// open the ballot the same voter actually committed, not anyone else's.
-func ComputeVoteCommitment(voter NFTID, approve bool, nonce Hash) Hash {
+// not a concrete scheme). voter is the caster's real
+// VoteEligibilityProof.Nullifier, not a public identity — binding it into
+// the hash still ties a commitment to one specific (anonymous) voter, so
+// a reveal can only open the ballot the same voter actually committed,
+// not anyone else's, without that voter ever being named.
+func ComputeVoteCommitment(voter Hash, approve bool, nonce Hash) Hash {
 	var approveByte [1]byte
 	if approve {
 		approveByte[0] = 1
@@ -225,6 +277,20 @@ type NFTMintPublicInputs struct {
 	AttestationIssuedAtMs int64
 	Attestor              []byte
 	AttestationSig        DilithiumSig
+	// VoterCommitment is the real, anonymous eligibility-tree leaf this
+	// mint registers — MiMC(VoterSK) for a VoterSK the wallet derives
+	// deterministically from its own signing key and never reveals
+	// directly (zk.DeriveVoterSK/zk.VoterCommitment). pkg/tx's pipeline
+	// inserts it into the real eligibility commitment tree at Stage 4,
+	// the same way a Transfer's OutCommits are inserted into the note
+	// tree; see VoteEligibilityProof for what later proves membership in
+	// it without revealing which leaf. This field is public (any NFTMint
+	// is already a public, PoH-attested event tying Owner to this leaf at
+	// mint time) — the anonymity a later vote gets comes from the
+	// membership proof never disclosing which past mint it corresponds
+	// to, exactly as a shielded Transfer's later spend hides which past
+	// output it spends even though that output's own creation was public.
+	VoterCommitment Hash
 }
 
 // Vote is a single BFT signature from an assigned stage validator (spec 4.3).

@@ -51,9 +51,12 @@ type Proposal struct {
 }
 
 // Ballot is one NFT holder's vote. One NFT, one vote — spec 9.1:
-// "governance weight (via NFT + optional stake)".
+// "governance weight (via NFT + optional stake)". Voter is a real
+// anonymous ZK eligibility proof's Nullifier (types.
+// VoteEligibilityProof.Nullifier), not a named identity — see
+// pkg/state.ProposalRecord's own doc for why dedup keys off it.
 type Ballot struct {
-	Voter   types.NFTID
+	Voter   types.Hash
 	Approve bool
 }
 
@@ -69,7 +72,7 @@ type TallyResult struct {
 // each NFT counts) and applies simple majority among cast votes, gated by a
 // minimum-turnout requirement. minTurnout of zero means no turnout floor.
 func Tally(ballots []Ballot, eligibleNFTs int, minTurnout decimal.Decimal) TallyResult {
-	seen := map[types.NFTID]bool{}
+	seen := map[types.Hash]bool{}
 	var approve, reject int
 	for _, b := range ballots {
 		if seen[b.Voter] {

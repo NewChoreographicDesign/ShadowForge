@@ -16,6 +16,7 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 	"github.com/shadowforge/shadowforge-l1/pkg/validator"
 	"github.com/shadowforge/shadowforge-l1/pkg/vault"
+	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
 
 // TestFourNodesConvergeOnSameChain is the real multi-node proof this
@@ -40,6 +41,17 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 		HeartbeatInterval: 50 * time.Millisecond,
 		OnlineTimeout:     3 * time.Second,
 		Genesis:           consensus.GenesisTime(genesisMs),
+	}
+
+	// One real, shared Groth16 system for anonymous voter eligibility —
+	// every node must verify against the exact same proving/verifying
+	// keys (see zk.EligibilitySystem.WriteTo's own doc on why an
+	// independent setup per process could never interoperate), the same
+	// real constraint zkSys would carry here for Kind Transfer had this
+	// test exercised it.
+	eligSys, err := zk.SetupEligibility()
+	if err != nil {
+		t.Fatalf("eligibility zk setup: %v", err)
 	}
 
 	nodes := make([]*validator.Node, n)
@@ -71,7 +83,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 		logf := func(format string, args ...interface{}) {
 			t.Logf("node%d: "+format, append([]interface{}{idx}, args...)...)
 		}
-		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, mempool, pk, sk, false, logf)
+		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, eligSys, mempool, pk, sk, false, logf)
 	}
 
 	// Full mesh: every node dials every other node, so Broadcast (which
@@ -131,7 +143,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 	}
 	connectCancel()
 
-	voteTx := mustSignIntegrationVote(t, stores, "integration-proposal")
+	voteTx := mustSignIntegrationVote(t, nodes, stores, eligSys, "integration-proposal")
 	env, err := shadownet.NewEnvelope(shadownet.MsgTxOffer, shadownet.TxOfferPayload{Tx: voteTx})
 	if err != nil {
 		t.Fatalf("build tx offer: %v", err)
@@ -185,14 +197,16 @@ func openIntegrationStore(t *testing.T, idx int) *state.Store {
 	return s
 }
 
-// mustSignIntegrationVote builds a real, signed TxVote and seeds a real
-// ValidatorNFT for its fresh signer key into every node's store, in
-// lockstep — real voter eligibility (pkg/tx's requireEligibleVoter) is
-// unconditional and each of the 4 nodes here independently re-verifies
-// this transaction against its own store, so every one needs the
-// identical real NFT record, not just whichever node happens to receive
-// the tx first.
-func mustSignIntegrationVote(t *testing.T, stores []*state.Store, proposalID string) types.ShieldedTx {
+// mustSignIntegrationVote builds a real, signed TxVote with a real,
+// anonymous ZK eligibility proof: it seeds a real ValidatorNFT and a real
+// eligibility-tree VoterCommitment for its fresh signer key into every
+// node's store/tree, in lockstep (Node.SeedEligibility — see that
+// method's own doc), then builds the actual proof against a local
+// mirror of the same tree state. Each of the 4 nodes here independently
+// re-verifies this transaction against its own state, so every one needs
+// identical real state, not just whichever node happens to receive the
+// tx first.
+func mustSignIntegrationVote(t *testing.T, nodes []*validator.Node, stores []*state.Store, eligSys *zk.EligibilitySystem, proposalID string) types.ShieldedTx {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
@@ -205,12 +219,51 @@ func mustSignIntegrationVote(t *testing.T, stores []*state.Store, proposalID str
 			t.Fatalf("seed voter nft on node %d: %v", i, err)
 		}
 	}
+
+	voterSK := zk.DeriveVoterSK(sk)
+	commitment := types.Hash(zk.ToBytes32(zk.VoterCommitment(voterSK)))
+	for i, node := range nodes {
+		if _, err := node.SeedEligibility(commitment); err != nil {
+			t.Fatalf("seed eligibility on node %d: %v", i, err)
+		}
+	}
+
+	// A local mirror of the identical single-leaf tree every node above
+	// just advanced, to build the real Merkle proof from — mirroring how
+	// a real wallet (pkg/govwallet.Wallet) maintains its own local mirror
+	// synced from the network rather than reaching into a node directly.
+	mirrorTree := zk.NewTree()
+	idx, err := mirrorTree.Insert(zk.VoterCommitment(voterSK))
+	if err != nil {
+		t.Fatalf("mirror tree insert: %v", err)
+	}
+	proof, err := mirrorTree.Prove(idx)
+	if err != nil {
+		t.Fatalf("mirror tree prove: %v", err)
+	}
+	scope := zk.FieldElementFromBytes32(types.VoteEligibilityScope(types.ID(proposalID)))
+	eligIn := zk.EligibilityInput{MerkleRoot: proof.Root, ProposalScope: scope, VoterSK: voterSK, Proof: proof}
+	zproof, err := eligSys.Prove(eligIn)
+	if err != nil {
+		t.Fatalf("prove eligibility: %v", err)
+	}
+	proofBytes, err := zk.ProofToBytes(zproof)
+	if err != nil {
+		t.Fatalf("proof to bytes: %v", err)
+	}
+	elig := &types.VoteEligibilityProof{
+		Proof:      proofBytes,
+		MerkleRoot: types.Hash(zk.ToBytes32(proof.Root)),
+		Nullifier:  types.Hash(zk.ToBytes32(eligIn.Nullifier())),
+	}
+
 	in := types.ShieldedTx{
 		Kind: types.TxVote,
 		VotePublicInputs: &types.VotePublicInputs{
 			ProposalID: types.ID(proposalID),
 			Commitment: types.Hash{1, 2, 3, 4},
 		},
+		VoteEligibility: elig,
 	}
 	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
 	sig, err := crypto.DilithiumSign(sk, in.TxID[:])

@@ -7,19 +7,23 @@
 // trusted setup; Vote does not).
 //
 // A real, disclosed limitation as of this build's real voter-eligibility
-// check (pkg/tx's requireEligibleVoter, closing a real Sybil-voting gap):
-// every ballot this tool casts will now be rejected by any node that
-// enforces it, since submitRandomVote's fresh, throwaway-per-session
+// check (pkg/tx's requireEligibleVoterZK, closing a real Sybil-voting
+// gap): every ballot this tool casts will now be rejected by any node
+// that enforces it, since submitRandomVote's fresh, throwaway-per-session
 // identity (see that function's own doc on why that's deliberate) never
-// holds a real, PoH-verified ValidatorNFT. This tool still exercises the
-// real commit-reveal wire mechanics and signature checks end to end —
-// useful for load/liveness testing the pipeline's earlier stages — but
-// no longer demonstrates a ballot actually being tallied. Giving it a
-// persistent, pre-minted identity would fix that at the cost of the
-// very throwaway-identity behavior it exists to model; this reference
-// build leaves that tension for whoever wires a real anonymous
-// eligibility proof (see pkg/tx's own doc on TxVote) rather than
-// resolving it here.
+// holds a real, PoH-verified ValidatorNFT — and, now that eligibility is
+// a real anonymous ZK membership proof (pkg/govwallet,
+// types.VoteEligibilityProof) rather than a plaintext owner lookup, this
+// tool has no real VoterSK to prove membership with either way. This
+// tool still exercises the real commit-reveal wire mechanics, signature
+// checks, and Stage 2/3 well-formedness end to end — useful for
+// load/liveness testing the pipeline's earlier stages — but no longer
+// demonstrates a ballot actually being tallied. Giving it a persistent,
+// pre-minted identity (and syncing a real pkg/govwallet.Wallet to build
+// a genuine proof) would fix that at the cost of the very
+// throwaway-identity behavior it exists to model; this reference build
+// leaves that tension unresolved here rather than compromising either
+// side of it.
 package main
 
 import (
@@ -133,7 +137,16 @@ func submitRandomVote(ctx context.Context, node *shadownet.Node) error {
 	if err != nil {
 		return fmt.Errorf("generate throwaway voter key: %w", err)
 	}
-	voter := types.NFTID(types.SumHash([]byte(pk)))
+	// A syntactically well-formed but unproven stand-in nullifier: this
+	// tool never holds a real minted NFT (see the package doc above), so
+	// it has no real VoterSK to build an actual zk.EligibilitySystem
+	// proof from. Populating VoteEligibility with a random Nullifier and
+	// no real Proof bytes lets this simulated ballot exercise Stage 2/3
+	// well-formedness the same as a real one, still failing where the
+	// package doc says it will — real ZK proof verification at Stage 4 —
+	// rather than failing earlier for the unrelated reason of a missing
+	// field.
+	voter := types.Hash(types.SumHash([]byte(pk)))
 
 	var nonceBytes [32]byte
 	if _, err := rand.Read(nonceBytes[:]); err != nil {
@@ -153,6 +166,7 @@ func submitRandomVote(ctx context.Context, node *shadownet.Node) error {
 			ProposalID: types.ID("sim-proposal"),
 			Commitment: commitment,
 		},
+		VoteEligibility: &types.VoteEligibilityProof{Nullifier: voter},
 		// TxID = Hash(proof || commitments || nullifier) per spec 4.1;
 		// VotePublicInputs isn't part of that hash, so without a
 		// per-submission Nullifier here every commit tx would collide on
@@ -175,7 +189,8 @@ func submitRandomVote(ctx context.Context, node *shadownet.Node) error {
 			Approve:    approve,
 			Nonce:      nonce,
 		},
-		Nullifier: types.SumHash(nonce[:], []byte("reveal")), // distinct from commitTx's — see its comment
+		VoteEligibility: &types.VoteEligibilityProof{Nullifier: voter},
+		Nullifier:       types.SumHash(nonce[:], []byte("reveal")), // distinct from commitTx's — see its comment
 	}
 	if err := signAndSend(ctx, node, pk, sk, revealTx); err != nil {
 		return fmt.Errorf("submit ballot reveal: %w", err)

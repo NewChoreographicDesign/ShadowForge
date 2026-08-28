@@ -415,12 +415,12 @@ func TestHoldRoundTripsRealRecord(t *testing.T) {
 
 func TestProposalReturnsAggregateNotPerVoterData(t *testing.T) {
 	env := newTestEnv(t)
-	voter := types.NFTID{0x77}
+	voter := types.Hash{0x77}
 	rec := state.ProposalRecord{
 		ProposalID:  "prop-1",
 		Epoch:       3,
-		Commitments: map[types.NFTID]types.Hash{voter: {0x88}},
-		Reveals:     map[types.NFTID]bool{voter: true},
+		Commitments: map[types.Hash]types.Hash{voter: {0x88}},
+		Reveals:     map[types.Hash]bool{voter: true},
 		Tallied:     true,
 		Approve:     5,
 		Reject:      2,

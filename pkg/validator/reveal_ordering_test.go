@@ -19,8 +19,14 @@ import (
 // mustSignRevealWithKey builds a real, correctly-signed TxVoteReveal for
 // proposalID/approve/nonce, signed by the given keypair — mirroring
 // mustSignVote's TxVote construction so a matching commit/reveal pair can
-// be built by the same voter.
-func mustSignRevealWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, proposalID string, approve bool, nonce types.Hash) types.ShieldedTx {
+// be built by the same voter. elig carries the (real or, for these
+// filterReadyReveals-only tests, merely consistent-Nullifier) eligibility
+// proof filterReadyReveals reads to correlate a reveal with its earlier
+// commit — filterReadyReveals itself never verifies the proof
+// cryptographically (that's Stage 4's job), only pkg/tx's pipeline does,
+// so these tests don't need a real Groth16 proof, just a matching
+// Nullifier.
+func mustSignRevealWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, proposalID string, approve bool, nonce types.Hash, elig *types.VoteEligibilityProof) types.ShieldedTx {
 	t.Helper()
 	in := types.ShieldedTx{
 		Kind: types.TxVoteReveal,
@@ -29,7 +35,8 @@ func mustSignRevealWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto
 			Approve:    approve,
 			Nonce:      nonce,
 		},
-		Nullifier: types.SumHash([]byte(pk), []byte(proposalID), []byte("reveal")),
+		VoteEligibility: elig,
+		Nullifier:       types.SumHash([]byte(pk), []byte(proposalID), []byte("reveal")),
 	}
 	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
 	sig, err := crypto.DilithiumSign(sk, in.TxID[:])
@@ -43,7 +50,7 @@ func mustSignRevealWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto
 
 // mustSignVoteWithKey mirrors mustSignVote but with a caller-supplied
 // keypair, so a commit and its later reveal come from the same voter.
-func mustSignVoteWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, proposalID string, commitment types.Hash) types.ShieldedTx {
+func mustSignVoteWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, proposalID string, commitment types.Hash, elig *types.VoteEligibilityProof) types.ShieldedTx {
 	t.Helper()
 	in := types.ShieldedTx{
 		Kind: types.TxVote,
@@ -51,7 +58,8 @@ func mustSignVoteWithKey(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.D
 			ProposalID: types.ID(proposalID),
 			Commitment: commitment,
 		},
-		Nullifier: types.SumHash([]byte(pk), []byte(proposalID), []byte("commit")),
+		VoteEligibility: elig,
+		Nullifier:       types.SumHash([]byte(pk), []byte(proposalID), []byte("commit")),
 	}
 	in.TxID = types.ComputeTxID(in.Proof, in.Commitments, in.Nullifier)
 	sig, err := crypto.DilithiumSign(sk, in.TxID[:])
@@ -71,7 +79,8 @@ func TestFilterReadyRevealsDefersRevealWithNoDurableCommit(t *testing.T) {
 	}
 	// A reveal arrives with no commit anywhere — neither durably
 	// committed nor present in the same candidate batch.
-	reveal := mustSignRevealWithKey(t, pk, sk, "race-proposal", true, types.Hash{1})
+	elig := &types.VoteEligibilityProof{Nullifier: types.Hash{42}}
+	reveal := mustSignRevealWithKey(t, pk, sk, "race-proposal", true, types.Hash{1}, elig)
 
 	ready, deferred := n.filterReadyReveals([]types.ShieldedTx{reveal})
 	if len(ready) != 0 {
@@ -88,11 +97,11 @@ func TestFilterReadyRevealsAllowsRevealWhoseCommitIsEarlierInSameBatch(t *testin
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	voter := types.NFTID(types.SumHash([]byte(pk)))
+	elig := &types.VoteEligibilityProof{Nullifier: types.Hash{55}}
 	nonce := types.Hash{2}
-	commitment := types.ComputeVoteCommitment(voter, true, nonce)
-	commit := mustSignVoteWithKey(t, pk, sk, "same-batch-proposal", commitment)
-	reveal := mustSignRevealWithKey(t, pk, sk, "same-batch-proposal", true, nonce)
+	commitment := types.ComputeVoteCommitment(elig.Nullifier, true, nonce)
+	commit := mustSignVoteWithKey(t, pk, sk, "same-batch-proposal", commitment, elig)
+	reveal := mustSignRevealWithKey(t, pk, sk, "same-batch-proposal", true, nonce, elig)
 
 	// Commit appears earlier in the SAME candidate batch as its reveal —
 	// this is the ordinary, common case (gossip delivered in order) and
@@ -112,22 +121,22 @@ func TestFilterReadyRevealsAllowsRevealWhoseCommitIsDurablyCommitted(t *testing.
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	voter := types.NFTID(types.SumHash([]byte(pk)))
+	elig := &types.VoteEligibilityProof{Nullifier: types.Hash{77}}
 	nonce := types.Hash{3}
-	commitment := types.ComputeVoteCommitment(voter, true, nonce)
+	commitment := types.ComputeVoteCommitment(elig.Nullifier, true, nonce)
 
 	// Simulate an already-durably-committed commit for this voter,
 	// exactly the shape pipeline.go's TxVote case would have persisted.
 	record := state.ProposalRecord{
 		ProposalID:  "durable-proposal",
-		Commitments: map[types.NFTID]types.Hash{voter: commitment},
-		Reveals:     map[types.NFTID]bool{},
+		Commitments: map[types.Hash]types.Hash{elig.Nullifier: commitment},
+		Reveals:     map[types.Hash]bool{},
 	}
 	if err := n.store.PutProposal(record); err != nil {
 		t.Fatalf("seed committed proposal: %v", err)
 	}
 
-	reveal := mustSignRevealWithKey(t, pk, sk, "durable-proposal", true, nonce)
+	reveal := mustSignRevealWithKey(t, pk, sk, "durable-proposal", true, nonce, elig)
 	ready, deferred := n.filterReadyReveals([]types.ShieldedTx{reveal})
 	if len(deferred) != 0 {
 		t.Fatalf("expected nothing to be deferred, got %+v", deferred)
@@ -156,7 +165,7 @@ func TestBuildProposalBatchDefersNotYetReadyRevealAndReinserts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generate signer key: %v", err)
 	}
-	stranded := mustSignRevealWithKey(t, pk, sk, "stranded-proposal", true, types.Hash{9})
+	stranded := mustSignRevealWithKey(t, pk, sk, "stranded-proposal", true, types.Hash{9}, &types.VoteEligibilityProof{Nullifier: types.Hash{88}})
 	if err := n.mempool.Submit(stranded, time.Now()); err != nil {
 		t.Fatalf("submit: %v", err)
 	}

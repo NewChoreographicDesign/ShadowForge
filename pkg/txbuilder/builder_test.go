@@ -1,6 +1,7 @@
 package txbuilder_test
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -12,7 +13,30 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/txbuilder"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
+	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
+
+// realEligibilitySystem lazily runs one real Groth16 setup for
+// zk.EligibilityCircuit and shares it across every test in this file —
+// mirroring pkg/tx/pipeline_test.go's own zkOnce pattern for
+// TransferCircuit: a real setup is expensive enough that every test
+// building its own would slow the suite for no real benefit, and every
+// test needs the exact same proving/verifying keys to interoperate
+// anyway.
+var (
+	eligOnce sync.Once
+	eligSys  *zk.EligibilitySystem
+	eligErr  error
+)
+
+func realEligibilitySystem(t *testing.T) *zk.EligibilitySystem {
+	t.Helper()
+	eligOnce.Do(func() { eligSys, eligErr = zk.SetupEligibility() })
+	if eligErr != nil {
+		t.Fatalf("eligibility zk setup: %v", eligErr)
+	}
+	return eligSys
+}
 
 func openStore(t *testing.T) *state.Store {
 	t.Helper()
@@ -29,14 +53,26 @@ func openStore(t *testing.T) *state.Store {
 // newRealPipeline builds a genuine tx.Pipeline — the exact same
 // validation code a live node runs — so every test in this file proves
 // txbuilder's output against real acceptance logic, not a mock of it.
+// Every pipeline gets a real, shared EligibilityZK system and a fresh
+// EligibilityTree/EligibilityRoots pair — TxVote/TxVoteReveal's real
+// anonymous eligibility check is unconditional (fail-closed), so any
+// test exercising them needs these wired regardless of extra.
 func newRealPipeline(t *testing.T, extra tx.Deps) (*tx.Pipeline, tx.Deps) {
 	t.Helper()
+	eligTree := zk.NewTree()
+	initialRoot, err := eligTree.Root()
+	if err != nil {
+		t.Fatalf("fresh eligibility tree root: %v", err)
+	}
 	deps := tx.Deps{
-		Store:           openStore(t),
-		StateTree:       state.NewMerkleTree(),
-		Oracle:          extra.Oracle,
-		OracleTolerance: extra.OracleTolerance,
-		Epoch:           extra.Epoch,
+		Store:            openStore(t),
+		StateTree:        state.NewMerkleTree(),
+		Oracle:           extra.Oracle,
+		OracleTolerance:  extra.OracleTolerance,
+		Epoch:            extra.Epoch,
+		EligibilityZK:    realEligibilitySystem(t),
+		EligibilityTree:  eligTree,
+		EligibilityRoots: zk.NewRootHistory(initialRoot),
 	}
 	return tx.NewPipeline(deps), deps
 }
@@ -50,12 +86,27 @@ func newIdentity(t *testing.T) *txbuilder.Builder {
 	return txbuilder.New(pk, sk)
 }
 
+// voterIdentity is a real identity that has both minted a ValidatorNFT
+// (deps.Store) and registered its real anonymous VoterCommitment in
+// deps.EligibilityTree, so it can build a genuine VoteEligibilityProof
+// for any proposal via eligibilityFor. It embeds *txbuilder.Builder so
+// every ordinary Builder method (Vote, VoteReveal, Identity, ...) is
+// still available directly.
+type voterIdentity struct {
+	*txbuilder.Builder
+	voterSK   zk.FieldElement
+	treeIndex int
+	tree      *zk.Tree
+	sys       *zk.EligibilitySystem
+}
+
 // newVoterIdentity is newIdentity plus a real, minted ValidatorNFT seeded
-// directly into deps.Store — real voter eligibility (pkg/tx's
-// requireEligibleVoter) is unconditional, so any test proving TxVote/
+// directly into deps.Store and a real VoterCommitment leaf inserted into
+// deps.EligibilityTree — real voter eligibility (pkg/tx's
+// requireEligibleVoterZK) is unconditional, so any test proving TxVote/
 // TxVoteReveal acceptance through the real pipeline needs this instead
 // of newIdentity.
-func newVoterIdentity(t *testing.T, deps tx.Deps) *txbuilder.Builder {
+func newVoterIdentity(t *testing.T, deps tx.Deps) *voterIdentity {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
 	if err != nil {
@@ -65,7 +116,52 @@ func newVoterIdentity(t *testing.T, deps tx.Deps) *txbuilder.Builder {
 	if err := deps.Store.PutNFT(types.ValidatorNFT{ID: types.NFTID(types.SumHash(owner[:])), Owner: owner}); err != nil {
 		t.Fatalf("seed voter nft: %v", err)
 	}
-	return txbuilder.New(pk, sk)
+	voterSK := zk.DeriveVoterSK(sk)
+	idx, err := deps.EligibilityTree.Insert(zk.VoterCommitment(voterSK))
+	if err != nil {
+		t.Fatalf("insert voter commitment: %v", err)
+	}
+	newRoot, err := deps.EligibilityTree.Root()
+	if err != nil {
+		t.Fatalf("eligibility tree root: %v", err)
+	}
+	deps.EligibilityRoots.Record(newRoot)
+	return &voterIdentity{
+		Builder:   txbuilder.New(pk, sk),
+		voterSK:   voterSK,
+		treeIndex: idx,
+		tree:      deps.EligibilityTree,
+		sys:       deps.EligibilityZK,
+	}
+}
+
+// eligibilityFor builds a real, fresh zk.EligibilitySystem proof that v
+// holds a real, minted NFT eligible to vote on proposalID, without
+// revealing which leaf it is — exactly what a real wallet
+// (pkg/govwallet.Wallet.BuildEligibilityProof) would produce, built here
+// directly against the same in-process tree/system rather than over a
+// live network, since these are txbuilder-level unit tests.
+func (v *voterIdentity) eligibilityFor(t *testing.T, proposalID types.ID) types.VoteEligibilityProof {
+	t.Helper()
+	proof, err := v.tree.Prove(v.treeIndex)
+	if err != nil {
+		t.Fatalf("merkle proof: %v", err)
+	}
+	scope := zk.FieldElementFromBytes32(types.VoteEligibilityScope(proposalID))
+	in := zk.EligibilityInput{MerkleRoot: proof.Root, ProposalScope: scope, VoterSK: v.voterSK, Proof: proof}
+	zproof, err := v.sys.Prove(in)
+	if err != nil {
+		t.Fatalf("prove eligibility: %v", err)
+	}
+	proofBytes, err := zk.ProofToBytes(zproof)
+	if err != nil {
+		t.Fatalf("proof to bytes: %v", err)
+	}
+	return types.VoteEligibilityProof{
+		Proof:      proofBytes,
+		MerkleRoot: types.Hash(zk.ToBytes32(proof.Root)),
+		Nullifier:  types.Hash(zk.ToBytes32(in.Nullifier())),
+	}
 }
 
 func runOne(p *tx.Pipeline, txn types.ShieldedTx) error {
@@ -110,8 +206,9 @@ func TestBuilderIdentityMatchesConsensusConvention(t *testing.T) {
 func TestVoteAcceptedByRealPipelineAndRecordsCommitment(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
 	b := newVoterIdentity(t, deps)
+	elig := b.eligibilityFor(t, "prop-1")
 
-	votetx, err := b.Vote("prop-1", true, "", "")
+	votetx, err := b.Vote("prop-1", true, "", "", elig)
 	if err != nil {
 		t.Fatalf("build vote: %v", err)
 	}
@@ -125,7 +222,7 @@ func TestVoteAcceptedByRealPipelineAndRecordsCommitment(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("expected a real proposal record to exist: found=%v err=%v", found, err)
 	}
-	if _, voted := record.Commitments[b.Identity()]; !voted {
+	if _, voted := record.Commitments[elig.Nullifier]; !voted {
 		t.Fatalf("expected this identity's commitment to be recorded")
 	}
 }
@@ -135,7 +232,7 @@ func TestVoteWithParamKeyBindsFirstVoteOnly(t *testing.T) {
 	first := newVoterIdentity(t, deps)
 	second := newVoterIdentity(t, deps)
 
-	firstVote, err := first.Vote("prop-param", true, "DepositATRMultiple", "4")
+	firstVote, err := first.Vote("prop-param", true, "DepositATRMultiple", "4", first.eligibilityFor(t, "prop-param"))
 	if err != nil {
 		t.Fatalf("build first vote: %v", err)
 	}
@@ -143,7 +240,7 @@ func TestVoteWithParamKeyBindsFirstVoteOnly(t *testing.T) {
 		t.Fatalf("first vote: %v", err)
 	}
 
-	secondVote, err := second.Vote("prop-param", false, "WithdrawATRMultiple", "9")
+	secondVote, err := second.Vote("prop-param", false, "WithdrawATRMultiple", "9", second.eligibilityFor(t, "prop-param"))
 	if err != nil {
 		t.Fatalf("build second vote: %v", err)
 	}
@@ -163,8 +260,9 @@ func TestVoteWithParamKeyBindsFirstVoteOnly(t *testing.T) {
 func TestSecondVoteFromSameIdentityRejectedByRealPipeline(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
 	b := newVoterIdentity(t, deps)
+	elig := b.eligibilityFor(t, "prop-dup")
 
-	first, err := b.Vote("prop-dup", true, "", "")
+	first, err := b.Vote("prop-dup", true, "", "", elig)
 	if err != nil {
 		t.Fatalf("build first vote: %v", err)
 	}
@@ -173,10 +271,11 @@ func TestSecondVoteFromSameIdentityRejectedByRealPipeline(t *testing.T) {
 	}
 
 	// The deterministic nonce means calling Vote again with the same
-	// (proposal, approve) reproduces the identical transaction — proving
-	// the idempotency property this package's doc promises, while also
-	// exercising the pipeline's real one-NFT-one-vote rejection.
-	second, err := b.Vote("prop-dup", true, "", "")
+	// (proposal, approve, eligibility) reproduces the identical
+	// transaction — proving the idempotency property this package's doc
+	// promises, while also exercising the pipeline's real
+	// one-NFT-one-vote (nullifier dedup) rejection.
+	second, err := b.Vote("prop-dup", true, "", "", elig)
 	if err != nil {
 		t.Fatalf("build second vote: %v", err)
 	}
@@ -191,8 +290,9 @@ func TestSecondVoteFromSameIdentityRejectedByRealPipeline(t *testing.T) {
 func TestVoteRevealRoundTripAcceptedByRealPipeline(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
 	b := newVoterIdentity(t, deps)
+	elig := b.eligibilityFor(t, "prop-reveal")
 
-	votetx, err := b.Vote("prop-reveal", true, "", "")
+	votetx, err := b.Vote("prop-reveal", true, "", "", elig)
 	if err != nil {
 		t.Fatalf("build vote: %v", err)
 	}
@@ -200,7 +300,7 @@ func TestVoteRevealRoundTripAcceptedByRealPipeline(t *testing.T) {
 		t.Fatalf("vote: %v", err)
 	}
 
-	revealtx, err := b.VoteReveal("prop-reveal", true)
+	revealtx, err := b.VoteReveal("prop-reveal", true, b.eligibilityFor(t, "prop-reveal"))
 	if err != nil {
 		t.Fatalf("build reveal: %v", err)
 	}
@@ -213,7 +313,7 @@ func TestVoteRevealRoundTripAcceptedByRealPipeline(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("expected a proposal record: found=%v err=%v", found, err)
 	}
-	if approve, revealed := record.Reveals[b.Identity()]; !revealed || !approve {
+	if approve, revealed := record.Reveals[elig.Nullifier]; !revealed || !approve {
 		t.Fatalf("expected a real, correct reveal recorded: revealed=%v approve=%v", revealed, approve)
 	}
 }
@@ -222,7 +322,7 @@ func TestVoteRevealRejectsWrongApproveValue(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
 	b := newVoterIdentity(t, deps)
 
-	votetx, err := b.Vote("prop-mismatch", true, "", "")
+	votetx, err := b.Vote("prop-mismatch", true, "", "", b.eligibilityFor(t, "prop-mismatch"))
 	if err != nil {
 		t.Fatalf("build vote: %v", err)
 	}
@@ -231,7 +331,7 @@ func TestVoteRevealRejectsWrongApproveValue(t *testing.T) {
 	}
 
 	// Reveal claims the opposite of what was actually committed.
-	wrongReveal, err := b.VoteReveal("prop-mismatch", false)
+	wrongReveal, err := b.VoteReveal("prop-mismatch", false, b.eligibilityFor(t, "prop-mismatch"))
 	if err != nil {
 		t.Fatalf("build reveal: %v", err)
 	}
@@ -244,7 +344,7 @@ func TestVoteRevealWithoutPriorVoteRejectedByRealPipeline(t *testing.T) {
 	p, deps := newRealPipeline(t, tx.Deps{})
 	b := newVoterIdentity(t, deps)
 
-	revealtx, err := b.VoteReveal("prop-never-voted", true)
+	revealtx, err := b.VoteReveal("prop-never-voted", true, b.eligibilityFor(t, "prop-never-voted"))
 	if err != nil {
 		t.Fatalf("build reveal: %v", err)
 	}
@@ -255,14 +355,14 @@ func TestVoteRevealWithoutPriorVoteRejectedByRealPipeline(t *testing.T) {
 
 func TestVoteRejectsEmptyProposalID(t *testing.T) {
 	b := newIdentity(t)
-	if _, err := b.Vote("", true, "", ""); err == nil {
+	if _, err := b.Vote("", true, "", "", types.VoteEligibilityProof{}); err == nil {
 		t.Fatalf("expected an empty proposal id to be rejected")
 	}
 }
 
 func TestVoteRevealRejectsEmptyProposalID(t *testing.T) {
 	b := newIdentity(t)
-	if _, err := b.VoteReveal("", true); err == nil {
+	if _, err := b.VoteReveal("", true, types.VoteEligibilityProof{}); err == nil {
 		t.Fatalf("expected an empty proposal id to be rejected")
 	}
 }

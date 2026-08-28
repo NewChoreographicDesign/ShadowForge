@@ -93,7 +93,24 @@ type Deps struct {
 	// governance-Sybil-resistance (TxVote/TxVoteReveal below) now
 	// depends on.
 	TrustedPoHAttestors []crypto.DilithiumPublicKey
-	Now                 func() time.Time
+	// EligibilityZK, EligibilityTree, and EligibilityRoots are the real
+	// anonymous-eligibility counterparts of ZK/ZKTree/ZKRoots above, for
+	// the eligibility-commitment tree Kind NFTMint populates (Stage 4)
+	// and TxVote/TxVoteReveal prove membership against
+	// (requireEligibleVoterZK). Like TrustedPoHAttestors, and unlike
+	// every ZK*/Silent/Oracle/Governance field above, EligibilityZK ==
+	// nil is NOT "check disabled" — every TxVote/TxVoteReveal is
+	// rejected fail-closed, since this is exactly what real
+	// Sybil-resistance now depends on (a nil-tolerant "skip the check"
+	// default here would silently let anyone vote). EligibilityTree/
+	// EligibilityRoots must both be set whenever EligibilityZK is —
+	// requireEligibleVoterZK treats a nil EligibilityRoots as a real
+	// configuration error, not a disabled check, once EligibilityZK
+	// itself is configured.
+	EligibilityZK    *zk.EligibilitySystem
+	EligibilityTree  *zk.Tree
+	EligibilityRoots *zk.RootHistory
+	Now              func() time.Time
 }
 
 func (d Deps) now() time.Time {
@@ -354,9 +371,15 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 		if t.VotePublicInputs == nil {
 			return fmt.Errorf("vote tx missing public inputs")
 		}
+		if t.VoteEligibility == nil {
+			return fmt.Errorf("vote tx missing real anonymous eligibility proof (VoteEligibility)")
+		}
 	case types.TxVoteReveal:
 		if t.VoteRevealPublicInputs == nil {
 			return fmt.Errorf("vote reveal tx missing public inputs")
+		}
+		if t.VoteEligibility == nil {
+			return fmt.Errorf("vote reveal tx missing real anonymous eligibility proof (VoteEligibility)")
 		}
 	case types.TxNFTTrait:
 		if t.TraitPublicInputs == nil {
@@ -505,17 +528,17 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		// only what got revealed — see types.ComputeVoteCommitment and
 		// the TxVoteReveal case below.
 		//
-		// Real voter eligibility (spec 9.1's "one NFT, one vote"): the
-		// signer must actually own a real, minted, non-slashed
-		// ValidatorNFT — see requireEligibleVoter's own doc for why this
-		// is a pure additional gate rather than a change to the
-		// commitment/dedup scheme below (voter stays SumHash(pubkey),
-		// exactly as every existing client already computes it).
-		if err := p.requireEligibleVoter(t.SignerPubKey); err != nil {
+		// Real, anonymous voter eligibility (spec 9.1's "one NFT, one
+		// vote"): requireEligibleVoterZK verifies a real ZK proof that
+		// the caster holds a minted NFT without learning which one — see
+		// its own doc. voter is that proof's own Nullifier, which is
+		// what dedup below keys off (not a name), and it is also what
+		// ComputeVoteCommitment binds instead of a public identity.
+		voter, err := p.requireEligibleVoterZK(t.VoteEligibility, t.VotePublicInputs.ProposalID)
+		if err != nil {
 			return err
 		}
 		pub := t.VotePublicInputs
-		voter := types.NFTID(types.SumHash(t.SignerPubKey))
 		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
 		if err != nil {
 			return fmt.Errorf("proposal lookup: %w", err)
@@ -524,8 +547,8 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 			record = state.ProposalRecord{
 				ProposalID:  string(pub.ProposalID),
 				Epoch:       p.deps.Epoch,
-				Commitments: map[types.NFTID]types.Hash{},
-				Reveals:     map[types.NFTID]bool{},
+				Commitments: map[types.Hash]types.Hash{},
+				Reveals:     map[types.Hash]bool{},
 				// Only the first vote to reference this ProposalID binds
 				// what it does (types.VotePublicInputs' own doc) — a
 				// later voter's own ParamKey/NewValue are never
@@ -539,7 +562,7 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 			return fmt.Errorf("proposal %s already tallied; voting is closed", pub.ProposalID)
 		}
 		if _, already := record.Commitments[voter]; already {
-			return fmt.Errorf("voter %s has already cast a ballot for proposal %s", voter, pub.ProposalID)
+			return fmt.Errorf("a ballot with this nullifier has already been cast for proposal %s (double-vote)", pub.ProposalID)
 		}
 		record.Commitments[voter] = pub.Commitment
 		if err := p.deps.Store.PutProposal(record); err != nil {
@@ -550,15 +573,16 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		// Opens a sealed TxVote ballot: Approve/Nonce must reproduce the
 		// Commitment that voter's earlier TxVote bound, or the reveal is
 		// rejected outright — this is a real cryptographic check against
-		// stored on-chain state, not a trust-the-caller flag. Eligibility
-		// is re-checked here too (not just at commit time): an NFT
-		// slashed between a TxVote and its TxVoteReveal must not have its
-		// ballot count.
-		if err := p.requireEligibleVoter(t.SignerPubKey); err != nil {
+		// stored on-chain state, not a trust-the-caller flag.
+		// Eligibility is re-proved here too (not just at commit time):
+		// the reveal must carry a valid proof for the same nullifier the
+		// matching TxVote committed under, or it cannot open that
+		// ballot at all (see the Commitments lookup below).
+		voter, err := p.requireEligibleVoterZK(t.VoteEligibility, t.VoteRevealPublicInputs.ProposalID)
+		if err != nil {
 			return err
 		}
 		pub := t.VoteRevealPublicInputs
-		voter := types.NFTID(types.SumHash(t.SignerPubKey))
 		record, found, err := p.deps.Store.GetProposal(string(pub.ProposalID))
 		if err != nil {
 			return fmt.Errorf("proposal lookup: %w", err)
@@ -571,10 +595,10 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		}
 		commitment, committed := record.Commitments[voter]
 		if !committed {
-			return fmt.Errorf("voter %s has not cast a ballot for proposal %s", voter, pub.ProposalID)
+			return fmt.Errorf("no ballot with this nullifier has been cast for proposal %s", pub.ProposalID)
 		}
 		if record.Reveals[voter] {
-			return fmt.Errorf("voter %s has already revealed their ballot for proposal %s", voter, pub.ProposalID)
+			return fmt.Errorf("a ballot with this nullifier has already been revealed for proposal %s", pub.ProposalID)
 		}
 		if want := types.ComputeVoteCommitment(voter, pub.Approve, pub.Nonce); want != commitment {
 			return fmt.Errorf("reveal does not match the earlier commitment for proposal %s", pub.ProposalID)
@@ -649,38 +673,94 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		if err := p.deps.Store.PutNFT(minted); err != nil {
 			return fmt.Errorf("persist minted nft: %w", err)
 		}
+		// Real anonymous voter eligibility (VoteEligibilityProof): insert
+		// this mint's VoterCommitment into the same real, canonical
+		// commitment tree TxVote/TxVoteReveal later prove membership
+		// against, exactly mirroring how Kind Transfer's OutCommits are
+		// inserted into ZKTree above — every honest node builds an
+		// identical EligibilityTree by processing NFTMints in the same
+		// committed order.
+		if p.deps.EligibilityTree != nil {
+			if _, err := p.deps.EligibilityTree.Insert(zk.FieldElementFromBytes32(pub.VoterCommitment)); err != nil {
+				return fmt.Errorf("insert voter commitment into eligibility tree: %w", err)
+			}
+			if p.deps.EligibilityRoots != nil {
+				newRoot, err := p.deps.EligibilityTree.Root()
+				if err != nil {
+					return fmt.Errorf("compute eligibility tree root: %w", err)
+				}
+				p.deps.EligibilityRoots.Record(newRoot)
+			}
+		}
 	}
 
 	t.StageHints = t.StageHints.With(4)
 	return nil
 }
 
-// requireEligibleVoter enforces spec 9.1's "one NFT, one vote" for real:
-// signerPubKey must belong to a wallet that actually holds a real,
-// minted, non-slashed ValidatorNFT (via GetNFTByOwner's real secondary
-// index — see Kind NFTMint for the only live path that creates one).
-// Deliberately a pure additional gate, not a change to the ballot
-// commitment/dedup scheme (pkg/tx's TxVote/TxVoteReveal cases still key
-// everything off types.NFTID(types.SumHash(signerPubKey)), exactly as
-// every existing client — pkg/txbuilder.Vote included — already
-// computes it): the commitment hash a client builds locally must still
-// match what a later reveal recomputes, and changing what value feeds
-// that hash would break every existing, already-signed ballot's ability
-// to ever be revealed. Requiring eligibility here instead ties a vote to
-// a real Sybil-resistant credential without touching that math at all.
-func (p *Pipeline) requireEligibleVoter(signerPubKey []byte) error {
-	owner := types.AddressFromPubkey(signerPubKey)
-	rec, found, err := p.deps.Store.GetNFTByOwner(owner)
-	if err != nil {
-		return fmt.Errorf("voter eligibility lookup: %w", err)
+// requireEligibleVoterZK enforces spec 9.1's "one NFT, one vote"
+// anonymously: it verifies a real ZK proof that the caster holds some
+// real, minted NFT (a leaf in Deps.EligibilityTree, populated only by
+// real Kind NFTMint mints — see that Stage 4 case) without ever learning
+// which one. This is the anonymous replacement for this build's earlier
+// requireEligibleVoter, which resolved SignerPubKey to a real owner
+// address and looked up that owner's NFT directly — sound, but a
+// permanent public link between every ballot and a long-lived wallet
+// identity. Proving membership this way instead means an observer of a
+// Vote/VoteReveal transaction learns nothing about which NFT cast it,
+// only that a real one did.
+//
+// On success it returns the proof's own Nullifier — what the
+// TxVote/TxVoteReveal cases above key ballot commit/dedup off, instead of
+// a named voter. Nullifier is scoped to proposalID (types.
+// VoteEligibilityScope), so the same real NFT proves a distinct,
+// unlinkable nullifier for each different proposal it votes on, while
+// reproducing the identical one for a second attempt on the same
+// proposal — that reproduction, not a lookup by identity, is what makes
+// double-voting on one proposal actually impossible.
+//
+// A real, disclosed limitation of this anonymous design, replacing the
+// old check's rec.Slashed test: because a valid proof never reveals
+// which leaf it opens, this cannot tell whether that specific NFT has
+// since been slashed. Revoking an anonymous credential needs either a
+// slashed-leaf accumulator or epoch-scoped re-registration, and this
+// build implements neither yet — see governance.ProposalSlashNFT's own
+// doc, which already discloses that automated slash execution itself
+// isn't wired end to end in this build.
+func (p *Pipeline) requireEligibleVoterZK(proof *types.VoteEligibilityProof, proposalID types.ID) (types.Hash, error) {
+	if p.deps.EligibilityZK == nil {
+		return types.Hash{}, fmt.Errorf("no anonymous eligibility ZK system configured; cannot verify a voter eligibility proof")
 	}
-	if !found {
-		return fmt.Errorf("wallet holds no minted NFT — governance voting requires a real, PoH-verified NFT (see Kind NFTMint)")
+	if p.deps.EligibilityRoots == nil {
+		return types.Hash{}, fmt.Errorf("no eligibility root history configured; cannot verify a voter eligibility proof anchors to a real tree")
 	}
-	if rec.Slashed {
-		return fmt.Errorf("wallet's NFT is slashed and cannot vote")
+	if proof == nil {
+		return types.Hash{}, fmt.Errorf("missing voter eligibility proof")
 	}
-	return nil
+
+	rootElem := zk.FieldElementFromBytes32(proof.MerkleRoot)
+	if !p.deps.EligibilityRoots.Contains(rootElem) {
+		// Checked before the expensive Groth16 verification below, for
+		// the same real DoS-resistance and soundness reasons Stage 1's
+		// Transfer root check documents: a proof anchored to a root
+		// nobody ever produced is rejected without spending CPU on a
+		// proof that was never going to matter, and it closes the
+		// analogous gap a bare "internally consistent" check alone would
+		// leave (a self-invented tree with a self-invented member).
+		return types.Hash{}, fmt.Errorf("eligibility proof anchored to an unrecognized commitment tree root")
+	}
+
+	scopeElem := zk.FieldElementFromBytes32(types.VoteEligibilityScope(proposalID))
+	nullifierElem := zk.FieldElementFromBytes32(proof.Nullifier)
+	pub := zk.EligibilityPublic{
+		MerkleRoot:    rootElem,
+		Nullifier:     nullifierElem,
+		ProposalScope: scopeElem,
+	}
+	if err := p.deps.EligibilityZK.VerifyPublicProofBytes(proof.Proof, pub); err != nil {
+		return types.Hash{}, fmt.Errorf("eligibility proof invalid: %w", err)
+	}
+	return proof.Nullifier, nil
 }
 
 // checkOraclePrice cross-checks a BankDeposit/BankWithdraw's claimed
@@ -798,7 +878,7 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 		for voter, approve := range record.Reveals {
 			ballots = append(ballots, governance.Ballot{Voter: voter, Approve: approve})
 		}
-		result := governance.Tally(ballots, eligibleNFTs, decimal.Zero)
+		result := governance.Tally(ballots, eligibleNFTs, governance.MinTurnout)
 
 		record.Tallied = true
 		record.Approve = result.Approve
