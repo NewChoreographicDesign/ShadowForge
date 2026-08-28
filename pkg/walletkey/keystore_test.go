@@ -1,6 +1,7 @@
 package walletkey_test
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -327,6 +328,129 @@ func TestIdentityMatchesConsensusConvention(t *testing.T) {
 // TestTwoGeneratedKeystoresAreDistinct guards against a catastrophic RNG
 // or salt-reuse bug: two independently generated keystores must never
 // share a public key or a salt.
+// --- X25519 shielded key ---
+
+func TestUnlockShieldedRoundTripEnablesRealECDH(t *testing.T) {
+	alice, err := walletkey.Generate("alice-passphrase")
+	if err != nil {
+		t.Fatalf("generate alice: %v", err)
+	}
+	bob, err := walletkey.Generate("bob-passphrase")
+	if err != nil {
+		t.Fatalf("generate bob: %v", err)
+	}
+
+	aliceID, err := alice.UnlockShielded("alice-passphrase")
+	if err != nil {
+		t.Fatalf("unlock alice: %v", err)
+	}
+	bobID, err := bob.UnlockShielded("bob-passphrase")
+	if err != nil {
+		t.Fatalf("unlock bob: %v", err)
+	}
+
+	if aliceID.ShieldedPub.Equal(bob.ShieldedPublicKey()) {
+		t.Fatalf("expected alice and bob to have distinct shielded public keys")
+	}
+
+	// The real point of the X25519 key: two independently-unlocked
+	// identities that only ever exchanged public keys must derive the
+	// identical shared secret.
+	secretFromAlice, err := aliceID.ShieldedKey.ECDH(bobID.ShieldedPub)
+	if err != nil {
+		t.Fatalf("alice ECDH: %v", err)
+	}
+	secretFromBob, err := bobID.ShieldedKey.ECDH(aliceID.ShieldedPub)
+	if err != nil {
+		t.Fatalf("bob ECDH: %v", err)
+	}
+	if string(secretFromAlice) != string(secretFromBob) {
+		t.Fatalf("expected both sides to derive the same ECDH shared secret")
+	}
+}
+
+func TestShieldedPublicKeyAvailableWithoutPassphrase(t *testing.T) {
+	ks, err := walletkey.Generate("the-real-passphrase")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "wallet.json")
+	if err := ks.Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded, err := walletkey.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if loaded.ShieldedPublicKey() == nil {
+		t.Fatalf("expected a shielded public key to be available without unlocking")
+	}
+	if !loaded.ShieldedPublicKey().Equal(ks.ShieldedPublicKey()) {
+		t.Fatalf("expected the loaded shielded public key to match the generated one")
+	}
+}
+
+func TestUnlockShieldedRejectsTamperedShieldedPublicKey(t *testing.T) {
+	ks, err := walletkey.Generate("the-real-passphrase")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "wallet.json")
+	if err := ks.Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	other, err := walletkey.Generate("unrelated")
+	if err != nil {
+		t.Fatalf("generate other: %v", err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var f map[string]any
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	f["x25519_public_key"] = hex.EncodeToString(other.ShieldedPublicKey().Bytes())
+	out, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("write tampered file: %v", err)
+	}
+
+	loaded, err := walletkey.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if _, err := loaded.UnlockShielded("the-real-passphrase"); err == nil {
+		t.Fatalf("expected a swapped shielded public key to break decryption of the original ciphertext")
+	}
+}
+
+func TestChangePassphrasePreservesShieldedKey(t *testing.T) {
+	ks, err := walletkey.Generate("old-passphrase")
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	originalShielded := ks.ShieldedPublicKey().Bytes()
+
+	if err := ks.ChangePassphrase("old-passphrase", "new-passphrase"); err != nil {
+		t.Fatalf("change passphrase: %v", err)
+	}
+
+	id, err := ks.UnlockShielded("new-passphrase")
+	if err != nil {
+		t.Fatalf("unlock with new passphrase: %v", err)
+	}
+	if string(id.ShieldedPub.Bytes()) != string(originalShielded) {
+		t.Fatalf("expected the same shielded identity to survive a passphrase change")
+	}
+}
+
 func TestTwoGeneratedKeystoresAreDistinct(t *testing.T) {
 	a, err := walletkey.Generate("passphrase-a")
 	if err != nil {
