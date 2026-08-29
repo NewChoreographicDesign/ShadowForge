@@ -278,4 +278,8 @@ func printProposal(p queryclient.Proposal) {
 		fmt.Printf("unlock transfer target: %s\n", p.UnlockTransferTarget)
 		fmt.Printf("unlock transfer applied: %v\n", p.UnlockTransferApplied)
 	}
+	if p.ContainerAssetTarget != "" {
+		fmt.Printf("container asset target: %s\n", p.ContainerAssetTarget)
+		fmt.Printf("container asset applied: %v\n", p.ContainerAssetApplied)
+	}
 }

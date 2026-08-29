@@ -366,6 +366,38 @@ func (b *Builder) ProposeUnlockTransfer(proposalID types.ID, approve bool, targe
 	return b.finalize(t)
 }
 
+// ProposeAuthorizeAsset casts a real sealed ballot for proposalID exactly
+// like ProposeSlash/ProposeUnlockTransfer do, and binds it to a real
+// spec-11/19.3 "authorize a new Bank asset" request against asset (see
+// types.VotePublicInputs.ContainerAssetTarget's own doc). Like
+// ProposeSlash/ProposeUnlockTransfer, this needs no Groth16 proof of its
+// own — pkg/tx's Stage 4 checks asset isn't the native SFG and isn't
+// already authorized at the moment this binds, and the actual
+// authorization (state.Store.PutAuthorizedAsset) runs once, at tally, if
+// the proposal passes.
+func (b *Builder) ProposeAuthorizeAsset(proposalID types.ID, approve bool, asset types.AssetID, eligibility types.VoteEligibilityProof) (types.ShieldedTx, error) {
+	if proposalID == "" {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: proposal id must not be empty")
+	}
+	if asset == "" {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: container-asset target must not be empty")
+	}
+	nonce := voteNonce(proposalID, eligibility.Nullifier)
+	commitment := types.ComputeVoteCommitment(eligibility.Nullifier, approve, nonce)
+
+	t := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID:           proposalID,
+			Commitment:           commitment,
+			ContainerAssetTarget: asset,
+		},
+		VoteEligibility: &eligibility,
+		Nullifier:       types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("container-asset-commit")),
+	}
+	return b.finalize(t)
+}
+
 // VoteReveal opens the sealed ballot Vote(proposalID, approve, ...)
 // earlier committed, by recomputing the same deterministic nonce and
 // handing back the (approve, nonce) pair the pipeline checks against the

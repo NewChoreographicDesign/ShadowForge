@@ -28,13 +28,23 @@ var MinTurnout = decimal.MustFromString("0.20")
 // TallyDueProposals calls the real pkg/nft.UnlockTransfer on a pass,
 // and a real types.TxNFTTransfer transaction kind is what actually lets
 // the now-unlocked NFT change hands afterward — see that type's own
-// doc). The remaining two kinds are tallied identically (real ballots,
-// real majority, real persisted Approve/Reject/Passed) but this build
-// wires no execution step for a pass: ProposalContainerAsset and
-// ProposalUpgradeUnwind have no automated effect at all. A real
-// deployment needs a wallet/App-layer or operator step to read a passed
-// proposal's Kind and act on it for those two, the same "tally is real,
-// automatic execution is a separate later step" split
+// doc). ProposalContainerAsset is real end-to-end too now (spec 11/19.3:
+// "Governance may require a vote before a high-privilege deploy ...
+// new Bank asset" — types.VotePublicInputs.ContainerAssetTarget;
+// TallyDueProposals calls the real state.Store.PutAuthorizedAsset on a
+// pass, and pkg/tx's Stage 4 rejects every BankDeposit/BankWithdraw
+// naming an unauthorized external asset until that vote passes). Only
+// ProposalUpgradeUnwind is tallied like any other (real ballots, real
+// majority, real persisted Approve/Reject/Passed) but wires no
+// execution step for a pass, and honestly cannot yet: this build never
+// implements the dual-sign (Dilithium + classical) migration path spec
+// 8.5 describes in the first place, so there is no real dual-sign state
+// for a pass to unwind — wiring one would mean inventing a migration
+// mechanism from scratch, not closing an existing gap the way the other
+// four kinds' execution steps did. A real deployment that does
+// implement dual-sign needs a wallet/App-layer or operator step to read
+// a passed ProposalUpgradeUnwind and act on it, the same "tally is
+// real, automatic execution is a separate later step" split
 // TallyDueProposals' own doc already draws for SFG minting.
 type ProposalKind uint8
 

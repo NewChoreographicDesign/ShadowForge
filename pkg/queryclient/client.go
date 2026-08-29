@@ -214,6 +214,12 @@ type Proposal struct {
 	// types.VotePublicInputs.UnlockTransferTarget's own doc.
 	UnlockTransferTarget  string
 	UnlockTransferApplied bool
+	// ContainerAssetTarget/ContainerAssetApplied are a real spec-11/19.3
+	// Bank-asset-authorization proposal's bound claim and execution
+	// status — see types.VotePublicInputs.ContainerAssetTarget's own
+	// doc.
+	ContainerAssetTarget  string
+	ContainerAssetApplied bool
 }
 
 type proposalResponse struct {
@@ -236,6 +242,8 @@ type proposalResponse struct {
 	SlashApplied          bool   `json:"slash_applied,omitempty"`
 	UnlockTransferTarget  string `json:"unlock_transfer_target,omitempty"`
 	UnlockTransferApplied bool   `json:"unlock_transfer_applied,omitempty"`
+	ContainerAssetTarget  string `json:"container_asset_target,omitempty"`
+	ContainerAssetApplied bool   `json:"container_asset_applied,omitempty"`
 }
 
 func (p proposalResponse) toProposal() Proposal { return Proposal(p) }

@@ -105,3 +105,11 @@ func (t *Txn) GetContainerRoot(containerID string) (types.Hash, bool, error) {
 	found, err := getJSON(t.txn, prefixContainer, containerID, &root)
 	return root, found, err
 }
+
+func (t *Txn) PutAuthorizedAsset(asset types.AssetID) error {
+	return putAuthorizedAsset(t.txn, asset)
+}
+
+func (t *Txn) IsAssetAuthorized(asset types.AssetID) (bool, error) {
+	return isAssetAuthorized(t.txn, asset)
+}

@@ -95,6 +95,44 @@ func TestTxnDoubleSpendRejectedWithinSameTxn(t *testing.T) {
 	}
 }
 
+func TestTxnAuthorizedAssetCommitMakesWritesVisible(t *testing.T) {
+	s := openTestStore(t)
+	txn := s.BeginTxn()
+	defer txn.Discard()
+
+	authorized, err := txn.IsAssetAuthorized(types.AssetBTC)
+	if err != nil {
+		t.Fatalf("check within txn: %v", err)
+	}
+	if authorized {
+		t.Fatalf("expected BTC to start out unauthorized")
+	}
+	if err := txn.PutAuthorizedAsset(types.AssetBTC); err != nil {
+		t.Fatalf("authorize within txn: %v", err)
+	}
+	authorized, err = txn.IsAssetAuthorized(types.AssetBTC)
+	if err != nil || !authorized {
+		t.Fatalf("expected to read back own uncommitted write: authorized=%v err=%v", authorized, err)
+	}
+
+	// Not yet visible outside the open txn.
+	authorized, err = s.IsAssetAuthorized(types.AssetBTC)
+	if err != nil {
+		t.Fatalf("outside check: %v", err)
+	}
+	if authorized {
+		t.Fatalf("uncommitted write must not be visible via the Store")
+	}
+
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	authorized, err = s.IsAssetAuthorized(types.AssetBTC)
+	if err != nil || !authorized {
+		t.Fatalf("expected committed write to be visible: authorized=%v err=%v", authorized, err)
+	}
+}
+
 func TestTxnSatisfiesAccessorInterface(t *testing.T) {
 	s := openTestStore(t)
 	var _ state.Accessor = s

@@ -64,6 +64,19 @@ func openStore(t *testing.T) *state.Store {
 	return s
 }
 
+// authorizeAssetForTest seeds store's real spec-11/19.3 governance-gated
+// asset registry directly (bypassing a full propose/vote/reveal/tally
+// cycle — that real end-to-end path is exercised on its own by
+// TestPipelineContainerAssetVote* below) so a test that only wants to
+// exercise Bank's oracle/buffer checks in isolation for a non-SFG asset
+// doesn't have to run one first.
+func authorizeAssetForTest(t *testing.T, store state.Accessor, asset types.AssetID) {
+	t.Helper()
+	if err := store.PutAuthorizedAsset(asset); err != nil {
+		t.Fatalf("authorize %s for test: %v", asset, err)
+	}
+}
+
 func newDeps(t *testing.T) tx.Deps {
 	eligTree := zk.NewTree()
 	initialRoot, err := eligTree.Root()
@@ -535,6 +548,7 @@ func TestPipelineBankDepositWithinOracleToleranceAccepted(t *testing.T) {
 	deps.Oracle = oracle.NewQuorum(decimal.MustFromString("0.05"), oracle.StaticSource{
 		Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")},
 	})
+	authorizeAssetForTest(t, deps.Store, types.AssetBTC)
 	p := tx.NewPipeline(deps)
 	// 1% off the real 60000/2000 reading, within the default 2% tolerance.
 	bankTx := bankDepositTx(t, types.AssetBTC, "60500", "2010")
@@ -549,6 +563,7 @@ func TestPipelineBankDepositBeyondOracleToleranceRejected(t *testing.T) {
 	deps.Oracle = oracle.NewQuorum(decimal.MustFromString("0.05"), oracle.StaticSource{
 		Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")},
 	})
+	authorizeAssetForTest(t, deps.Store, types.AssetBTC)
 	p := tx.NewPipeline(deps)
 	// Claims a price 10x the real oracle reading — exactly the exploit
 	// this wiring closes: internally self-consistent (buffer = 2.5*ATR)
@@ -574,6 +589,7 @@ func TestPipelineBankDepositFrozenOnOracleDisagreement(t *testing.T) {
 		oracle.StaticSource{Value: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")}},
 		oracle.StaticSource{Value: oracle.Quote{PriceUSD: decimal.MustFromString("90000"), ATRUSD: decimal.MustFromString("2000")}},
 	)
+	authorizeAssetForTest(t, deps.Store, types.AssetBTC)
 	p := tx.NewPipeline(deps)
 	bankTx := bankDepositTx(t, types.AssetBTC, "60000", "2000")
 	results := p.ProcessBatch([]tx.Entry{{Tx: bankTx, SubmittedAt: time.Now()}})
@@ -592,6 +608,7 @@ func TestPipelineBankWithdrawUsesLastGoodOnOracleDisagreement(t *testing.T) {
 	toggle := &toggleSource{agree: oracle.Quote{PriceUSD: decimal.MustFromString("60000"), ATRUSD: decimal.MustFromString("2000")}}
 	q := oracle.NewQuorum(decimal.MustFromString("0.02"), agree, toggle)
 	deps.Oracle = q
+	authorizeAssetForTest(t, deps.Store, types.AssetBTC)
 	p := tx.NewPipeline(deps)
 
 	// First: sources agree, priming Quorum's LastGood snapshot for BTC.

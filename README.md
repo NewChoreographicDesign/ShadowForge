@@ -325,6 +325,31 @@ package — this is not a stub with comments describing intended behavior.
   a throwaway key, since the transaction's signature *is* the real
   authorization check here, unlike `vote`/`propose-mint`'s anonymity
   requirement.
+- **Real spec-11/19.3 governance-gated Bank asset authorization —
+  closing a gap where `pkg/tx`'s pipeline accepted any caller-supplied
+  `AssetID` for `Kind BankDeposit`/`BankWithdraw` with no check at all.**
+  docs/SPEC_SOURCE.md is explicit: "Governance may require a vote before
+  a high-privilege deploy (new container type, new Bank asset)" — until
+  this build, nothing enforced that for the Bank-asset half.
+  `types.VotePublicInputs` gained `ContainerAssetTarget`, bound at
+  proposal time via the same "first `TxVote` wins" mechanism
+  `SlashTargetNFT`/`UnlockTransferTarget` already established, with two
+  real preconditions checked once, at binding time: the target must not
+  be the native `AssetSFG` (which needs no vote — it isn't external) and
+  must not already be authorized. `TallyDueProposals` calls the real,
+  new `state.Store.PutAuthorizedAsset` on a pass (added to `Accessor`,
+  alongside `IsAssetAuthorized`), and Stage 4 now rejects every
+  `BankDeposit`/`BankWithdraw` naming an unauthorized external asset
+  outright — existing tests exercising `BTC` through the real pipeline
+  were updated to authorize it first, the same real precondition a live
+  network would require. `pkg/txbuilder.Builder.ProposeAuthorizeAsset`
+  and `cmd/wallet propose-authorize-asset` are the real CLI. This
+  build's own `governance.ProposalKind` doc is now honest about what's
+  left: `ProposalUpgradeUnwind` remains the one kind with no execution
+  step, and unlike every kind closed so far, this one can't be closed by
+  wiring up dead code — this build never implements the dual-sign
+  (Dilithium + classical) migration path spec 8.5 describes in the first
+  place, so there is no real dual-sign state for a pass to unwind.
 
 ## Security
 

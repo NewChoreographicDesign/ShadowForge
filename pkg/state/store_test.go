@@ -148,6 +148,35 @@ func TestBankHoldRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAuthorizedAssetRoundTrip(t *testing.T) {
+	s := openTestStore(t)
+	authorized, err := s.IsAssetAuthorized(types.AssetBTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if authorized {
+		t.Fatalf("expected BTC to start out unauthorized")
+	}
+	if err := s.PutAuthorizedAsset(types.AssetBTC); err != nil {
+		t.Fatalf("authorize BTC: %v", err)
+	}
+	authorized, err = s.IsAssetAuthorized(types.AssetBTC)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !authorized {
+		t.Fatalf("expected BTC to be authorized after PutAuthorizedAsset")
+	}
+	// A different asset must remain untouched by another's authorization.
+	authorized, err = s.IsAssetAuthorized(types.AssetETH)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if authorized {
+		t.Fatalf("expected ETH to remain unauthorized after only BTC was authorized")
+	}
+}
+
 func TestGetMissingReturnsNotFound(t *testing.T) {
 	s := openTestStore(t)
 	_, found, err := s.GetNote(types.Hash{99})

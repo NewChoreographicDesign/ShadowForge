@@ -216,6 +216,13 @@ type proposalResponse struct {
 	// types.VotePublicInputs.UnlockTransferTarget's own doc.
 	UnlockTransferTarget  string `json:"unlock_transfer_target,omitempty"`
 	UnlockTransferApplied bool   `json:"unlock_transfer_applied,omitempty"`
+	// ContainerAssetTarget/ContainerAssetApplied are a real spec-11/19.3
+	// Bank-asset-authorization proposal's bound claim and execution
+	// status — see types.VotePublicInputs.ContainerAssetTarget's own
+	// doc. Safe to expose here for the identical reason SlashTargetNFT
+	// already is.
+	ContainerAssetTarget  string `json:"container_asset_target,omitempty"`
+	ContainerAssetApplied bool   `json:"container_asset_applied,omitempty"`
 }
 
 func slashTargetJSON(p state.ProposalRecord) string {
@@ -282,6 +289,8 @@ func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
 		SlashApplied:          p.SlashApplied,
 		UnlockTransferTarget:  unlockTransferTargetJSON(p),
 		UnlockTransferApplied: p.UnlockTransferApplied,
+		ContainerAssetTarget:  string(p.ContainerAssetTarget),
+		ContainerAssetApplied: p.ContainerAssetApplied,
 	})
 }
 
@@ -314,6 +323,8 @@ func (s *Server) handleProposals(w http.ResponseWriter, r *http.Request) {
 			SlashApplied:          p.SlashApplied,
 			UnlockTransferTarget:  unlockTransferTargetJSON(p),
 			UnlockTransferApplied: p.UnlockTransferApplied,
+			ContainerAssetTarget:  string(p.ContainerAssetTarget),
+			ContainerAssetApplied: p.ContainerAssetApplied,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

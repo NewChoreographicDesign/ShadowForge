@@ -401,6 +401,27 @@ type VotePublicInputs struct {
 	// checked or acted on. The zero value means this proposal carries no
 	// unlock request.
 	UnlockTransferTarget NFTID
+
+	// ContainerAssetTarget optionally binds this proposal to a real
+	// spec-11/19.3 "authorize a new Bank asset" vote (docs/SPEC_SOURCE.md
+	// section on governance: "Governance may require a vote before a
+	// high-privilege deploy (new container type, new Bank asset)") — the
+	// same "first TxVote wins" pattern SlashTargetNFT/UnlockTransferTarget
+	// already establish, applied to which external AssetID (e.g. BTC,
+	// ETH) pkg/tx's Stage 4 will accept for Kind BankDeposit/BankWithdraw
+	// at all. AssetSFG never needs this (see AssetSFG's own doc: it is
+	// the native asset, not an external one Bank custodies), and pkg/tx's
+	// Stage 4 rejects a claim naming it here outright — a governance vote
+	// to "authorize" the chain's own native asset is a no-op that could
+	// only ever be a mistake or an attempt to spam the ballot. Likewise
+	// rejected outright: a target that's already authorized. On a pass,
+	// TallyDueProposals calls the real state.Store.PutAuthorizedAsset,
+	// and every subsequent BankDeposit/BankWithdraw naming this asset is
+	// then genuinely accepted — before that, Stage 4 rejects every claim
+	// against it, closing what was previously an unrestricted accept-any-
+	// AssetID gap. The zero value means this proposal carries no
+	// asset-authorization request.
+	ContainerAssetTarget AssetID
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

@@ -924,6 +924,80 @@ func TestCLIProposeUnlockTransferAndNFTTransferEndToEnd(t *testing.T) {
 	}
 }
 
+// TestCLIProposeAuthorizeAssetEndToEnd proves the real spec-11/19.3
+// Bank-asset-authorization path end to end through the actual CLI: a
+// real minted NFT gives a voter real anonymous eligibility, 'wallet
+// propose-authorize-asset' builds and submits a real request to
+// authorize BTC for Bank use, a matching 'wallet vote-reveal' opens the
+// sealed ballot, the test drives the same real TallyDueProposals a live
+// validator runs at epoch end (see TestCLIProposeMintEndToEnd's
+// identical doc for why), and the real store ends up with BTC
+// authorized — proving the CLI's own wiring end to end; the resulting
+// Bank-gate enforcement itself (a BankDeposit naming BTC rejected before
+// this and accepted after) is already proven directly against the real
+// pipeline by pkg/tx's and pkg/txbuilder's own tests, so this test
+// doesn't repeat it through 'wallet bank-deposit', which would need a
+// live external price oracle this offline test suite has none of.
+func TestCLIProposeAuthorizeAssetEndToEnd(t *testing.T) {
+	backend := newTestBackend(t, 0x0a, nil, nil, nil)
+
+	voterPath, voterKS := newTestKeystore(t, "authorize-asset-voter-passphrase")
+	mintNFTViaCLI(t, backend, voterKS.PublicKey(), voterPath, "authorize-asset-voter-passphrase")
+
+	withStdin(t, "authorize-asset-voter-passphrase")
+	out, err := captureStdout(t, func() error {
+		return runProposeAuthorizeAsset([]string{
+			"-keystore", voterPath, "-passphrase-stdin",
+			"-proposal", "cli-authorize-asset-1", "-approve", "-asset", "BTC",
+			"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runProposeAuthorizeAsset: %v", err)
+	}
+	if !strings.Contains(out, "real asset-authorization proposal built") {
+		t.Fatalf("expected propose-authorize-asset output to describe the real proposal, got:\n%s", out)
+	}
+
+	withStdin(t, "authorize-asset-voter-passphrase")
+	err = runVoteReveal([]string{
+		"-keystore", voterPath, "-passphrase-stdin",
+		"-proposal", "cli-authorize-asset-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runVoteReveal: %v", err)
+	}
+
+	tallied, err := backend.pipeline.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed || !tallied[0].ContainerAssetApplied {
+		t.Fatalf("expected the real proposal to pass and the real authorization to be applied, got %+v", tallied)
+	}
+
+	authorized, err := backend.store.IsAssetAuthorized(types.AssetID("BTC"))
+	if err != nil {
+		t.Fatalf("check authorization: %v", err)
+	}
+	if !authorized {
+		t.Fatalf("expected BTC to be authorized in the real store after a passed proposal")
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runProposal([]string{"-query", backend.queryURL, "-id", "cli-authorize-asset-1"})
+	})
+	if err != nil {
+		t.Fatalf("runProposal: %v", err)
+	}
+	if !strings.Contains(out, "container asset applied: true") {
+		t.Fatalf("expected 'wallet proposal' to report the real authorization as applied, got:\n%s", out)
+	}
+}
+
 // TestCLIProposeMintStakedAndUnstakeEndToEnd proves the real spec-17.4
 // staked-yield path end to end through the actual CLI: 'wallet
 // propose-mint -staked' builds and submits a real, Groth16-proven staked

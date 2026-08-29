@@ -638,6 +638,26 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 		// the ATR-derived figure bound into the proof's public inputs is
 		// internally consistent before any state changes).
 		pub := t.BankPublicInputs
+		// Real spec-11/19.3 governance gate (docs/SPEC_SOURCE.md:
+		// "Governance may require a vote before a high-privilege deploy
+		// ... new Bank asset") — closing the gap where any caller-
+		// supplied AssetID was accepted here with no check at all. The
+		// native asset (types.AssetSFG) and an unset claim (the zero
+		// value existing tests that don't care about a specific external
+		// asset rely on — mirroring BankPublicInputs' own doc on why the
+		// zero value stays valid when no oracle is wired) both skip this
+		// gate; only a real, named external asset (BTC, ETH, ...) needs
+		// a real, passed ProposalContainerAsset vote first (see types.
+		// VotePublicInputs.ContainerAssetTarget's own doc).
+		if pub.Asset != "" && pub.Asset != types.AssetSFG {
+			authorized, err := p.deps.Store.IsAssetAuthorized(pub.Asset)
+			if err != nil {
+				return fmt.Errorf("authorized-asset lookup: %w", err)
+			}
+			if !authorized {
+				return fmt.Errorf("asset %s is not authorized by governance for Bank use", pub.Asset)
+			}
+		}
 		depositMult, withdrawMult := bank.DepositATRMultiple, bank.WithdrawATRMultiple
 		if p.deps.Governance != nil {
 			// A passed ProposalParamChange vote (TallyDueProposals) has
@@ -777,6 +797,24 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 					return fmt.Errorf("unlock-transfer proposal targets a nonexistent NFT %s", pub.UnlockTransferTarget)
 				}
 			}
+			if pub.ContainerAssetTarget != "" {
+				// Checked once, here, at the exact point the claim becomes
+				// durable, for the identical reason SlashTargetNFT/
+				// UnlockTransferTarget are: a proposal that could never
+				// have a meaningful effect must never even be created.
+				// AssetSFG is the native asset (types.AssetID's own doc)
+				// and needs no governance authorization at all — voting to
+				// "authorize" it is always a no-op, never a legitimate
+				// proposal.
+				if pub.ContainerAssetTarget == types.AssetSFG {
+					return fmt.Errorf("container-asset proposal targets %s, which is the native asset and needs no governance authorization", types.AssetSFG)
+				}
+				if authorized, err := p.deps.Store.IsAssetAuthorized(pub.ContainerAssetTarget); err != nil {
+					return fmt.Errorf("authorized-asset lookup: %w", err)
+				} else if authorized {
+					return fmt.Errorf("container-asset proposal targets %s, which is already authorized", pub.ContainerAssetTarget)
+				}
+			}
 			record = state.ProposalRecord{
 				ProposalID:  string(pub.ProposalID),
 				Epoch:       p.deps.Epoch,
@@ -796,6 +834,7 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				SlashTargetNFT:       pub.SlashTargetNFT,
 				SlashBurn:            pub.SlashBurn,
 				UnlockTransferTarget: pub.UnlockTransferTarget,
+				ContainerAssetTarget: pub.ContainerAssetTarget,
 			}
 		}
 		if record.Tallied {
@@ -1178,11 +1217,16 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 // real UnlockTransferTarget (spec 10.1 — see types.VotePublicInputs.
 // UnlockTransferTarget's own doc) really does unlock the target NFT
 // now: pkg/nft.UnlockTransfer sets the real "transferable" trait, which
-// a later Kind NFTTransfer transaction then actually acts on.
-// container-asset/upgrade-unwind proposal kinds are tallied like any
-// other but have no execution wired here either — see governance.
-// ProposalKind's own doc for the remaining kinds this build does not
-// yet apply.
+// a later Kind NFTTransfer transaction then actually acts on. A passed
+// proposal bound to a real ContainerAssetTarget (spec 11/19.3 — see
+// types.VotePublicInputs.ContainerAssetTarget's own doc) really does
+// authorize the target asset now: Store.PutAuthorizedAsset makes it
+// real, so a later BankDeposit/BankWithdraw naming it passes Stage 4's
+// own gate. The upgrade-unwind proposal kind is tallied like any other
+// but has no execution wired here — see governance.ProposalKind's own
+// doc for why: unlike the other kinds above, this build never
+// implements the dual-sign migration path spec 8.5 describes, so there
+// is no real mechanism for a pass to unwind.
 //
 // This runs deterministically off already-committed proposal state plus
 // the caller's own block Epoch, so every honest node reaches the same
@@ -1324,6 +1368,24 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 				if err := p.deps.Store.PutNFT(nftRec); err == nil {
 					record.UnlockTransferApplied = true
 				}
+			}
+		}
+
+		if record.Passed && record.ContainerAssetTarget != "" {
+			// Real spec-11/19.3 Bank-asset-authorization execution: the
+			// claim's own validity (not SFG, not already authorized) was
+			// already checked once, at Stage 4, the moment this
+			// proposal's first vote bound it — this only makes a
+			// governance-authorized asset real, so every subsequent
+			// BankDeposit/BankWithdraw naming it passes Stage 4's own
+			// gate above. Store.PutAuthorizedAsset is a pure existence
+			// write and cannot itself fail short of a real storage
+			// error, but ContainerAssetApplied is still tracked
+			// separately (rather than assumed) to mirror every other
+			// execution step's identical "durable, auditable, never
+			// blocks tallying every other due proposal" treatment above.
+			if err := p.deps.Store.PutAuthorizedAsset(record.ContainerAssetTarget); err == nil {
+				record.ContainerAssetApplied = true
 			}
 		}
 

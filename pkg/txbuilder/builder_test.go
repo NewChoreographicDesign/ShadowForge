@@ -77,6 +77,19 @@ func newRealPipeline(t *testing.T, extra tx.Deps) (*tx.Pipeline, tx.Deps) {
 	return tx.NewPipeline(deps), deps
 }
 
+// authorizeAssetForTest seeds deps' real spec-11/19.3 governance-gated
+// asset registry directly (bypassing a full propose/vote/reveal/tally
+// cycle — that real end-to-end path is exercised on its own by
+// TestProposeAuthorizeAsset* below) so a test that only wants to
+// exercise a built BankDeposit/BankWithdraw tx against the real pipeline
+// for a non-SFG asset doesn't have to run one first.
+func authorizeAssetForTest(t *testing.T, store state.Accessor, asset types.AssetID) {
+	t.Helper()
+	if err := store.PutAuthorizedAsset(asset); err != nil {
+		t.Fatalf("authorize %s for test: %v", asset, err)
+	}
+}
+
 func newIdentity(t *testing.T) *txbuilder.Builder {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
@@ -378,7 +391,8 @@ func staticQuorum(t *testing.T, priceUSD, atrUSD string) *oracle.Quorum {
 
 func TestBankDepositAcceptedByRealPipelineWithMatchingOracle(t *testing.T) {
 	quorum := staticQuorum(t, "60000", "1500")
-	p, _ := newRealPipeline(t, tx.Deps{Oracle: quorum})
+	p, deps := newRealPipeline(t, tx.Deps{Oracle: quorum})
+	authorizeAssetForTest(t, deps.Store, types.AssetID("BTC"))
 	b := newIdentity(t)
 
 	deposit, err := b.BankDeposit(quorum, "BTC")
@@ -393,7 +407,8 @@ func TestBankDepositAcceptedByRealPipelineWithMatchingOracle(t *testing.T) {
 
 func TestBankWithdrawAcceptedByRealPipelineWithMatchingOracle(t *testing.T) {
 	quorum := staticQuorum(t, "60000", "1500")
-	p, _ := newRealPipeline(t, tx.Deps{Oracle: quorum})
+	p, deps := newRealPipeline(t, tx.Deps{Oracle: quorum})
+	authorizeAssetForTest(t, deps.Store, types.AssetID("BTC"))
 	b := newIdentity(t)
 
 	withdraw, err := b.BankWithdraw(quorum, "BTC")
@@ -414,7 +429,8 @@ func TestBankWithdrawAcceptedByRealPipelineWithMatchingOracle(t *testing.T) {
 func TestBankDepositRejectedWhenPipelineOracleDisagrees(t *testing.T) {
 	buildQuorum := staticQuorum(t, "60000", "1500")
 	nodeQuorum := staticQuorum(t, "90000", "1500") // 50% higher price than what the tx will claim
-	p, _ := newRealPipeline(t, tx.Deps{Oracle: nodeQuorum})
+	p, deps := newRealPipeline(t, tx.Deps{Oracle: nodeQuorum})
+	authorizeAssetForTest(t, deps.Store, types.AssetID("BTC"))
 	b := newIdentity(t)
 
 	deposit, err := b.BankDeposit(buildQuorum, "BTC")

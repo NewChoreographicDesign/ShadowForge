@@ -60,6 +60,8 @@ func main() {
 		err = runProposeSlash(args)
 	case "propose-unlock-transfer":
 		err = runProposeUnlockTransfer(args)
+	case "propose-authorize-asset":
+		err = runProposeAuthorizeAsset(args)
 	case "nft-transfer":
 		err = runNFTTransfer(args)
 	case "mint":
@@ -171,6 +173,14 @@ is rejected outright for anyone else, for an NFT that isn't unlocked,
 or if the receiving wallet already holds a different NFT — spec 10.1's
 "one per wallet" invariant must survive a transfer, not just hold at
 mint time.
+
+Real spec-11/19.3 Bank-asset-authorization proposal — bank-deposit/
+bank-withdraw reject any external asset (BTC, ETH, ...) until a real
+governance vote authorizes it; the native SFG asset needs no vote:
+  wallet propose-authorize-asset -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -asset BTC -eligibility-zk-params <file>
+Once tallied, check 'wallet proposal -id <id>' for real Passed/
+ContainerAssetApplied status, then 'wallet bank-deposit -asset BTC' (or
+-withdraw) is accepted.
 
 Real spec-17.4 epoch mint — both proposer paths spec 13.1/17.4 name are
 implemented: submitting a proposal both casts its own first ballot and

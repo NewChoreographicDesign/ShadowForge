@@ -35,6 +35,14 @@ var (
 	prefixBlock      = []byte("block:")
 	prefixTxIndex    = []byte("tx:")
 	keyHead          = []byte("head")
+	// prefixAuthorizedAsset is this package's own addition, for the real
+	// spec-11/19.3 governance-gated Bank asset registry — see
+	// types.VotePublicInputs.ContainerAssetTarget's own doc for the gap
+	// this closes. Not one of spec section 7's named rows (there is no
+	// dedicated "authorized asset" row in the spec's own list), but it
+	// belongs alongside everything else this package already keeps for
+	// an analogous reason: block/head above.
+	prefixAuthorizedAsset = []byte("asset_auth:")
 )
 
 // Accessor is the read/write surface pkg/tx's pipeline needs. Both *Store
@@ -69,6 +77,11 @@ type Accessor interface {
 	CountNFTs() (int, error)
 	PutContainerRoot(containerID string, root types.Hash) error
 	GetContainerRoot(containerID string) (types.Hash, bool, error)
+	// PutAuthorizedAsset/IsAssetAuthorized back the real spec-11/19.3
+	// governance-gated Bank asset registry — see types.VotePublicInputs.
+	// ContainerAssetTarget's own doc.
+	PutAuthorizedAsset(asset types.AssetID) error
+	IsAssetAuthorized(asset types.AssetID) (bool, error)
 }
 
 var _ Accessor = (*Store)(nil)
@@ -420,6 +433,16 @@ type ProposalRecord struct {
 	UnlockTransferTarget  types.NFTID
 	UnlockTransferApplied bool
 
+	// ContainerAssetTarget/ContainerAssetApplied are a real spec-11/19.3
+	// Bank-asset-authorization proposal's bound claim and execution
+	// status — see types.VotePublicInputs.ContainerAssetTarget's own
+	// doc. ContainerAssetTarget's zero value means this proposal
+	// requests no asset authorization. ContainerAssetApplied mirrors
+	// UnlockTransferApplied: the durable record of whether
+	// Store.PutAuthorizedAsset already ran.
+	ContainerAssetTarget  types.AssetID
+	ContainerAssetApplied bool
+
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch
 	// moves past this proposal's own Epoch. Turnout isn't recorded here:
@@ -508,6 +531,43 @@ func (s *Store) GetContainerRoot(containerID string) (types.Hash, bool, error) {
 		return err
 	})
 	return root, found, err
+}
+
+// --- Authorized Bank assets (spec 11/19.3 governance gate) ---
+
+// putAuthorizedAsset/isAssetAuthorized are a real, minimal existence
+// registry — a passed ProposalContainerAsset vote (TallyDueProposals)
+// is the only way an entry is ever written here; nothing else does. A
+// value's actual content is never read, only whether the key exists, so
+// a single marker byte is enough (mirroring markNullifierSpent's
+// identical shape just above).
+func putAuthorizedAsset(txn *badger.Txn, asset types.AssetID) error {
+	return txn.Set(withPrefix(prefixAuthorizedAsset, string(asset)), []byte{1})
+}
+
+func isAssetAuthorized(txn *badger.Txn, asset types.AssetID) (bool, error) {
+	_, err := txn.Get(withPrefix(prefixAuthorizedAsset, string(asset)))
+	if err == badger.ErrKeyNotFound {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) PutAuthorizedAsset(asset types.AssetID) error {
+	return s.db.Update(func(txn *badger.Txn) error { return putAuthorizedAsset(txn, asset) })
+}
+
+func (s *Store) IsAssetAuthorized(asset types.AssetID) (bool, error) {
+	var authorized bool
+	err := s.db.View(func(txn *badger.Txn) error {
+		var err error
+		authorized, err = isAssetAuthorized(txn, asset)
+		return err
+	})
+	return authorized, err
 }
 
 // --- Blocks + chain head (pkg/chain) ---
