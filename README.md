@@ -343,13 +343,33 @@ package — this is not a stub with comments describing intended behavior.
   outright — existing tests exercising `BTC` through the real pipeline
   were updated to authorize it first, the same real precondition a live
   network would require. `pkg/txbuilder.Builder.ProposeAuthorizeAsset`
-  and `cmd/wallet propose-authorize-asset` are the real CLI. This
-  build's own `governance.ProposalKind` doc is now honest about what's
-  left: `ProposalUpgradeUnwind` remains the one kind with no execution
-  step, and unlike every kind closed so far, this one can't be closed by
-  wiring up dead code — this build never implements the dual-sign
-  (Dilithium + classical) migration path spec 8.5 describes in the first
-  place, so there is no real dual-sign state for a pass to unwind.
+  and `cmd/wallet propose-authorize-asset` are the real CLI.
+- **Real spec-8.5 dual-sign migration path and `ProposalUpgradeUnwind`
+  execution — closing the last kind `governance.ProposalKind` had
+  disclosed as unwired, honestly, because this build never implemented
+  the dual-sign path it would retire in the first place.** "Dual-sign
+  (Dilithium + ed25519) is allowed only as a migration aid and must be
+  scheduled for removal by governance." `pkg/crypto` gains a real ed25519
+  implementation (`GenerateClassicalKey`/`ClassicalSign`/`ClassicalVerify`,
+  Go's own standard-library `crypto/ed25519`) alongside Dilithium, never
+  in place of it. `types.ShieldedTx` gains optional
+  `ClassicalSig`/`ClassicalPubKey`; when set, Stage 2 verifies a real
+  ed25519 signature over the same `TxID` as a genuine second signature —
+  an attacker now has to forge both, not whichever is weaker.
+  `governance.Params` gains `DualSignEnabled` (true at genesis, matching
+  "allowed... during migration"); `types.VotePublicInputs` gains
+  `UnwindDualSign`, bound via the same "first `TxVote` wins" mechanism
+  and rejected outright if dual-sign is already retired.
+  `TallyDueProposals` sets `DualSignEnabled` false on a pass, and Stage 2
+  then rejects outright any transaction still carrying a classical
+  co-signature — the migration path is genuinely closed, not merely
+  optional, from that point on. `pkg/txbuilder.Builder.WithClassicalKey`
+  attaches a real keypair so every transaction that `Builder` signs from
+  then on is genuinely dual-signed; `Builder.ProposeUnwindDualSign` and
+  `cmd/wallet propose-unwind-dual-sign`/`classical-keygen`/
+  `bank-deposit -classical-key`/`bank-withdraw -classical-key` are the
+  real CLI. Every kind `governance.ProposalKind` enumerates now has a
+  real, wired execution step for a pass.
 
 ## Security
 

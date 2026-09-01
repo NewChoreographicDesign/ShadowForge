@@ -223,6 +223,11 @@ type proposalResponse struct {
 	// already is.
 	ContainerAssetTarget  string `json:"container_asset_target,omitempty"`
 	ContainerAssetApplied bool   `json:"container_asset_applied,omitempty"`
+	// UnwindDualSign/UnwindDualSignApplied are a real spec-8.5 dual-sign-
+	// retirement proposal's bound claim and execution status — see
+	// types.VotePublicInputs.UnwindDualSign's own doc.
+	UnwindDualSign        bool `json:"unwind_dual_sign,omitempty"`
+	UnwindDualSignApplied bool `json:"unwind_dual_sign_applied,omitempty"`
 }
 
 func slashTargetJSON(p state.ProposalRecord) string {
@@ -291,6 +296,8 @@ func (s *Server) handleProposal(w http.ResponseWriter, r *http.Request) {
 		UnlockTransferApplied: p.UnlockTransferApplied,
 		ContainerAssetTarget:  string(p.ContainerAssetTarget),
 		ContainerAssetApplied: p.ContainerAssetApplied,
+		UnwindDualSign:        p.UnwindDualSign,
+		UnwindDualSignApplied: p.UnwindDualSignApplied,
 	})
 }
 
@@ -325,6 +332,8 @@ func (s *Server) handleProposals(w http.ResponseWriter, r *http.Request) {
 			UnlockTransferApplied: p.UnlockTransferApplied,
 			ContainerAssetTarget:  string(p.ContainerAssetTarget),
 			ContainerAssetApplied: p.ContainerAssetApplied,
+			UnwindDualSign:        p.UnwindDualSign,
+			UnwindDualSignApplied: p.UnwindDualSignApplied,
 		})
 	}
 	writeJSON(w, http.StatusOK, out)

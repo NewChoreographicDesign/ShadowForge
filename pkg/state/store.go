@@ -443,6 +443,16 @@ type ProposalRecord struct {
 	ContainerAssetTarget  types.AssetID
 	ContainerAssetApplied bool
 
+	// UnwindDualSign/UnwindDualSignApplied are a real spec-8.5 dual-sign-
+	// retirement proposal's bound claim and execution status — see
+	// types.VotePublicInputs.UnwindDualSign's own doc. UnwindDualSign's
+	// zero value (false) means this proposal requests no retirement.
+	// UnwindDualSignApplied mirrors ContainerAssetApplied: the durable
+	// record of whether governance.Params.DualSignEnabled was actually
+	// set false.
+	UnwindDualSign        bool
+	UnwindDualSignApplied bool
+
 	// Tallied/Approve/Reject/Passed are populated once, by the
 	// epoch-boundary tally that runs when a committed block's Epoch
 	// moves past this proposal's own Epoch. Turnout isn't recorded here:

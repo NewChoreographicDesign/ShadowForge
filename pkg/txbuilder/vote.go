@@ -398,6 +398,34 @@ func (b *Builder) ProposeAuthorizeAsset(proposalID types.ID, approve bool, asset
 	return b.finalize(t)
 }
 
+// ProposeUnwindDualSign casts a real sealed ballot for proposalID exactly
+// like ProposeAuthorizeAsset does, and binds it to a real spec-8.5
+// request to retire the dual-sign migration path (see types.
+// VotePublicInputs.UnwindDualSign's own doc). Like ProposeAuthorizeAsset,
+// this needs no Groth16 proof of its own — pkg/tx's Stage 4 checks
+// dual-sign isn't already retired at the moment this binds, and the
+// actual retirement (governance.Params.DualSignEnabled = false) runs
+// once, at tally, if the proposal passes.
+func (b *Builder) ProposeUnwindDualSign(proposalID types.ID, approve bool, eligibility types.VoteEligibilityProof) (types.ShieldedTx, error) {
+	if proposalID == "" {
+		return types.ShieldedTx{}, fmt.Errorf("txbuilder: proposal id must not be empty")
+	}
+	nonce := voteNonce(proposalID, eligibility.Nullifier)
+	commitment := types.ComputeVoteCommitment(eligibility.Nullifier, approve, nonce)
+
+	t := types.ShieldedTx{
+		Kind: types.TxVote,
+		VotePublicInputs: &types.VotePublicInputs{
+			ProposalID:     proposalID,
+			Commitment:     commitment,
+			UnwindDualSign: true,
+		},
+		VoteEligibility: &eligibility,
+		Nullifier:       types.SumHash(b.sk, voteNonceDomain, []byte(proposalID), []byte("unwind-dual-sign-commit")),
+	}
+	return b.finalize(t)
+}
+
 // VoteReveal opens the sealed ballot Vote(proposalID, approve, ...)
 // earlier committed, by recomputing the same deterministic nonce and
 // handing back the (approve, nonce) pair the pipeline checks against the

@@ -62,6 +62,10 @@ func main() {
 		err = runProposeUnlockTransfer(args)
 	case "propose-authorize-asset":
 		err = runProposeAuthorizeAsset(args)
+	case "propose-unwind-dual-sign":
+		err = runProposeUnwindDualSign(args)
+	case "classical-keygen":
+		err = runClassicalKeygen(args)
 	case "nft-transfer":
 		err = runNFTTransfer(args)
 	case "mint":
@@ -181,6 +185,17 @@ governance vote authorizes it; the native SFG asset needs no vote:
 Once tallied, check 'wallet proposal -id <id>' for real Passed/
 ContainerAssetApplied status, then 'wallet bank-deposit -asset BTC' (or
 -withdraw) is accepted.
+
+Real spec-8.5 dual-sign migration aid — a real, optional ed25519
+co-signature alongside your always-required Dilithium one, and a real
+governance vote to retire it for good:
+  wallet classical-keygen -out classical-key.json
+  wallet bank-deposit -keystore <file> -bootstrap <addr> -query <url> -asset SFG -classical-key classical-key.json
+  wallet propose-unwind-dual-sign -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -eligibility-zk-params <file>
+Once a propose-unwind-dual-sign proposal passes and tallies (check
+'wallet proposal -id <id>' for Passed/UnwindDualSignApplied), any
+transaction still built with -classical-key is rejected outright — the
+migration path is genuinely closed, not merely optional.
 
 Real spec-17.4 epoch mint — both proposer paths spec 13.1/17.4 name are
 implemented: submitting a proposal both casts its own first ballot and

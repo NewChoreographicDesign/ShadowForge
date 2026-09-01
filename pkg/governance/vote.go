@@ -33,19 +33,16 @@ var MinTurnout = decimal.MustFromString("0.20")
 // new Bank asset" — types.VotePublicInputs.ContainerAssetTarget;
 // TallyDueProposals calls the real state.Store.PutAuthorizedAsset on a
 // pass, and pkg/tx's Stage 4 rejects every BankDeposit/BankWithdraw
-// naming an unauthorized external asset until that vote passes). Only
-// ProposalUpgradeUnwind is tallied like any other (real ballots, real
-// majority, real persisted Approve/Reject/Passed) but wires no
-// execution step for a pass, and honestly cannot yet: this build never
-// implements the dual-sign (Dilithium + classical) migration path spec
-// 8.5 describes in the first place, so there is no real dual-sign state
-// for a pass to unwind — wiring one would mean inventing a migration
-// mechanism from scratch, not closing an existing gap the way the other
-// four kinds' execution steps did. A real deployment that does
-// implement dual-sign needs a wallet/App-layer or operator step to read
-// a passed ProposalUpgradeUnwind and act on it, the same "tally is
-// real, automatic execution is a separate later step" split
-// TallyDueProposals' own doc already draws for SFG minting.
+// naming an unauthorized external asset until that vote passes).
+// ProposalUpgradeUnwind is real end-to-end too now (spec 8.5: "Dual-sign
+// (Dilithium + ed25519) is allowed only as a migration aid and must be
+// scheduled for removal by governance" — types.VotePublicInputs.
+// UnwindDualSign; TallyDueProposals sets the real
+// governance.Params.DualSignEnabled false on a pass, and pkg/tx's Stage 2
+// rejects outright any transaction still carrying a classical
+// co-signature — types.ShieldedTx.ClassicalSig's own doc — from then on).
+// Every kind this package enumerates now has a real, wired execution
+// step for a pass.
 type ProposalKind uint8
 
 const (
@@ -53,7 +50,7 @@ const (
 	ProposalSlashNFT
 	ProposalUnlockNFTTransfer
 	ProposalContainerAsset
-	ProposalUpgradeUnwind // e.g. removing a dual-sign migration path (spec 8.5)
+	ProposalUpgradeUnwind // retires the dual-sign migration path (spec 8.5)
 )
 
 // Proposal is one governance item. Votes accumulate as ZKP ballots during

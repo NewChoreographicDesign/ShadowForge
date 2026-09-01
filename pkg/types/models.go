@@ -184,9 +184,26 @@ type ShieldedTx struct {
 	Memo         []byte // optional encrypted memo for receiver
 	Sig          DilithiumSig
 	SignerPubKey []byte // Dilithium public key the wallet signed Sig with (spec 8.5)
-	Kind         TxKind
-	StageHints   StageSet
-	ContainerID  *ID // nil unless originated in an enterprise container
+	// ClassicalSig/ClassicalPubKey are spec 8.5's real, optional dual-sign
+	// migration aid — "Dual-sign (Dilithium + ed25519) is allowed only as
+	// a migration aid and must be scheduled for removal by governance."
+	// Dilithium above remains unconditionally required regardless of
+	// whether these are set; when both are non-empty, pkg/tx's Stage 2
+	// verifies ClassicalSig (a real ed25519 signature, crypto.
+	// ClassicalSign/ClassicalVerify) over this same TxID as a genuine
+	// second, classical-assumption signature — real defense-in-depth
+	// during the migration window, not a formality: an attacker would
+	// need to forge both a Dilithium and an ed25519 signature, not
+	// whichever is weaker. Once governance passes a real
+	// ProposalUpgradeUnwind vote (types.VotePublicInputs.UnwindDualSign's
+	// own doc), Stage 2 rejects outright any transaction that still
+	// carries either field — the migration path is genuinely closed, not
+	// merely optional from then on.
+	ClassicalSig    []byte
+	ClassicalPubKey []byte
+	Kind            TxKind
+	StageHints      StageSet
+	ContainerID     *ID // nil unless originated in an enterprise container
 
 	// Public inputs bound per Kind (spec 4.2: "TxKind determines which
 	// extra public inputs the circuit must bind"). Only the fields
@@ -422,6 +439,28 @@ type VotePublicInputs struct {
 	// AssetID gap. The zero value means this proposal carries no
 	// asset-authorization request.
 	ContainerAssetTarget AssetID
+
+	// UnwindDualSign optionally binds this proposal to a real spec-8.5
+	// governance retirement of the dual-sign migration path: "Dual-sign
+	// (Dilithium + ed25519) is allowed only as a migration aid and must
+	// be scheduled for removal by governance." Unlike every other
+	// optional binding above, there is no target to name — the action is
+	// unconditionally "retire dual-sign", so the "first TxVote wins"
+	// pattern SlashTargetNFT/UnlockTransferTarget/ContainerAssetTarget
+	// establish applies to this bool exactly the way it applies to their
+	// typed targets: only the first TxVote to reference a given
+	// ProposalID sets it, and pkg/tx's Stage 4 rejects the claim outright
+	// if dual-sign has already been retired (the identical "already
+	// authorized" rejection ContainerAssetTarget gets, for the identical
+	// reason: a proposal that could never have a real effect must never
+	// even be created). On a pass, TallyDueProposals sets
+	// governance.Params.DualSignEnabled to false, and pkg/tx's Stage 2
+	// then rejects outright any transaction still carrying
+	// ClassicalSig/ClassicalPubKey (ShieldedTx's own doc) — the migration
+	// path is genuinely closed from that point on, not merely optional.
+	// The zero value (false) means this proposal carries no unwind
+	// request.
+	UnwindDualSign bool
 }
 
 // VoteRevealPublicInputs opens a sealed TxVote ballot: Approve and Nonce

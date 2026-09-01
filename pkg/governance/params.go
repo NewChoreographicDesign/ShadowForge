@@ -43,6 +43,20 @@ type Params struct {
 	SilentTxVaultFee      decimal.Decimal // 10%
 	ContainerHybridSplit  decimal.Decimal // 50/50, per-container envelope
 	RefundCap             decimal.Decimal // 100%, may be voted to 80%
+	// DualSignEnabled is spec 8.5's real dual-sign migration flag: "Dual-
+	// sign (Dilithium + ed25519) is allowed only as a migration aid and
+	// must be scheduled for removal by governance." True (the genesis
+	// default below) means a real ed25519 co-signature is permitted
+	// alongside the always-required Dilithium one (types.ShieldedTx.
+	// ClassicalSig/ClassicalPubKey's own doc); a real, passed
+	// ProposalUpgradeUnwind vote (types.VotePublicInputs.UnwindDualSign's
+	// own doc) sets this false, after which pkg/tx's Stage 2 rejects
+	// outright any transaction still carrying either field — not just a
+	// param this package's own ApplyParamChange can set (it's a bool, not
+	// the decimal.Decimal-typed subset ParamKeys covers), mutated
+	// directly by TallyDueProposals on a pass, the same dedicated-
+	// mechanism treatment SlashTargetNFT/ContainerAssetTarget already get.
+	DualSignEnabled bool
 }
 
 // Default returns the spec section 22 genesis defaults.
@@ -76,6 +90,7 @@ func Default() Params {
 		SilentTxVaultFee:      decimal.MustFromString("0.10"),
 		ContainerHybridSplit:  decimal.MustFromString("0.50"),
 		RefundCap:             decimal.MustFromString("1.0"),
+		DualSignEnabled:       true,
 	}
 }
 

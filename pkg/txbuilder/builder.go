@@ -31,12 +31,35 @@ import (
 type Builder struct {
 	pk crypto.DilithiumPublicKey
 	sk crypto.DilithiumPrivateKey
+	// classicalPK/classicalSK are spec 8.5's optional dual-sign migration
+	// aid — nil unless WithClassicalKey is used. When set, finalize
+	// co-signs every transaction with a real ed25519 signature over the
+	// same TxID, alongside (never instead of) the Dilithium signature
+	// pk/sk above always produce — see types.ShieldedTx.ClassicalSig's
+	// own doc.
+	classicalPK crypto.ClassicalPublicKey
+	classicalSK crypto.ClassicalPrivateKey
 }
 
 // New wraps an already-unlocked real Dilithium identity. Callers
 // typically get pk/sk from pkg/walletkey.Keystore.Unlock.
 func New(pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey) *Builder {
 	return &Builder{pk: pk, sk: sk}
+}
+
+// WithClassicalKey attaches a real ed25519 keypair to b, so every
+// transaction it builds from here on also carries a real classical
+// co-signature — spec 8.5's dual-sign migration aid, an addition to the
+// Dilithium signature b already always produces, never a substitute for
+// it. Rejected by pkg/tx's Stage 2 once governance has retired dual-sign
+// (types.VotePublicInputs.UnwindDualSign's own doc); a caller has no way
+// to know that from here, so it should stop calling WithClassicalKey (or
+// building fresh identities without it) once it observes a real,
+// tallied, passed ProposalUpgradeUnwind.
+func (b *Builder) WithClassicalKey(pk crypto.ClassicalPublicKey, sk crypto.ClassicalPrivateKey) *Builder {
+	b.classicalPK = pk
+	b.classicalSK = sk
+	return b
 }
 
 // Identity is this builder's consensus-style identity — the same
@@ -80,5 +103,13 @@ func (b *Builder) finalize(t types.ShieldedTx) (types.ShieldedTx, error) {
 	}
 	t.Sig = types.DilithiumSig(sig)
 	t.SignerPubKey = []byte(b.pk)
+	if len(b.classicalSK) > 0 {
+		classicalSig, err := crypto.ClassicalSign(b.classicalSK, t.TxID[:])
+		if err != nil {
+			return types.ShieldedTx{}, fmt.Errorf("txbuilder: classical co-sign: %w", err)
+		}
+		t.ClassicalSig = []byte(classicalSig)
+		t.ClassicalPubKey = []byte(b.classicalPK)
+	}
 	return t, nil
 }

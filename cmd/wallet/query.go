@@ -282,4 +282,8 @@ func printProposal(p queryclient.Proposal) {
 		fmt.Printf("container asset target: %s\n", p.ContainerAssetTarget)
 		fmt.Printf("container asset applied: %v\n", p.ContainerAssetApplied)
 	}
+	if p.UnwindDualSign {
+		fmt.Printf("unwind dual sign: %v\n", p.UnwindDualSign)
+		fmt.Printf("unwind dual sign applied: %v\n", p.UnwindDualSignApplied)
+	}
 }

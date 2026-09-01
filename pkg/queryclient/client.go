@@ -220,6 +220,11 @@ type Proposal struct {
 	// doc.
 	ContainerAssetTarget  string
 	ContainerAssetApplied bool
+	// UnwindDualSign/UnwindDualSignApplied are a real spec-8.5 dual-sign-
+	// retirement proposal's bound claim and execution status — see
+	// types.VotePublicInputs.UnwindDualSign's own doc.
+	UnwindDualSign        bool
+	UnwindDualSignApplied bool
 }
 
 type proposalResponse struct {
@@ -244,6 +249,8 @@ type proposalResponse struct {
 	UnlockTransferApplied bool   `json:"unlock_transfer_applied,omitempty"`
 	ContainerAssetTarget  string `json:"container_asset_target,omitempty"`
 	ContainerAssetApplied bool   `json:"container_asset_applied,omitempty"`
+	UnwindDualSign        bool   `json:"unwind_dual_sign,omitempty"`
+	UnwindDualSignApplied bool   `json:"unwind_dual_sign_applied,omitempty"`
 }
 
 func (p proposalResponse) toProposal() Proposal { return Proposal(p) }

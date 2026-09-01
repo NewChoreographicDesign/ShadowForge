@@ -479,6 +479,28 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 		return fmt.Errorf("signature does not verify against the claimed signer key")
 	}
 
+	// Real spec-8.5 dual-sign migration aid: optional, and only ever a
+	// genuine ADDITION to the Dilithium check just above, never a
+	// substitute for it (see types.ShieldedTx.ClassicalSig's own doc). A
+	// real, passed ProposalUpgradeUnwind vote closes the path outright —
+	// once governance.Params.DualSignEnabled is false, a transaction
+	// still carrying either field is rejected, not merely un-checked.
+	if len(t.ClassicalSig) > 0 || len(t.ClassicalPubKey) > 0 {
+		if p.deps.Governance != nil && !p.deps.Governance.DualSignEnabled {
+			return fmt.Errorf("dual-sign has been retired by governance; this transaction must not carry a classical co-signature")
+		}
+		if len(t.ClassicalSig) == 0 || len(t.ClassicalPubKey) == 0 {
+			return fmt.Errorf("dual-sign requires both a classical signature and a classical public key")
+		}
+		classicalOK, err := crypto.ClassicalVerify(crypto.ClassicalPublicKey(t.ClassicalPubKey), t.TxID[:], crypto.ClassicalSignature(t.ClassicalSig))
+		if err != nil {
+			return fmt.Errorf("classical signature check: %w", err)
+		}
+		if !classicalOK {
+			return fmt.Errorf("classical signature does not verify against the claimed classical public key")
+		}
+	}
+
 	// Spike detection (spec 15.4) keys off the wallet identity the
 	// signature check above just proved genuine — never off an unverified
 	// claimed pubkey, which an attacker could pick freely to paint an
@@ -815,6 +837,16 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 					return fmt.Errorf("container-asset proposal targets %s, which is already authorized", pub.ContainerAssetTarget)
 				}
 			}
+			if pub.UnwindDualSign {
+				// Same "a proposal that could never have a real effect
+				// must never even be created" discipline ContainerAsset's
+				// already-authorized check applies, for the identical
+				// reason: retiring an already-retired path is a no-op
+				// that could only ever be a mistake or ballot spam.
+				if p.deps.Governance != nil && !p.deps.Governance.DualSignEnabled {
+					return fmt.Errorf("dual-sign has already been retired by governance")
+				}
+			}
 			record = state.ProposalRecord{
 				ProposalID:  string(pub.ProposalID),
 				Epoch:       p.deps.Epoch,
@@ -835,6 +867,7 @@ func (p *Pipeline) stage4SendExec(t *types.ShieldedTx) error {
 				SlashBurn:            pub.SlashBurn,
 				UnlockTransferTarget: pub.UnlockTransferTarget,
 				ContainerAssetTarget: pub.ContainerAssetTarget,
+				UnwindDualSign:       pub.UnwindDualSign,
 			}
 		}
 		if record.Tallied {
@@ -1222,11 +1255,11 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 // types.VotePublicInputs.ContainerAssetTarget's own doc) really does
 // authorize the target asset now: Store.PutAuthorizedAsset makes it
 // real, so a later BankDeposit/BankWithdraw naming it passes Stage 4's
-// own gate. The upgrade-unwind proposal kind is tallied like any other
-// but has no execution wired here — see governance.ProposalKind's own
-// doc for why: unlike the other kinds above, this build never
-// implements the dual-sign migration path spec 8.5 describes, so there
-// is no real mechanism for a pass to unwind.
+// own gate. A passed proposal bound to a real UnwindDualSign (spec 8.5
+// — see types.VotePublicInputs.UnwindDualSign's own doc) really does
+// retire the dual-sign migration path now: Governance.DualSignEnabled
+// becomes false, so Stage 2 starts rejecting any transaction still
+// carrying a classical co-signature.
 //
 // This runs deterministically off already-committed proposal state plus
 // the caller's own block Epoch, so every honest node reaches the same
@@ -1387,6 +1420,20 @@ func (p *Pipeline) TallyDueProposals(currentEpoch types.EpochNumber) ([]state.Pr
 			if err := p.deps.Store.PutAuthorizedAsset(record.ContainerAssetTarget); err == nil {
 				record.ContainerAssetApplied = true
 			}
+		}
+
+		if record.Passed && record.UnwindDualSign && p.deps.Governance != nil {
+			// Real spec-8.5 dual-sign retirement: the claim's own
+			// validity (not already retired) was already checked once,
+			// at Stage 4, the moment this proposal's first vote bound
+			// it — this only makes a governance-passed retirement real,
+			// so Stage 2 starts rejecting any transaction still carrying
+			// ClassicalSig/ClassicalPubKey from here on.
+			// Deps.Governance == nil (never true on a real node) leaves
+			// UnwindDualSignApplied false, mirroring every other
+			// execution step's identical treatment above.
+			p.deps.Governance.DualSignEnabled = false
+			record.UnwindDualSignApplied = true
 		}
 
 		if err := p.deps.Store.PutProposal(record); err != nil {

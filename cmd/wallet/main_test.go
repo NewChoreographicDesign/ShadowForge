@@ -20,6 +20,7 @@ import (
 
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
+	"github.com/shadowforge/shadowforge-l1/pkg/governance"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
 	"github.com/shadowforge/shadowforge-l1/pkg/query"
 	"github.com/shadowforge/shadowforge-l1/pkg/shieldedwallet"
@@ -1017,6 +1018,101 @@ func TestCLIProposeAuthorizeAssetEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(out, "container asset applied: true") {
 		t.Fatalf("expected 'wallet proposal' to report the real authorization as applied, got:\n%s", out)
+	}
+}
+
+// TestCLIClassicalKeygenWritesRealKeypair proves 'wallet classical-keygen'
+// writes a real, usable ed25519 keypair to disk.
+func TestCLIClassicalKeygenWritesRealKeypair(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "classical-key.json")
+	if err := runClassicalKeygen([]string{"-out", out}); err != nil {
+		t.Fatalf("runClassicalKeygen: %v", err)
+	}
+	pk, sk, err := loadClassicalKey(out)
+	if err != nil {
+		t.Fatalf("loadClassicalKey: %v", err)
+	}
+	sig, err := crypto.ClassicalSign(sk, []byte("real classical key round trip"))
+	if err != nil {
+		t.Fatalf("sign with loaded key: %v", err)
+	}
+	ok, err := crypto.ClassicalVerify(pk, []byte("real classical key round trip"), sig)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected the real, loaded-from-disk classical keypair to work")
+	}
+
+	if err := runClassicalKeygen([]string{"-out", out}); err == nil {
+		t.Fatalf("expected classical-keygen to refuse overwriting an existing key")
+	}
+}
+
+// TestCLIProposeUnwindDualSignEndToEnd proves the real spec-8.5 dual-
+// sign-retirement path end to end through the actual CLI: a real minted
+// NFT gives a voter real anonymous eligibility, 'wallet
+// propose-unwind-dual-sign' builds and submits a real retirement
+// request, a matching 'wallet vote-reveal' opens the sealed ballot, the
+// test drives the same real TallyDueProposals a live validator runs at
+// epoch end (see TestCLIProposeMintEndToEnd's identical doc for why),
+// and the real Deps.Governance ends up with DualSignEnabled genuinely
+// false.
+func TestCLIProposeUnwindDualSignEndToEnd(t *testing.T) {
+	backend := newTestBackend(t, 0x0b, nil, nil, nil)
+	govParams := governance.Default()
+	backend.deps.Governance = &govParams
+	backend.pipeline = tx.NewPipeline(backend.deps)
+
+	voterPath, voterKS := newTestKeystore(t, "unwind-dual-sign-voter-passphrase")
+	mintNFTViaCLI(t, backend, voterKS.PublicKey(), voterPath, "unwind-dual-sign-voter-passphrase")
+
+	withStdin(t, "unwind-dual-sign-voter-passphrase")
+	out, err := captureStdout(t, func() error {
+		return runProposeUnwindDualSign([]string{
+			"-keystore", voterPath, "-passphrase-stdin",
+			"-proposal", "cli-unwind-dual-sign-1", "-approve",
+			"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+			"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+		})
+	})
+	if err != nil {
+		t.Fatalf("runProposeUnwindDualSign: %v", err)
+	}
+	if !strings.Contains(out, "real dual-sign-retirement proposal built") {
+		t.Fatalf("expected propose-unwind-dual-sign output to describe the real proposal, got:\n%s", out)
+	}
+
+	withStdin(t, "unwind-dual-sign-voter-passphrase")
+	err = runVoteReveal([]string{
+		"-keystore", voterPath, "-passphrase-stdin",
+		"-proposal", "cli-unwind-dual-sign-1", "-approve",
+		"-eligibility-zk-params", backend.eligibilityZKParamsPath,
+		"-bootstrap", backend.addr, "-query", backend.queryURL, "-confirm-timeout", "10s",
+	})
+	if err != nil {
+		t.Fatalf("runVoteReveal: %v", err)
+	}
+
+	tallied, err := backend.pipeline.TallyDueProposals(1)
+	if err != nil {
+		t.Fatalf("tally: %v", err)
+	}
+	if len(tallied) != 1 || !tallied[0].Passed || !tallied[0].UnwindDualSignApplied {
+		t.Fatalf("expected the real proposal to pass and the real retirement to be applied, got %+v", tallied)
+	}
+	if govParams.DualSignEnabled {
+		t.Fatalf("expected DualSignEnabled to be genuinely false after the real retirement vote")
+	}
+
+	out, err = captureStdout(t, func() error {
+		return runProposal([]string{"-query", backend.queryURL, "-id", "cli-unwind-dual-sign-1"})
+	})
+	if err != nil {
+		t.Fatalf("runProposal: %v", err)
+	}
+	if !strings.Contains(out, "unwind dual sign applied: true") {
+		t.Fatalf("expected 'wallet proposal' to report the real retirement as applied, got:\n%s", out)
 	}
 }
 
