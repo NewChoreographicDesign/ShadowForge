@@ -6,12 +6,21 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/zk"
 )
 
+// fatalHelper is the minimal subset of *testing.T that buildInput needs.
+// *testing.F implements it too (with the identical signatures), so fuzz
+// seed-corpus setup can call buildInput directly with the real *testing.F
+// it's handed, instead of needing a fake or nil *testing.T.
+type fatalHelper interface {
+	Helper()
+	Fatalf(format string, args ...interface{})
+}
+
 // buildInput assembles a valid two-input, two-output shielded transfer:
 // two spent notes worth 60 + 40 = 100, split into a 70 payment note and a
 // 25 change note, with a fee of 5 (70+25+5 = 100). This exercises all five
 // spec-8.1 properties end to end: Merkle membership, opening knowledge,
 // nullifier derivation, value conservation, and well-formed new commitments.
-func buildInput(t *testing.T) (zk.TransferInput, *zk.Tree) {
+func buildInput(t fatalHelper) (zk.TransferInput, *zk.Tree) {
 	t.Helper()
 	tree := zk.NewTree()
 

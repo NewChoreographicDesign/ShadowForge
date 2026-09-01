@@ -211,6 +211,27 @@ func (n *Node) sweepTimeouts() {
 		for _, t := range r.batch {
 			_ = n.mempool.Reinsert(t, time.Now()) // best-effort retry; a full mempool just drops it
 		}
+
+		// A round timing out without local quorum doesn't mean the
+		// network as a whole failed to finalize this height — another
+		// node may have reached quorum and broadcast a real
+		// BlockAnnounce (tryFinalizeLocked) that this node's link simply
+		// never delivered, since that broadcast is a real, one-shot
+		// send with no retry of its own (spec 18.6 hardening: consensus
+		// must still converge under real jitter/packet loss, not just a
+		// clean network). Proactively asking every currently connected
+		// peer for this exact height closes that gap through the same
+		// real, independently-reverified catch-up path
+		// (requestCatchUp/handleBlockRequest/handleBlockResponse) a
+		// multi-block-behind node already relies on. A peer that doesn't
+		// have it either just answers with nothing
+		// (handleBlockRequest), so this is always safe to repeat on
+		// every timeout, and handleBlockResponse's own re-verification
+		// means a stale or duplicate reply can never cause anything
+		// beyond a no-op.
+		for _, p := range n.net.Host.Network().Peers() {
+			n.requestCatchUp(p, r.height, r.height)
+		}
 	}
 }
 

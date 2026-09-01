@@ -914,13 +914,27 @@ func signVoteTx(t *testing.T, pk crypto.DilithiumPublicKey, sk crypto.DilithiumP
 // claiming an arbitrary epoch) does not itself block a genuinely
 // epoch-appropriate proposal.
 func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
+	// Warm every shared, sync.Once-cached ZK system newTestNode depends on
+	// *before* genesisMs is computed below. Left cold, the very first real
+	// Setup() call in the whole test process can itself take well past a
+	// few seconds under a `-race` build (observed ~26s in this
+	// environment) — which used to eat directly into epoch0Remaining's
+	// budget since genesisMs was computed first. Warming here moves that
+	// one-time, highly variable cost outside the timing-sensitive window
+	// entirely; every call below is then just a cheap cache hit.
+	getTestEligibilitySystem(t)
+	getTestMintSystem(t)
+	getTestStakeSystem(t)
+	getTestUnstakeSystem(t)
+
 	// genesisMs is chosen so epoch 0 (a fixed 1 hour) has just a few
 	// seconds left to run when the test starts, so the real epoch
 	// boundary arrives quickly instead of requiring an actual hour-long
-	// wait. The margin is generous (not e.g. 300ms) because this must
-	// still hold under a loaded `go test ./...` run competing with other
-	// packages' tests for CPU, not just in isolation.
-	const epoch0Remaining = 3 * time.Second
+	// wait. The margin is generous (not e.g. 300ms) because everything
+	// from here through the real BlockProposal/StageVote handling below
+	// must still complete inside it, under real CPU contention from a
+	// loaded `go test ./...` run.
+	const epoch0Remaining = 10 * time.Second
 	genesisMs := time.Now().Add(-(time.Hour - epoch0Remaining)).UnixMilli()
 	n := newTestNode(t, time.Minute, genesisMs)
 
@@ -1008,8 +1022,11 @@ func TestEpochBoundaryTallyRunsOnRealProposal(t *testing.T) {
 		t.Fatalf("must not be tallied yet: still in the proposal's own epoch")
 	}
 
-	// Wait for the real epoch boundary to actually pass.
-	deadline := time.Now().Add(15 * time.Second)
+	// Wait for the real epoch boundary to actually pass. The deadline
+	// must exceed epoch0Remaining itself (how long from genesis until
+	// epoch 1 actually starts) with real margin on top, not just cover
+	// the polling loop's own overhead.
+	deadline := time.Now().Add(epoch0Remaining + 15*time.Second)
 	for consensus.CurrentEpoch(n.cfg.Genesis, time.Now()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("epoch never advanced to 1 within the deadline")

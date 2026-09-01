@@ -393,12 +393,115 @@ three real, exploitable gaps rather than being a formality:
    silently discarded. Fixed by persisting each ballot's commitment
    against its proposal (`state.ProposalRecord`); tallying still
    correctly happens at epoch end, not per-transaction (spec 17.4).
+4. **A liveness gap real jitter/packet-loss load testing surfaced**:
+   `tryFinalizeLocked` broadcasts `BlockAnnounce` exactly once, with no
+   retry of its own — under real, sustained packet loss, a node that
+   missed every copy of that one broadcast (and never fell more than one
+   block behind, the only case that triggered proactive catch-up) had no
+   other path back to sync and could stall indefinitely even while the
+   rest of the network kept committing blocks. Fixed: `sweepTimeouts` now
+   proactively asks every currently connected peer for the exact height
+   that just timed out locally, every time a round times out
+   (`pkg/validator/consensus.go`) — reusing the existing, independently
+   re-verified `requestCatchUp`/`handleBlockRequest`/`handleBlockResponse`
+   path rather than adding a new one. See "Load testing" below for the
+   test that found this.
 
 No secrets are logged; encryption keys use `crypto/rand`, never
 `math/rand`; AEAD nonces are fresh per call. See `docs/ARCHITECTURE.md`
 for what's still required before a real deployment (a production ZK
 trusted-setup ceremony and the spec 18.6 hardening phase in full — this
 is a tested reference implementation, not an audited production system).
+
+### Fuzzing
+
+Two real Go native fuzz targets exercise the two boundaries spec 23's own
+risk register names as a Year-1 mitigation ("fuzz of the prover/verifier
+pair") and the pipeline's first attacker-controlled byte fields:
+`pkg/zk/fuzz_test.go` (`FuzzProofFromBytesNeverPanics`,
+`FuzzVerifyPublicProofBytesNeverPanics` — arbitrary bytes into proof
+deserialization and full Groth16 verification against a real, valid set
+of public inputs) and `pkg/tx/fuzz_test.go`
+(`FuzzStage2WellFormednessNeverPanics` — arbitrary Memo/Sig/SignerPubKey/
+ClassicalSig/ClassicalPubKey combinations through the real
+`pipeline.ProcessBatch`). Each has run clean, with no crash, for real
+fuzz time beyond its seed corpus, not just as ordinary subtests; run
+`go test -fuzz=<Name> -fuzztime=1m ./pkg/zk/` or `./pkg/tx/` to fuzz
+further.
+
+### Dependency / supply-chain review
+
+Every direct and indirect dependency in `go.mod` was checked against
+public CVE/advisory data (`golang.org/x/vuln`'s live database was
+unreachable from this build environment's network policy, so the review
+used targeted advisory lookups per dependency instead of `govulncheck`).
+Findings:
+
+- **cloudflare/circl** (Dilithium3 PQC signatures): the FourQ low-order-
+  point issue (fixed 1.6.1) and the secp384r1 `CombinedMult` issue (fixed
+  1.6.3) both predate our pinned `v1.6.5`; neither curve is used by this
+  codebase's Dilithium/ed25519 code paths regardless.
+- **consensys/gnark** / **gnark-crypto**: the in-circuit EdDSA/ECDSA
+  signature-malleability advisory (fixed in gnark 0.14.0) and the older
+  signature-deserialization range-check issue (fixed in gnark-crypto
+  long before our `v0.21.0`) both concern signature-verification circuits
+  this codebase doesn't use — the shielded-transfer and eligibility
+  circuits are MiMC-hash-based, not EdDSA/ECDSA. Our pins (`v0.16.3` /
+  `v0.21.0`) are already well past both fixes regardless.
+- **quic-go**: the HTTP/3 QPACK trailer memory-exhaustion DoS (fixed
+  0.59.1) predates our pinned `v0.60.0`.
+- **go-libp2p**: the gossipsub PRUNE-backoff and IHAVE/IWANT DoS
+  advisories are specific to the gossipsub pubsub extension — this
+  codebase depends on core `go-libp2p` transport/Noise/stream muxing only
+  (`pkg/net`) and never imports `go-libp2p-pubsub`, so those advisories
+  don't apply here regardless of version.
+- **golang.org/x/crypto**: several 2026 SSH-agent/SSH-channel/CA-
+  revocation CVEs (fixed 0.52.0–0.53.0) don't apply to this codebase's
+  usage (`chacha20poly1305`, `hkdf`, `argon2` only — no `x/crypto/ssh` or
+  certificate validation anywhere), and our pin was already past every
+  fix version regardless.
+- **dgraph-io/badger**: the one relevant 2026 CVE is in Dgraph's Alpha
+  server's unauthenticated gRPC snapshot-import endpoint, a server this
+  codebase never runs — `pkg/state` only embeds the Badger KV library
+  directly, with no network-exposed import surface.
+
+No exploitable version gap was found. Four dependencies were still
+bumped to their latest currently-tagged release as routine hygiene
+(`golang.org/x/crypto` 0.54.0→0.55.0, `golang.org/x/net` 0.57.0→0.58.0,
+`google.golang.org/protobuf` 1.36.11→1.36.12; `quic-go` was left at
+`v0.60.0` deliberately — 0.61.0+ raises the required Go toolchain to
+1.26, which this repository does not otherwise need). The full test
+suite (`go test ./... -count=1`) passes unchanged after the bump.
+
+### Load testing
+
+`pkg/validator/jitter_test.go`'s `TestFourNodesConvergeUnderJitterAndPacketLoss`
+extends the real 4-node, real-libp2p, real-BFT-consensus topology
+(`TestFourNodesConvergeOnSameChain`) with a genuine adversarial network
+condition beyond a clean local loopback: a `lossyHost` wraps every node's
+real `host.Host` and gives every outbound stream (i.e. every wire message
+any node sends — heartbeat, TxOffer, BlockProposal, StageVote,
+BlockAnnounce, MegabatchPart, BlockRequest/Response, all of it, since they
+all go through the identical `host.Host.NewStream` path) a genuine 15%
+independent chance of being dropped outright and, when it isn't, a real
+0-120ms random delivery delay. This is real fault injection at the actual
+libp2p transport layer, not a mocked or simulated message bus — the same
+four `validator.Node`s, same real Noise-encrypted connections, same real
+signature/proof verification on every message, just over a deliberately
+unreliable link. It directly found and drove the fix to the liveness gap
+described in "Security" item 4 above: run repeatedly before that fix, it
+failed roughly half the time; after the fix, it has passed every run.
+
+Final validation also ran the full suite under the race detector
+(`go test ./... -race -count=1`), which surfaced one more real,
+pre-existing issue: `TestEpochBoundaryTallyRunsOnRealProposal` computed
+its real epoch-0-about-to-end genesis time *before* triggering the
+package's shared, `sync.Once`-cached ZK system setup — under `-race`'s
+real slowdown, that one-time setup cost could itself exceed the test's
+margin, so the real epoch boundary had already passed by the time the
+test could check it was still in epoch 0. Fixed by warming those caches
+first, moving the one-time setup cost outside the timing-sensitive
+window entirely, rather than just enlarging the margin and hoping.
 
 ## Repository layout
 
@@ -531,7 +634,13 @@ connections — two live, quorum-capable validators commit several blocks
 together before a third, passive node ever connects, and that node's
 chain head converges with theirs purely through real wire
 `BlockAnnounce`/`BlockRequest`/`BlockResponse` traffic, never a direct
-call into another node's internals.
+call into another node's internals. The exactly-one-block-behind case
+(too close to trigger the multi-block path above, since `tryFinalizeLocked`
+only ever broadcasts `BlockAnnounce` once per height with no retry of its
+own) is covered too: `sweepTimeouts` now proactively re-requests that
+exact height from every connected peer every time a round times out
+locally, closing a real liveness gap real network jitter/packet-loss load
+testing found — see "Security" and "Load testing" below.
 
 Cross-process BFT finality (spec 5.7) is fully wired and network-tested:
 `pkg/validator` runs a real propose/vote/commit state machine — genuine

@@ -26,7 +26,7 @@ var (
 	zkErr  error
 )
 
-func getZKSystem(t *testing.T) *zk.System {
+func getZKSystem(t fatalHelper) *zk.System {
 	t.Helper()
 	zkOnce.Do(func() { zkSys, zkErr = zk.Setup() })
 	if zkErr != nil {
@@ -43,7 +43,7 @@ var (
 	eligErr  error
 )
 
-func getEligibilitySystem(t *testing.T) *zk.EligibilitySystem {
+func getEligibilitySystem(t fatalHelper) *zk.EligibilitySystem {
 	t.Helper()
 	eligOnce.Do(func() { eligSys, eligErr = zk.SetupEligibility() })
 	if eligErr != nil {
@@ -52,7 +52,18 @@ func getEligibilitySystem(t *testing.T) *zk.EligibilitySystem {
 	return eligSys
 }
 
-func openStore(t *testing.T) *state.Store {
+// fatalHelper is the minimal subset of *testing.T that openStore,
+// getZKSystem, getEligibilitySystem, and newDeps need. *testing.F
+// implements it too (identical signatures), so a fuzz target's one-time
+// setup can build real Deps directly from the *testing.F it's handed,
+// instead of needing a fake or nil *testing.T.
+type fatalHelper interface {
+	Helper()
+	Fatalf(format string, args ...interface{})
+	Cleanup(func())
+}
+
+func openStore(t fatalHelper) *state.Store {
 	t.Helper()
 	var key [32]byte
 	copy(key[:], []byte("pipeline-test-key-32-bytes-pad!!"))
@@ -77,7 +88,7 @@ func authorizeAssetForTest(t *testing.T, store state.Accessor, asset types.Asset
 	}
 }
 
-func newDeps(t *testing.T) tx.Deps {
+func newDeps(t fatalHelper) tx.Deps {
 	eligTree := zk.NewTree()
 	initialRoot, err := eligTree.Root()
 	if err != nil {
