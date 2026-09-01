@@ -42,15 +42,15 @@
 // MsgTxOffer case), and maybePropose builds dual-track batches (Track A
 // live + Track B drained backlog, still bounded by the same MaxBatchBytes
 // budget that protects every ordinary batch) until a clean dual-track
-// cycle reaches real BFT quorum and OutageFlag clears.
-//
-// What is intentionally still out of scope, documented rather than
-// silently skipped: MegabatchPart's chunked wire-format reassembly for a
-// recovery batch too large to fit even a single MaxBatchBytes-bounded
-// proposal (see pkg/net/message.go's doc) — a real megabatch fits the
-// existing single-proposal pipeline for any backlog depth this build's
-// own MaxBatchBytes budget can absorb per round; splitting one across
-// multiple wire messages is a separate, larger undertaking.
+// cycle reaches real BFT quorum and OutageFlag clears. Every dual-track
+// proposal also broadcasts its full pre-trim megabatch in real, chunked
+// MsgMegabatchPart wire messages (shadownet.MegabatchPartPayload's own
+// doc) — a real transparency channel, not a consensus input: the
+// committee still only ever votes on and commits whatever fit inside
+// MaxBatchBytes, exactly as before, but every node (not just the
+// committee) can now reassemble and cross-check the full recovery batch
+// a proposer claims to be draining, previously visible only to whoever
+// happened to be on that round's committee.
 package validator
 
 import (
@@ -60,6 +60,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
@@ -293,7 +294,41 @@ type Node struct {
 	// roundMu.
 	roundMu sync.Mutex
 	rounds  map[uint64]*round
+
+	// megabatchMu guards megabatchRecv/megabatchDone — real MsgMegabatchPart
+	// wire reassembly state (see that payload's own doc). Separate from
+	// roundMu/mu: reassembly is purely observational bookkeeping, never
+	// part of round processing or the online registry, so it doesn't need
+	// to share either lock's critical section.
+	megabatchMu   sync.Mutex
+	megabatchRecv map[megabatchKey]*megabatchAssembly
+	// megabatchDone holds the most recently completed reassembly per
+	// height, bounded to megabatchDoneCap entries (oldest evicted first)
+	// so a long-running node's memory doesn't grow with every recovery
+	// round it ever observes — this is a real, disclosed, deliberately
+	// small window (recent-history transparency, not an audit log).
+	megabatchDone      map[uint64][]types.ShieldedTx
+	megabatchDoneOrder []uint64
 }
+
+// megabatchKey correlates one recovery round's MegabatchPart broadcast:
+// which peer sent it, and which height it announced (see
+// shadownet.MegabatchPartPayload's own doc on why Height is the only
+// available correlation field).
+type megabatchKey struct {
+	sender peer.ID
+	height uint64
+}
+
+// megabatchAssembly buffers the chunks of one in-progress MegabatchPart
+// reassembly until every part has arrived.
+type megabatchAssembly struct {
+	parts [][]byte
+	seen  int
+}
+
+// megabatchDoneCap bounds megabatchDone's size — see that field's own doc.
+const megabatchDoneCap = 16
 
 // NewNode builds a validator.Node, constructing its own net.Node on h so
 // the message handler (a method on the Node being built) can be wired at
@@ -351,17 +386,19 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 			p := governance.Default()
 			return &p
 		}(),
-		silentMon:  silent.NewRateMonitor(),
-		sentinels:  consensus.NewSentinelManager(),
-		outage:     consensus.NewOutageController(consensus.DefaultOutageThresholds()),
-		isSentinel: isSentinel,
-		identity:   types.NFTID(types.SumHash(pk)),
-		pk:         pk,
-		sk:         sk,
-		log:        logf,
-		online:     map[types.NFTID]onlineInfo{},
-		everSeen:   map[types.NFTID]time.Time{},
-		rounds:     map[uint64]*round{},
+		silentMon:     silent.NewRateMonitor(),
+		sentinels:     consensus.NewSentinelManager(),
+		outage:        consensus.NewOutageController(consensus.DefaultOutageThresholds()),
+		isSentinel:    isSentinel,
+		identity:      types.NFTID(types.SumHash(pk)),
+		pk:            pk,
+		sk:            sk,
+		log:           logf,
+		online:        map[types.NFTID]onlineInfo{},
+		everSeen:      map[types.NFTID]time.Time{},
+		rounds:        map[uint64]*round{},
+		megabatchRecv: map[megabatchKey]*megabatchAssembly{},
+		megabatchDone: map[uint64][]types.ShieldedTx{},
 	}
 	n.net = shadownet.NewNode(h, limiter, n.handleMessage)
 	if !isSentinel {
@@ -411,6 +448,20 @@ func (n *Node) Mempool() *tx.Mempool { return n.mempool }
 // Net exposes the underlying net.Node, e.g. for FullAddr/Host access by
 // the caller's own logging.
 func (n *Node) Net() *shadownet.Node { return n.net }
+
+// ReassembledMegabatch returns the real, wire-reassembled outage-recovery
+// megabatch a peer announced for height, if this node has completed
+// reassembling one — real transparency into what a recovery round claims
+// to be draining, independent of whatever actually ends up committed; see
+// shadownet.MegabatchPartPayload's own doc for why this is observational
+// only and never itself trusted for consensus. megabatchDone's own doc
+// explains why only a small, recent window of heights is ever available.
+func (n *Node) ReassembledMegabatch(height uint64) ([]types.ShieldedTx, bool) {
+	n.megabatchMu.Lock()
+	defer n.megabatchMu.Unlock()
+	batch, ok := n.megabatchDone[height]
+	return batch, ok
+}
 
 // Start launches the heartbeat and round loops; it returns immediately and
 // runs until ctx is done.

@@ -119,10 +119,18 @@ func (n *Node) handleMessage(p peer.ID, env shadownet.Envelope) {
 		}
 		n.handleBlockResponse(resp)
 
+	case shadownet.MsgMegabatchPart:
+		var part shadownet.MegabatchPartPayload
+		if err := decode(env, &part); err != nil {
+			n.log("validator: bad megabatch part from %s: %v", p, err)
+			return
+		}
+		n.handleMegabatchPart(p, part)
+
 	default:
-		// MegabatchPart, ContainerSync, SilentPad: accepted on the wire
-		// (rate-limited like every other type) but not acted on by this
-		// package — see the package doc's scope note.
+		// ContainerSync, SilentPad: accepted on the wire (rate-limited
+		// like every other type) but not acted on by this package — see
+		// the package doc's scope note.
 	}
 }
 
@@ -293,6 +301,13 @@ func (n *Node) buildProposalBatch(dualTrack bool) []types.ShieldedTx {
 	}
 
 	megaDrained := n.outage.BuildMegabatch(n.cfg.maxBatchSize())
+	if len(megaDrained) > 0 {
+		// Real transparency broadcast (shadownet.MegabatchPartPayload's
+		// own doc): the FULL pre-trim megabatch, not just whatever ends
+		// up fitting the committee's own MaxBatchBytes-bounded proposal
+		// below — best-effort, never fatal to proposing.
+		n.broadcastMegabatchPart(n.chn.NextHeight(), megaDrained)
+	}
 	mega, megaDeferred := n.filterReadyReveals(megaDrained)
 	for _, t := range megaDeferred {
 		n.outage.Reinsert(t)
@@ -832,6 +847,113 @@ func (n *Node) handleBlockResponse(resp shadownet.BlockResponsePayload) {
 			break
 		}
 		n.log("validator: caught up to height %d via block response", b.Height)
+	}
+}
+
+// broadcastMegabatchPart announces the real, full pre-trim megabatch a
+// dual-track proposal round is draining, chunked over the real wire — see
+// shadownet.MegabatchPartPayload's own doc for why this exists as a real,
+// disclosed transparency channel alongside (never instead of) the actual
+// committee-voted proposal buildProposalBatch still assembles separately.
+// Best-effort: a marshal or send failure here never blocks or fails
+// proposing, only the broadcast.
+func (n *Node) broadcastMegabatchPart(height uint64, batch []types.ShieldedTx) {
+	data, err := json.Marshal(batch)
+	if err != nil {
+		n.log("validator: marshal megabatch for broadcast: %v", err)
+		return
+	}
+	partCount := (len(data) + shadownet.MaxMegabatchPartBytes - 1) / shadownet.MaxMegabatchPartBytes
+	if partCount == 0 {
+		partCount = 1
+	}
+	ctx := context.Background()
+	for i := 0; i < partCount; i++ {
+		start := i * shadownet.MaxMegabatchPartBytes
+		end := start + shadownet.MaxMegabatchPartBytes
+		if end > len(data) {
+			end = len(data)
+		}
+		env, err := shadownet.NewEnvelope(shadownet.MsgMegabatchPart, shadownet.MegabatchPartPayload{
+			Height: height, PartIndex: i, PartCount: partCount, Data: data[start:end],
+		})
+		if err != nil {
+			n.log("validator: build megabatch part %d/%d: %v", i+1, partCount, err)
+			return
+		}
+		n.net.Broadcast(ctx, env)
+	}
+}
+
+// handleMegabatchPart buffers one real chunk of a peer's megabatch
+// announcement and, once every chunk has arrived, reassembles and
+// records it — see shadownet.MegabatchPartPayload's own doc. Never
+// trusted for anything consensus-affecting: a malformed, incomplete, or
+// dishonest announcement can only ever fail to reassemble, or produce a
+// recorded result a later observer compares against reality — it never
+// touches real chain state.
+func (n *Node) handleMegabatchPart(sender peer.ID, part shadownet.MegabatchPartPayload) {
+	if part.PartCount <= 0 || part.PartCount > shadownet.MaxMegabatchParts || part.PartIndex < 0 || part.PartIndex >= part.PartCount {
+		n.log("validator: bad megabatch part index/count from %s: %d/%d", sender, part.PartIndex, part.PartCount)
+		return
+	}
+	if len(part.Data) > shadownet.MaxMegabatchPartBytes {
+		n.log("validator: oversized megabatch part from %s: %d bytes", sender, len(part.Data))
+		return
+	}
+
+	n.megabatchMu.Lock()
+	key := megabatchKey{sender: sender, height: part.Height}
+	asm, ok := n.megabatchRecv[key]
+	if !ok || part.PartCount != len(asm.parts) {
+		// Either the first part of a new announcement, or a peer
+		// restarting mid-stream with a different part count — either way,
+		// start a fresh assembly rather than reassembling a mismatched
+		// mix of two different broadcasts.
+		asm = &megabatchAssembly{parts: make([][]byte, part.PartCount)}
+		n.megabatchRecv[key] = asm
+	}
+	if asm.parts[part.PartIndex] == nil {
+		asm.seen++
+	}
+	asm.parts[part.PartIndex] = part.Data
+	complete := asm.seen == part.PartCount
+	if complete {
+		delete(n.megabatchRecv, key)
+	}
+	n.megabatchMu.Unlock()
+
+	if !complete {
+		return
+	}
+
+	var data []byte
+	for _, p := range asm.parts {
+		data = append(data, p...)
+	}
+	var batch []types.ShieldedTx
+	if err := json.Unmarshal(data, &batch); err != nil {
+		n.log("validator: reassembled megabatch from %s at height %d failed to decode: %v", sender, part.Height, err)
+		return
+	}
+	n.log("validator: reassembled real megabatch from %s at height %d: %d tx(es)", sender, part.Height, len(batch))
+	n.recordCompletedMegabatch(part.Height, batch)
+}
+
+// recordCompletedMegabatch stores batch under height in megabatchDone,
+// evicting the oldest entry once megabatchDoneCap is exceeded — see that
+// field's own doc.
+func (n *Node) recordCompletedMegabatch(height uint64, batch []types.ShieldedTx) {
+	n.megabatchMu.Lock()
+	defer n.megabatchMu.Unlock()
+	if _, exists := n.megabatchDone[height]; !exists {
+		n.megabatchDoneOrder = append(n.megabatchDoneOrder, height)
+	}
+	n.megabatchDone[height] = batch
+	for len(n.megabatchDoneOrder) > megabatchDoneCap {
+		oldest := n.megabatchDoneOrder[0]
+		n.megabatchDoneOrder = n.megabatchDoneOrder[1:]
+		delete(n.megabatchDone, oldest)
 	}
 }
 

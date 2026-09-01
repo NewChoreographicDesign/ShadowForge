@@ -110,9 +110,48 @@ type BlockAnnouncePayload struct {
 	Block types.Block `json:"block"`
 }
 
+// MaxMegabatchPartBytes bounds one MegabatchPartPayload chunk's Data
+// field — real defense-in-depth against an oversized single chunk,
+// mirroring MaxCatchUpBlocks's identical role for block catch-up: a
+// recovery megabatch too large for one chunk is sent as more chunks
+// (PartCount > 1), not one unbounded one.
+const MaxMegabatchPartBytes = 64 * 1024 // 64 KiB per part
+
+// MaxMegabatchParts bounds how many parts one reassembly will ever
+// buffer, regardless of what a peer's own PartCount claims — real
+// defense-in-depth against a peer claiming an unbounded part count purely
+// to make a receiver allocate an unbounded []byte slice before a single
+// real byte has arrived. A real megabatch (consensus.MegabatchMultiplier
+// * a node's own MaxBatchSize, real Dilithium-signed transactions) tops
+// out at a few hundred parts at MaxMegabatchPartBytes — this leaves
+// generous headroom above that while still bounding the worst case.
+const MaxMegabatchParts = 1024
+
 // MegabatchPartPayload carries one chunk of an outage-recovery megabatch
-// (spec 5.6).
+// (spec 5.6) — a real, disclosed side channel broadcast alongside (not
+// instead of) the actual dual-track BlockProposal/BlockAnnounce path:
+// the committee still only ever votes on and commits whatever fit inside
+// MaxBatchBytes's own budget (see pkg/validator's buildProposalBatch),
+// exactly as before. What this closes is the gap where a proposer's
+// *entire* recovery megabatch — everything OutageController.BuildMegabatch
+// drained this round, before that same byte-budget trim — was never
+// visible to the wider network at all, only to whoever ended up on the
+// committee. Every real node, not just committee members, can now
+// reassemble the full megabatch a recovery round claims to be draining
+// and cross-check it against what actually lands in the committed chain
+// afterward — real transparency into outage recovery, not a consensus
+// input: a peer that reassembles a bogus or incomplete announcement can
+// only ever notice and log a discrepancy, never have it affect its own
+// chain state, exactly like every other observability signal this
+// codebase already treats this message type's row as (see MessageType's
+// own doc).
+//
+// Height correlates every part of one recovery round's announcement
+// (there is no other framing to disambiguate concurrent broadcasts from
+// the same or different senders); PartIndex/PartCount let the receiver
+// know when every chunk of that one announcement has arrived.
 type MegabatchPartPayload struct {
+	Height    uint64 `json:"height"`
 	PartIndex int    `json:"part_index"`
 	PartCount int    `json:"part_count"`
 	Data      []byte `json:"data"`

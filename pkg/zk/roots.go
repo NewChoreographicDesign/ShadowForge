@@ -27,12 +27,22 @@ import "sync"
 // transactions ordered earlier in the same or a prior batch may have
 // already advanced the canonical tree past it. Rejecting anything but
 // the single newest root would make ordinary concurrent use fail
-// unpredictably. MerkleDepth's own tiny (TreeSize-leaf) capacity already
-// bounds how many roots can ever exist across this build's lifetime, so
-// keeping the full history costs nothing meaningful.
+// unpredictably.
+//
+// A real, disclosed scaling limit: at MerkleDepth's now-production
+// capacity (see that constant's own doc), nothing bounds how many roots
+// can accumulate here except real transaction volume over the chain's
+// entire lifetime — unlike the old 16-leaf placeholder depth, where the
+// tree's own capacity capped this at a handful of entries for free.
+// Contains is an O(1) map lookup (not a linear scan) precisely because
+// of that: real transaction volume, not MerkleDepth, is what could
+// eventually make this history's memory footprint worth revisiting (a
+// pruning or windowing policy for roots older than any proof still in
+// flight would reclaim it) — a separate, later concern this build does
+// not need to solve to make MerkleDepth itself real.
 type RootHistory struct {
 	mu    sync.Mutex
-	roots []FieldElement
+	roots map[FieldElement]struct{}
 }
 
 // NewRootHistory seeds a RootHistory with initialRoot — the empty tree's
@@ -40,7 +50,7 @@ type RootHistory struct {
 // agree on the one root that's valid before any real note has ever been
 // committed.
 func NewRootHistory(initialRoot FieldElement) *RootHistory {
-	return &RootHistory{roots: []FieldElement{initialRoot}}
+	return &RootHistory{roots: map[FieldElement]struct{}{initialRoot: {}}}
 }
 
 // Record appends a newly-canonical root — called once per real Transfer
@@ -49,7 +59,7 @@ func NewRootHistory(initialRoot FieldElement) *RootHistory {
 func (h *RootHistory) Record(root FieldElement) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.roots = append(h.roots, root)
+	h.roots[root] = struct{}{}
 }
 
 // Contains reports whether root is one this history has ever recorded —
@@ -57,10 +67,6 @@ func (h *RootHistory) Record(root FieldElement) {
 func (h *RootHistory) Contains(root FieldElement) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, r := range h.roots {
-		if r.Equal(&root) {
-			return true
-		}
-	}
-	return false
+	_, ok := h.roots[root]
+	return ok
 }

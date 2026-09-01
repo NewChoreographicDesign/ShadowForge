@@ -3,6 +3,7 @@ package shieldedwallet
 import (
 	"crypto/ecdh"
 	"fmt"
+	"sort"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -138,16 +139,11 @@ func (w *Wallet) selectInputsLocked(amount, fee uint64) []*ownedNote {
 	for _, n := range w.notes {
 		all = append(all, n)
 	}
-	// Simple O(n^2) largest-first selection — this build's TreeSize (16
-	// leaves total, ever) makes n trivially small; clarity over
-	// micro-optimizing a search space that can never be large.
-	for i := 0; i < len(all); i++ {
-		for j := i + 1; j < len(all); j++ {
-			if all[j].secret.Value > all[i].secret.Value {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
+	// Largest-first selection. zk.MerkleDepth's own doc explains why this
+	// build no longer caps the number of notes any one wallet could ever
+	// hold to a handful — a real O(n log n) sort is the honest choice now
+	// that n isn't guaranteed trivially small.
+	sort.Slice(all, func(i, j int) bool { return all[i].secret.Value > all[j].secret.Value })
 	if len(all) < zk.NumInputs {
 		return nil
 	}

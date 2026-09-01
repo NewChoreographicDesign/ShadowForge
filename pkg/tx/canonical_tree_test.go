@@ -243,14 +243,15 @@ func TestTransferFullTreeRejectsWithoutPartialMutation(t *testing.T) {
 		t.Fatalf("insert in1: %v", err)
 	}
 
-	// Fill the remaining capacity down to exactly one free slot — a real
+	// Claim the remaining capacity down to exactly one free slot — a real
 	// 2-output transfer cannot possibly fit, no matter how valid its
-	// proof is.
-	for zkTree.Remaining() > 1 {
-		n := mkNote(t, 1)
-		if _, err := zkTree.Insert(n.Commitment()); err != nil {
-			t.Fatalf("fill tree: %v", err)
-		}
+	// proof is. Real Insert calls one at a time would need TreeSize-scale
+	// (billions of) iterations at MerkleDepth's real production depth —
+	// AdvanceUsedForTest's own doc explains why that's both infeasible
+	// and unnecessary: Root()/Prove() for in0/in1 only ever depend on the
+	// leaves actually stored, never on this accounting-only claim.
+	if err := zkTree.AdvanceUsedForTest(zkTree.Remaining() - 1); err != nil {
+		t.Fatalf("claim remaining capacity: %v", err)
 	}
 	root, err := zkTree.Root()
 	if err != nil {

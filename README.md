@@ -432,24 +432,54 @@ JS codebase), the following are **not** implemented here:
   runtime subspace mechanics (validator counts, hybrid split, sync
   triggers, shadow verification) that tooling would drive.
 
-Within the L1 core, one thing is implemented but intentionally scoped
-down, documented at the point of decision in code:
-
-- **ZK circuit size.** `pkg/zk.MerkleDepth` is 4 (16 leaves), not a
-  production depth. Spec 23's own risk register names "tiny circuits" as
-  the explicit Year-1 mitigation for "gnark / circuit bugs" — this
-  follows that directive. Raising it is a one-constant change plus a new
-  trusted setup.
+**Real, production-sized ZK Merkle depth — closing a gap this README used
+to disclose as "not a production depth."** `pkg/zk.MerkleDepth` is now 32
+(4,294,967,296 leaves), matching the depth real shielded pools have
+shipped at (Zcash's Orchard commitment tree), rather than the 4-deep
+(16-leaf) placeholder this build started with. Raising the constant alone
+was not, in practice, the "one-constant change" it looked like: `Tree`'s
+original implementation eagerly materialized and rehashed all `TreeSize`
+leaves on every `Root()`/`Prove()` call, which is fine at 16 leaves but
+allocates on the order of `TreeSize*32` bytes at any depth large enough to
+matter — roughly 137GB just to hold the leaf array at depth 32. The real
+fix, in `Tree`'s own doc: `Root()`/`Prove()` now cost `O(used +
+MerkleDepth)`, never `O(TreeSize)`, via precomputed all-zero-subtree
+hashes standing in for everything beyond the leaves actually inserted — a
+real Setup+Prove+Verify cycle at the new depth still completes in low
+single-digit seconds. `zk.RootHistory`'s linear `Contains` scan became an
+O(1) map lookup for the identical reason (nothing bounds its size for
+free anymore once `MerkleDepth`'s own tiny capacity can no longer do it),
+and `pkg/shieldedwallet`'s O(n²) input-selection sort became a real
+`sort.Slice` for the same reason.
 
 Outage detection and megabatch recovery (spec 5.6) are wired into live
 consensus: `pkg/validator`'s round loop calls `pkg/consensus`'s outage
 controller every tick (`evaluateOutage`), and a validator that detects an
 outage builds a real dual-track proposal (`buildProposalBatch`'s
 `dualTrack` path, `OutageController.BuildMegabatch`) until a clean cycle
-reaches real BFT quorum. Still intentionally out of scope, per
-`pkg/validator/node.go`'s own doc: `MegabatchPart`'s chunked wire-format
-reassembly for a recovery batch too large for a single
-`MaxBatchBytes`-bounded proposal.
+reaches real BFT quorum.
+
+**Real `MegabatchPart` chunked wire reassembly — closing a gap
+`pkg/validator/node.go`'s own doc had disclosed as "intentionally out of
+scope."** Spec 6 names `MegabatchPart` as one of its own wire message
+types, but nothing in this build ever sent or acted on one — it was
+accepted and rate-limited like any other message, then silently dropped.
+This closes it as a real, disclosed transparency channel, not a new
+consensus input: every dual-track proposal now broadcasts its *full*
+pre-trim recovery megabatch (everything `OutageController.BuildMegabatch`
+drained this round, before the same `MaxBatchBytes` trim the committee's
+own proposal still applies) as real, chunked `MsgMegabatchPart` envelopes
+(`pkg/net`'s new `MaxMegabatchPartBytes`/`MaxMegabatchParts` bound each
+chunk and the total part count a receiver will ever buffer). Any real
+node — not just that round's committee — can reassemble it and compare
+what a recovery round claims to be draining against what actually lands
+in the committed chain afterward; a malformed, incomplete, or dishonest
+announcement can only ever fail to reassemble, never touch real chain
+state, since the committee still only ever votes on and commits whatever
+fit inside `MaxBatchBytes`, exactly as before.
+`pkg/validator/megabatch_test.go`'s `TestMegabatchPartRealWireReassembly`
+proves this over a real libp2p connection between two independent nodes,
+with a real backlog large enough to force more than one chunk.
 
 **Real multi-block catch-up sync — closing a gap `pkg/validator/node.go`'s
 own doc had disclosed as "intentionally out of scope."** A node that fell

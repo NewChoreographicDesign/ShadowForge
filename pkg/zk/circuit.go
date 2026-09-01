@@ -20,9 +20,15 @@
 //
 // Circuit size: spec 23's own risk register says the Year-1 mitigation for
 // "gnark / circuit bugs" is "tiny circuits, recursive later, external audit
-// ... of the prover/verifier pair." MerkleDepth is deliberately small for
-// that reason; pkg/zk's tree is a separate, circuit-native (MiMC over the
-// BN254 scalar field) accumulator from pkg/state's SHA256 block-level
+// ... of the prover/verifier pair." MerkleDepth is now a real, production
+// capacity (see its own doc) rather than a 16-leaf placeholder, but the
+// circuit itself stays genuinely small in the sense spec 23 actually
+// cares about — total constraint count, and therefore setup/proving time
+// and audit surface: a real Setup()+Prove()+Verify() cycle at the current
+// MerkleDepth still completes in low single-digit seconds (see
+// Tree's own doc for why Root()/Prove() don't pay for the full leaf
+// capacity either). pkg/zk's tree is a separate, circuit-native (MiMC over
+// the BN254 scalar field) accumulator from pkg/state's SHA256 block-level
 // Merkle tree — the two serve different audiences (an in-circuit
 // membership proof vs. a general-purpose public state root a light client
 // checks with plain hashing) and are bridged explicitly by pkg/tx rather
@@ -42,11 +48,22 @@ const (
 	NumInputs  = 2
 	NumOutputs = 2
 
-	// MerkleDepth is intentionally small (16 leaves) per spec 23's "tiny
-	// circuits" mitigation for Year-1; raising it for a larger commitment
-	// set is a circuit (and trusted-setup) parameter change, not a
-	// structural one.
-	MerkleDepth = 4
+	// MerkleDepth is a real, production commitment-tree capacity: depth 32
+	// (2^32 = 4,294,967,296 leaves) matches the depth production shielded
+	// pools have actually shipped at (e.g. Zcash's Orchard commitment
+	// tree) — enough headroom that a live network exhausting it is not a
+	// realistic operational concern. This build previously ran at depth 4
+	// (16 leaves) as a placeholder — raising the constant alone would have
+	// been correct in principle but was not, in practice, a "one-constant
+	// change": Tree's original implementation eagerly materialized and
+	// rehashed all TreeSize leaves on every Root()/Prove() call, which
+	// allocates and hashes on the order of TreeSize*32 bytes — completely
+	// infeasible once TreeSize reaches the billions (roughly 137GB just to
+	// hold the leaf array at depth 32). Tree's own doc explains the real
+	// fix: Root()/Prove() now cost O(used + MerkleDepth), not O(TreeSize),
+	// via precomputed all-zero-subtree hashes for everything beyond the
+	// leaves actually inserted.
+	MerkleDepth = 32
 )
 
 // TransferCircuit is the gnark circuit definition for a shielded transfer.

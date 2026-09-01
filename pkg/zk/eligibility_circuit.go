@@ -32,8 +32,9 @@ import (
 // Revoking an anonymous credential requires either a slashed-leaf
 // accumulator or epoch-scoped re-registration, neither of which this
 // build implements — see pkg/tx's own doc at the call site for the full
-// disclosure. Circuit size mirrors TransferCircuit's own MerkleDepth
-// (spec 23's "tiny circuits" Year-1 mitigation).
+// disclosure. Circuit size mirrors TransferCircuit's own MerkleDepth —
+// see that constant's own doc for why it's now a real, production leaf
+// capacity rather than a placeholder.
 type EligibilityCircuit struct {
 	// Public inputs.
 	MerkleRoot    frontend.Variable `gnark:",public"`

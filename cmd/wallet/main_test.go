@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -311,6 +312,25 @@ type testBackend struct {
 	unstakeZKParamsPath string
 }
 
+// sharedEligibilitySystem/sharedUnstakeSystem are expensive to Setup at a
+// real, production-sized zk.MerkleDepth (each real proving/verifying key
+// generation over MerkleDepth+1 Merkle-path constraints) — built once and
+// reused by every test in this file that calls newTestBackend, mirroring
+// the identical sync.Once pattern pkg/tx/pipeline_test.go's own newDeps
+// already established for the same reason. Every test in this file still
+// gets its own real params file (t.TempDir()), just backed by the same
+// underlying Groth16 keys — exactly like a real network, where every node
+// and wallet loads one shared setup file rather than each generating its
+// own incompatible one (see zk.EligibilitySystem.WriteTo's own doc).
+var (
+	sharedEligOnce    sync.Once
+	sharedEligSys     *zk.EligibilitySystem
+	sharedEligErr     error
+	sharedUnstakeOnce sync.Once
+	sharedUnstakeSys  *zk.UnstakeSystem
+	sharedUnstakeErr  error
+)
+
 func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *zk.Tree, zkRoots *zk.RootHistory) *testBackend {
 	t.Helper()
 	var key [32]byte
@@ -334,10 +354,11 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	// pipeline and the CLI's own loaded copy (from the file this writes)
 	// to verify against identical Groth16 keys, exactly like zkSys above
 	// for Kind Transfer.
-	eligSys, err := zk.SetupEligibility()
-	if err != nil {
-		t.Fatalf("eligibility zk setup: %v", err)
+	sharedEligOnce.Do(func() { sharedEligSys, sharedEligErr = zk.SetupEligibility() })
+	if sharedEligErr != nil {
+		t.Fatalf("eligibility zk setup: %v", sharedEligErr)
 	}
+	eligSys := sharedEligSys
 	eligParamsPath := filepath.Join(t.TempDir(), "eligibility-zk-params.bin")
 	eligParamsFile, err := os.Create(eligParamsPath)
 	if err != nil {
@@ -394,10 +415,11 @@ func newTestBackend(t *testing.T, storeKeyByte byte, zkSys *zk.System, zkTree *z
 	if err := stakeParamsFile.Close(); err != nil {
 		t.Fatalf("close stake zk params file: %v", err)
 	}
-	unstakeSys, err := zk.SetupUnstake()
-	if err != nil {
-		t.Fatalf("unstake zk setup: %v", err)
+	sharedUnstakeOnce.Do(func() { sharedUnstakeSys, sharedUnstakeErr = zk.SetupUnstake() })
+	if sharedUnstakeErr != nil {
+		t.Fatalf("unstake zk setup: %v", sharedUnstakeErr)
 	}
+	unstakeSys := sharedUnstakeSys
 	unstakeParamsPath := filepath.Join(t.TempDir(), "unstake-zk-params.bin")
 	unstakeParamsFile, err := os.Create(unstakeParamsPath)
 	if err != nil {
