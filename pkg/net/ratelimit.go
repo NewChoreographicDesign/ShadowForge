@@ -69,11 +69,18 @@ func NewRateLimiter(cfg RateLimiterConfig) *RateLimiter {
 }
 
 // Allow reports whether a message of type t from p should be processed. It
-// applies only to the message types spec 6 names as rate-limited
-// (Heartbeat, TxOffer); all others always pass through this limiter
-// (though a real deployment may choose to extend the set via governance).
+// applies to the message types spec 6 names as rate-limited (Heartbeat,
+// TxOffer), plus BlockRequest — a real, independent audit finding (Phase
+// 2, low/medium): unlike every other unthrottled type here, a
+// BlockRequest triggers real, synchronous per-request disk I/O
+// (handleBlockRequest reads up to MaxCatchUpBlocks blocks from the
+// store), so a peer dialing a fresh stream as fast as it can and sending
+// BlockRequest repeatedly was a cheap, real I/O-amplification DoS this
+// limiter otherwise did nothing to slow down. Every other message type
+// always passes through unthrottled (though a real deployment may choose
+// to extend the set further via governance).
 func (r *RateLimiter) Allow(p peer.ID, t MessageType, now time.Time) bool {
-	if t != MsgHeartbeat && t != MsgTxOffer {
+	if t != MsgHeartbeat && t != MsgTxOffer && t != MsgBlockRequest {
 		return true
 	}
 

@@ -86,9 +86,13 @@ func TestOpenReloadsExistingHead(t *testing.T) {
 	v := genValidators(t, 3)
 	b := c1.NextBlock(0, nil, types.Hash{}, types.Hash{1}, types.Hash{}, v.ids[0], 2)
 	candidate := types.HashBlock(b)
+	// Real BFT-safe quorum for a 3-member committee is unanimous 3 of 3
+	// (see consensus.BFTQuorumMet's own doc) — 2 of 3 is a simple majority
+	// but not safe against BFTFaultTolerance(3)=1 equivocating validator.
 	b.Votes = []types.Vote{
 		{Validator: v.ids[0], StateRoot: candidate, Sig: v.sign(v.ids[0], candidate[:])},
 		{Validator: v.ids[1], StateRoot: candidate, Sig: v.sign(v.ids[1], candidate[:])},
+		{Validator: v.ids[2], StateRoot: candidate, Sig: v.sign(v.ids[2], candidate[:])},
 	}
 	if err := c1.Append(b, v.ids, v.lookup); err != nil {
 		t.Fatalf("append: %v", err)
@@ -112,16 +116,16 @@ func TestAppendWithRealQuorumSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	v := genValidators(t, 5) // majority of 5 is 3
+	v := genValidators(t, 5) // real BFT-safe quorum of 5 is 4 (see consensus.BFTQuorumMet's own doc)
 
 	b := c.NextBlock(0, nil, types.Hash{9}, types.Hash{1}, types.Hash{}, v.ids[0], 100)
 	candidate := types.HashBlock(b)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 4; i++ {
 		b.Votes = append(b.Votes, types.Vote{Validator: v.ids[i], StateRoot: candidate, Sig: v.sign(v.ids[i], candidate[:])})
 	}
 
 	if err := c.Append(b, v.ids, v.lookup); err != nil {
-		t.Fatalf("expected append with real 3/5 quorum to succeed: %v", err)
+		t.Fatalf("expected append with real 4/5 quorum to succeed: %v", err)
 	}
 	if c.HeadHeight() != 1 {
 		t.Fatalf("expected head height 1, got %d", c.HeadHeight())
@@ -145,7 +149,8 @@ func TestAppendIndexesCommittedTransactions(t *testing.T) {
 	}
 	b := c.NextBlock(0, batch, types.Hash{9}, types.Hash{1}, types.Hash{}, v.ids[0], 100)
 	candidate := types.HashBlock(b)
-	for i := 0; i < 2; i++ {
+	// Real BFT-safe quorum for a 3-member committee is unanimous 3 of 3.
+	for i := 0; i < 3; i++ {
 		b.Votes = append(b.Votes, types.Vote{Validator: v.ids[i], StateRoot: candidate, Sig: v.sign(v.ids[i], candidate[:])})
 	}
 

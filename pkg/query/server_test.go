@@ -208,7 +208,9 @@ func TestTxStatusCommittedAfterRealAppend(t *testing.T) {
 	batch := []types.ShieldedTx{{TxID: txid, Kind: types.TxVote}}
 	b := env.chn.NextBlock(0, batch, types.Hash{9}, types.Hash{1}, types.Hash{}, v1.id, 100)
 	candidate := types.HashBlock(b)
-	for _, v := range []validatorKey{v1, v2} {
+	// Real BFT-safe quorum for a 3-member committee is unanimous 3 of 3
+	// (see consensus.BFTQuorumMet's own doc).
+	for _, v := range []validatorKey{v1, v2, v3} {
 		sig, err := crypto.DilithiumSign(v.sk, candidate[:])
 		if err != nil {
 			t.Fatalf("sign: %v", err)

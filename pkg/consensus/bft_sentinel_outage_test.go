@@ -9,24 +9,31 @@ import (
 )
 
 func TestBFTQuorumOneValidatorPerStage(t *testing.T) {
-	// spec 5.7: "With one validator per stage that is 3 of 5."
+	// spec 5.7's literal "3 of 5" is a simple majority, not a real
+	// Byzantine-safe supermajority — see BFTQuorumMet's own doc and
+	// TestBFTQuorumUnsafeAgainstClaimedFaultTolerance. The real, safe
+	// threshold for a 5-validator committee (matching
+	// BFTFaultTolerance(5) == 1) is 4 of 5.
 	assigned := 5
-	if consensus.BFTQuorumMet(assigned, 2) {
-		t.Fatalf("2 of 5 must not reach quorum")
+	if consensus.BFTQuorumMet(assigned, 3) {
+		t.Fatalf("3 of 5 must not reach quorum (unsafe against 1 equivocating validator)")
 	}
-	if !consensus.BFTQuorumMet(assigned, 3) {
-		t.Fatalf("3 of 5 must reach quorum")
+	if !consensus.BFTQuorumMet(assigned, 4) {
+		t.Fatalf("4 of 5 must reach quorum")
 	}
 }
 
 func TestBFTQuorumTwoValidatorsPerStage(t *testing.T) {
-	// spec 5.7: "With two per stage that is 6 of 10."
+	// spec 5.7's literal "6 of 10" is likewise unsafe (see
+	// BFTQuorumMet's own doc) — the real, safe threshold for a
+	// 10-validator committee (matching BFTFaultTolerance(10) == 3) is
+	// 7 of 10.
 	assigned := 10
-	if consensus.BFTQuorumMet(assigned, 5) {
-		t.Fatalf("5 of 10 must not reach quorum")
+	if consensus.BFTQuorumMet(assigned, 6) {
+		t.Fatalf("6 of 10 must not reach quorum (unsafe against 3 equivocating validators)")
 	}
-	if !consensus.BFTQuorumMet(assigned, 6) {
-		t.Fatalf("6 of 10 must reach quorum")
+	if !consensus.BFTQuorumMet(assigned, 7) {
+		t.Fatalf("7 of 10 must reach quorum")
 	}
 }
 
@@ -93,8 +100,69 @@ func TestTallyVotesReachesQuorum(t *testing.T) {
 		{Validator: nftID(3), StateRoot: root},
 	}
 	endorsements, quorum := consensus.TallyVotes(committee, root, votes)
-	if endorsements != 3 || !quorum {
-		t.Fatalf("expected 3/5 to reach quorum, got endorsements=%d quorum=%v", endorsements, quorum)
+	if endorsements != 3 || quorum {
+		t.Fatalf("expected 3/5 to NOT reach the real, safe quorum, got endorsements=%d quorum=%v", endorsements, quorum)
+	}
+
+	votes = append(votes, types.Vote{Validator: nftID(4), StateRoot: root})
+	endorsements, quorum = consensus.TallyVotes(committee, root, votes)
+	if endorsements != 4 || !quorum {
+		t.Fatalf("expected 4/5 to reach quorum, got endorsements=%d quorum=%v", endorsements, quorum)
+	}
+}
+
+// TestBFTQuorumUnsafeAgainstClaimedFaultTolerance is a real, independent
+// audit finding (Phase 2): BFTFaultTolerance(assigned) claims the protocol
+// "tolerates up to one third faulty nodes" (spec 5.1), but a simple-majority
+// quorum (votes*2 > assigned, spec 5.7's literal "3 of 5" / "6 of 10") is
+// not sufficient to guarantee that against Byzantine (not just crash-fault)
+// validators — a validator that equivocates (signs two different candidate
+// roots at the same height, exactly what "Byzantine" as opposed to
+// "crash-fault" means) can be double-counted across two disjoint tallies.
+//
+// With a committee of 5 and BFTFaultTolerance(5) == 1 equivocating member:
+// two honest validators vote for root A, two different honest validators
+// vote for root B, and the one Byzantine validator signs both. That is
+// exactly 1 Byzantine validator among 5 — the precise count this codebase's
+// own BFTFaultTolerance claims to tolerate — yet under a simple-majority
+// quorum both A and B independently reach "3 of 5", i.e. two conflicting
+// blocks can both satisfy chain.Append's quorum check at the same height:
+// a real safety (double-finalization) violation, not a liveness nitpick.
+//
+// A safe BFT quorum must instead require agreement to exceed (assigned+f)/2
+// votes, which for f == BFTFaultTolerance(assigned) works out to the
+// classic ">2/3" supermajority; this test asserts that real safety
+// invariant directly (at most one of two disjoint-honest-voter candidates
+// may reach quorum when the equivocator count is within BFTFaultTolerance),
+// which the pre-fix majority rule fails.
+func TestBFTQuorumUnsafeAgainstClaimedFaultTolerance(t *testing.T) {
+	committee := []types.NFTID{nftID(1), nftID(2), nftID(3), nftID(4), nftID(5)}
+	byzantine := nftID(5)
+	if f := consensus.BFTFaultTolerance(len(committee)); f != 1 {
+		t.Fatalf("test assumes BFTFaultTolerance(5) == 1, got %d", f)
+	}
+
+	rootA := types.Hash{0xAA}
+	rootB := types.Hash{0xBB}
+
+	votesForA := []types.Vote{
+		{Validator: nftID(1), StateRoot: rootA},
+		{Validator: nftID(2), StateRoot: rootA},
+		{Validator: byzantine, StateRoot: rootA},
+	}
+	votesForB := []types.Vote{
+		{Validator: nftID(3), StateRoot: rootB},
+		{Validator: nftID(4), StateRoot: rootB},
+		{Validator: byzantine, StateRoot: rootB},
+	}
+
+	_, quorumA := consensus.TallyVotes(committee, rootA, votesForA)
+	_, quorumB := consensus.TallyVotes(committee, rootB, votesForB)
+	if quorumA && quorumB {
+		t.Fatalf("safety violation: two conflicting candidates (A and B) both reached quorum "+
+			"using only %d equivocating validator(s), within BFTFaultTolerance(%d)=%d — "+
+			"two different blocks could both be finalized at the same height",
+			1, len(committee), consensus.BFTFaultTolerance(len(committee)))
 	}
 }
 

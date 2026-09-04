@@ -20,6 +20,74 @@ import (
 // backlog during a real outage, and a real dual-track recovery batch that
 // reaches BFT quorum actually clears OutageFlag.
 
+// TestHeartbeatRejectsIdentityHijack is a real, independent audit finding
+// (Phase 2, critical): handleMessage's MsgHeartbeat case used to call
+// recordOnline(hb.NFT, hb.PubKey, ...) with no check that hb.NFT was
+// actually derived from hb.PubKey, even though that derivation
+// (types.NFTID(types.SumHash(pk))) is exactly how every node computes its
+// own identity (see NewNode). Since pubKeyLookup — the function real
+// signature verification for both StageVote (handleStageVote) and
+// chain.Append relies on — just returns whatever key is currently recorded
+// for an NFTID, an attacker heartbeating a victim's real, already-online
+// NFTID paired with the attacker's own key would silently overwrite the
+// victim's key in the online-identity table: every later "verified" vote
+// signed by the attacker but labeled as the victim would check out,
+// letting one malicious peer forge votes as any validator it has seen a
+// heartbeat from. This test proves the fix: such a heartbeat is dropped
+// outright, and the victim's real key survives untouched.
+func TestHeartbeatRejectsIdentityHijack(t *testing.T) {
+	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
+	victim := genPeer(t)
+	now := time.Now()
+	n.recordOnline(victim.id, victim.pk, false, now)
+
+	attacker := genPeer(t)
+	env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
+		NFT: victim.id, PubKey: []byte(attacker.pk), Timestamp: now.UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("build envelope: %v", err)
+	}
+	n.handleMessage(peer.ID("attacker-peer"), env)
+
+	pk, ok := n.pubKeyLookup(victim.id)
+	if !ok {
+		t.Fatalf("expected the victim's identity to still be known")
+	}
+	if string(pk) != string(victim.pk) {
+		t.Fatalf("identity hijack succeeded: victim's recorded pubkey was overwritten by an unrelated attacker key")
+	}
+	if string(pk) == string(attacker.pk) {
+		t.Fatalf("identity hijack succeeded: victim's identity now resolves to the attacker's key")
+	}
+}
+
+// TestHeartbeatAcceptsSelfConsistentIdentity is the positive-path
+// counterpart to TestHeartbeatRejectsIdentityHijack: a heartbeat whose NFT
+// really is Hash(PubKey) — every legitimate node's own heartbeat — must
+// still be accepted, so the new check doesn't just reject everything.
+func TestHeartbeatAcceptsSelfConsistentIdentity(t *testing.T) {
+	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
+	peerA := genPeer(t)
+	now := time.Now()
+
+	env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
+		NFT: peerA.id, PubKey: []byte(peerA.pk), Timestamp: now.UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("build envelope: %v", err)
+	}
+	n.handleMessage(peer.ID("peer-a"), env)
+
+	pk, ok := n.pubKeyLookup(peerA.id)
+	if !ok {
+		t.Fatalf("expected a genuine, self-consistent heartbeat to be recorded")
+	}
+	if string(pk) != string(peerA.pk) {
+		t.Fatalf("expected the recorded pubkey to match the heartbeat's own key")
+	}
+}
+
 func TestOnlineCivilianCountExcludesSentinels(t *testing.T) {
 	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
 	now := time.Now()

@@ -30,6 +30,25 @@ func FromInt(n int64) Decimal {
 	return Decimal{r: big.NewRat(n, 1)}
 }
 
+// FromUint64 builds a Decimal from an unsigned whole number without ever
+// round-tripping through int64. Phase 2 independent audit finding: several
+// real, ZK-proof-bound on-chain quantities (e.g.
+// TransferPublicInputs.FeeAmount) are uint64, range-constrained only to
+// this codebase's own 64-bit domain (pkg/zk/circuit.go's valueBits), so
+// they can legitimately exceed math.MaxInt64. Converting such a value with
+// a bare int64(n) cast (the bug this constructor replaces at its one real
+// call site, pkg/tx/pipeline.go's stage5PlaceFinal) reinterprets the top
+// bit as a sign bit for any n >= 2^63, silently producing a large
+// *negative* Decimal — every downstream Vault pool it's added to
+// (EpochBonusPool, AuditPool, RemainderPool, BurnedTotal) would then be
+// decremented by a real, attacker-reachable amount instead of credited,
+// permanently corrupting the chain's shared accounting. Routing every
+// uint64 that can plausibly exceed 2^63 through this constructor instead
+// keeps the value's true, non-negative magnitude intact.
+func FromUint64(n uint64) Decimal {
+	return Decimal{r: new(big.Rat).SetInt(new(big.Int).SetUint64(n))}
+}
+
 // FromString parses a decimal or rational literal, e.g. "2.5", "0.001", "5/2".
 func FromString(s string) (Decimal, error) {
 	r, ok := new(big.Rat).SetString(s)

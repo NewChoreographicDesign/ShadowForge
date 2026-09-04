@@ -151,6 +151,25 @@ func TestRateLimiterIgnoresUnthrottledTypes(t *testing.T) {
 	}
 }
 
+// TestRateLimiterThrottlesBlockRequest is a real, independent audit
+// finding (Phase 2, low/medium): unlike every other message type this
+// limiter leaves unthrottled, BlockRequest triggers real per-request disk
+// I/O (handleBlockRequest reads up to MaxCatchUpBlocks real blocks from
+// the store), so a peer flooding it was a cheap I/O-amplification DoS.
+// This proves it's now bounded by the same token bucket as
+// Heartbeat/TxOffer.
+func TestRateLimiterThrottlesBlockRequest(t *testing.T) {
+	rl := shadownet.NewRateLimiter(shadownet.RateLimiterConfig{Capacity: 1, RefillRate: 0, Cooldown: time.Minute})
+	p := peer.ID("test-peer")
+	now := time.Now()
+	if !rl.Allow(p, shadownet.MsgBlockRequest, now) {
+		t.Fatalf("expected the first BlockRequest to be allowed (capacity 1)")
+	}
+	if rl.Allow(p, shadownet.MsgBlockRequest, now) {
+		t.Fatalf("expected a second immediate BlockRequest to be throttled (capacity exhausted, no refill)")
+	}
+}
+
 // TestOversizedMessageRejected proves the MaxEnvelopeSize guard actually
 // stops an oversized payload rather than buffering it into memory: a raw
 // stream (bypassing Send/Envelope framing) writes well past the cap, and

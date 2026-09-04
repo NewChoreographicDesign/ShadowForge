@@ -212,7 +212,35 @@ func TestFourNodesConvergeUnderJitterAndPacketLoss(t *testing.T) {
 	// A much longer deadline than the clean-network test: real jitter and
 	// packet loss mean some rounds will time out and retry
 	// (sweepTimeouts + roundLoop's next tick), not fail outright.
-	deadline := time.Now().Add(90 * time.Second)
+	//
+	// Phase 2 independent audit finding: this deadline was widened from
+	// 90s after fixing a real BFT safety bug (consensus.BFTQuorumMet used
+	// to accept a simple majority, which a single equivocating validator
+	// could exploit to finalize two conflicting blocks at the same height
+	// — see TestBFTQuorumUnsafeAgainstClaimedFaultTolerance). The fix
+	// requires a genuine >2/3 supermajority instead of a bare majority,
+	// mathematically necessary for the safety this codebase already
+	// claims (BFTFaultTolerance's "tolerates up to one third faulty
+	// nodes"), but it also means more of a committee's votes must survive
+	// the same 15%-per-message packet loss before a round finalizes, so
+	// real convergence under this test's adversarial conditions genuinely
+	// needs a few more retries on most runs — a real, expected
+	// safety/liveness trade-off, not a regression this test should paper
+	// over by staying lenient on quorum.
+	//
+	// The stricter quorum also surfaced (and this pass fixed) a real,
+	// structural — not merely probabilistic — stall: tryAdoptBlockLocked's
+	// committee recomputation used to exclude this node's own identity
+	// unconditionally, which is correct for genuine multi-block catch-up
+	// (see that function's own doc) but wrong for an ordinary single-block
+	// announce, where self was almost certainly a live committee member.
+	// In a small committee (e.g. this test's 2-real-validator core), that
+	// miscount could shrink the recomputed committee below
+	// consensus.MinCommitteeSize, permanently rejecting an
+	// already-quorate block with "0/0 votes" on every retry, no matter how
+	// many — the run-to-run flakiness observed while diagnosing this test
+	// traced back to exactly that, not to ordinary packet-loss bad luck.
+	deadline := time.Now().Add(120 * time.Second)
 	for {
 		allAtHeight1 := true
 		var headHash types.Hash

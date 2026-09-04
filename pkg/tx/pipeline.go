@@ -468,6 +468,41 @@ func (p *Pipeline) stage2TxOffer(t *types.ShieldedTx, submittedAt time.Time) err
 	if t.TxID != wantTxID {
 		return fmt.Errorf("TxID does not match Hash(proof || commitments || nullifier)")
 	}
+
+	// Phase 2 independent audit finding (medium): the top-level
+	// Nullifier/Commitments fields are documented (types.ShieldedTx's own
+	// doc) as "this transfer's primary spent-note nullifier" / "the output
+	// notes" — i.e. they're meant to always equal
+	// TransferPublicInputs.Nullifiers[0] / .OutCommits. Nothing previously
+	// enforced that: double-spend tracking (stage5PlaceFinal) correctly
+	// marks nullifiers spent from TransferPublicInputs directly, so this
+	// was never a fund-theft or double-spend hole, but it meant TxID (and
+	// therefore the Dilithium signature over it) didn't actually commit to
+	// the real nullifier/commitments the proof was verified against — the
+	// key-holder could wrap one real (Proof, TransferPublicInputs) pair in
+	// unlimited distinct, individually-valid (TxID, Sig) combinations by
+	// varying these top-level fields to arbitrary values, each treated as
+	// a genuinely new transaction by Mempool.Submit's TxID-keyed
+	// ErrDuplicateTx dedup — a real gossip-amplification/mempool-bloat
+	// vector. Rejecting any mismatch here closes it and restores the
+	// documented invariant.
+	if t.Kind == types.TxTransfer {
+		if t.TransferPublicInputs == nil || len(t.TransferPublicInputs.Nullifiers) == 0 {
+			return fmt.Errorf("transfer is missing its public inputs' nullifier")
+		}
+		if t.Nullifier != t.TransferPublicInputs.Nullifiers[0] {
+			return fmt.Errorf("top-level Nullifier does not match TransferPublicInputs.Nullifiers[0]")
+		}
+		if len(t.Commitments) != len(t.TransferPublicInputs.OutCommits) {
+			return fmt.Errorf("top-level Commitments does not match TransferPublicInputs.OutCommits")
+		}
+		for i, c := range t.Commitments {
+			if c != t.TransferPublicInputs.OutCommits[i] {
+				return fmt.Errorf("top-level Commitments does not match TransferPublicInputs.OutCommits")
+			}
+		}
+	}
+
 	if len(t.Sig) == 0 || len(t.SignerPubKey) == 0 {
 		return fmt.Errorf("missing signature or signer public key")
 	}
@@ -1199,8 +1234,16 @@ func (p *Pipeline) stage5PlaceFinal(t *types.ShieldedTx) error {
 		// so this is real, cryptographically-proven revenue, not a
 		// fabricated figure — route it into the Vault's 20/10/10/60 split
 		// (spec 9.2) now that every stage has committed.
+		//
+		// Phase 2 independent audit finding (high): FeeAmount is only
+		// range-constrained to the circuit's own 64-bit domain
+		// (pkg/zk/circuit.go's valueBits), so it can legitimately be
+		// >= 2^63 — an int64(FeeAmount) cast (this line's old form) would
+		// reinterpret that as a negative number and silently *decrement*
+		// every Vault pool instead of crediting it. decimal.FromUint64
+		// preserves the true, non-negative magnitude.
 		if p.deps.Vault != nil {
-			p.deps.Vault.CollectFee(decimal.FromInt(int64(t.TransferPublicInputs.FeeAmount)))
+			p.deps.Vault.CollectFee(decimal.FromUint64(t.TransferPublicInputs.FeeAmount))
 		}
 	}
 	if t.Kind == types.TxUnstake {

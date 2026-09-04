@@ -35,6 +35,27 @@ func (n *Node) handleMessage(p peer.ID, env shadownet.Envelope) {
 		if len(hb.PubKey) == 0 {
 			return
 		}
+		// Phase 2 independent audit finding (critical): a heartbeat's NFT
+		// must be the real, self-consistent hash of the PubKey it also
+		// carries — exactly how every node derives its own identity (see
+		// NewNode's identity: types.NFTID(types.SumHash(pk))). Without
+		// this check, recordOnline below would blindly overwrite
+		// n.online[hb.NFT].pubKey with whatever key the sender claims,
+		// letting any peer hijack an already-online validator's identity
+		// (send a heartbeat with NFT = <victim's real ID>, PubKey =
+		// <attacker's own key>) and have every later StageVote/block
+		// signature "verified" against pubKeyLookup(victim) actually check
+		// against the attacker's key instead — full forged-vote/quorum
+		// impersonation of that validator, not just an unregistered-Sybil
+		// nuisance. This is a self-consistency check only; it does not by
+		// itself confirm hb.NFT is a real, minted, on-chain NFT (see
+		// HeartbeatPayload's own doc on that separate, already-disclosed
+		// gap), but it closes the much sharper hole of hijacking an
+		// identity that *is* real.
+		if hb.NFT != types.NFTID(types.SumHash(hb.PubKey)) {
+			n.log("validator: dropping heartbeat from %s: claimed NFT %s is not Hash(PubKey)", p, hb.NFT)
+			return
+		}
 		n.recordOnline(hb.NFT, crypto.DilithiumPublicKey(hb.PubKey), hb.IsSentinel, time.Now())
 
 	case shadownet.MsgTxOffer:
@@ -231,6 +252,32 @@ func (n *Node) sweepTimeouts() {
 		// beyond a no-op.
 		for _, p := range n.net.Host.Network().Peers() {
 			n.requestCatchUp(p, r.height, r.height)
+		}
+	}
+
+	// Phase 2 independent audit finding: a node can fall behind a height
+	// it has already seen referenced by a real BlockAnnounce without ever
+	// having (or keeping) a tracked round for it — tryAdoptBlockLocked
+	// unconditionally deletes any existing round before it even knows
+	// whether adoption will succeed, so a rejected announce (e.g. a
+	// transient local committee-view mismatch under real jitter/packet
+	// loss — this was observed causing a permanent stall in
+	// TestFourNodesConvergeUnderJitterAndPacketLoss) previously left
+	// nothing behind for the retry loop above to ever fire from. This
+	// piggybacks on the same periodic sweep to keep asking for a height
+	// this node knows exists, independent of the per-round expiry loop,
+	// until its own view catches up enough for tryAdoptBlockLocked to
+	// actually succeed — using the exact same requestCatchUp/
+	// handleBlockResponse path above, which independently re-verifies
+	// everything regardless of how many times it's asked.
+	n.roundMu.Lock()
+	nextHeight := n.chn.NextHeight()
+	behind := n.highestAnnounced >= nextHeight
+	target := n.highestAnnounced
+	n.roundMu.Unlock()
+	if behind {
+		for _, p := range n.net.Host.Network().Peers() {
+			n.requestCatchUp(p, nextHeight, target)
 		}
 	}
 }
@@ -605,6 +652,25 @@ func (n *Node) handleStageVote(v shadownet.StageVotePayload) {
 		return
 	}
 
+	// Phase 2 independent audit finding (medium): StageVote is not one of
+	// pkg/net's rate-limited message types (only Heartbeat/TxOffer are, per
+	// spec 6), so nothing previously stopped a peer from replaying the same
+	// already-valid, already-broadcast vote envelope indefinitely for a
+	// round's whole lifetime — each replay still passes the real signature
+	// check above and was unconditionally appended to r.votes, growing it
+	// (and the cost of every subsequent tryFinalizeLocked re-tally) without
+	// bound. consensus.TallyVotes already dedupes by validator for the
+	// purpose of *counting* quorum, but that doesn't stop the underlying
+	// slice, and the CPU spent re-verifying and re-tallying every replay,
+	// from growing unbounded. Dropping an already-recorded validator's
+	// vote here, before it's ever appended, closes that memory/CPU
+	// amplification directly, independent of TallyVotes' own protection.
+	for _, existing := range r.votes {
+		if existing.Validator == v.Validator {
+			return
+		}
+	}
+
 	r.votes = append(r.votes, types.Vote{Validator: v.Validator, StateRoot: v.CandidateHash, Sig: v.Sig})
 
 	n.tryFinalizeLocked(r)
@@ -659,6 +725,19 @@ func (n *Node) tryFinalizeLocked(r *round) {
 	n.net.Broadcast(context.Background(), env)
 }
 
+// recordHighestAnnounced remembers the highest height this node has ever
+// seen referenced by a real BlockAnnounce, so sweepTimeouts can keep
+// retrying catch-up for it even when adopting it never establishes (or
+// itself destroys) a tracked round to time out — see highestAnnounced's
+// own doc on Node.
+func (n *Node) recordHighestAnnounced(height uint64) {
+	n.roundMu.Lock()
+	if height > n.highestAnnounced {
+		n.highestAnnounced = height
+	}
+	n.roundMu.Unlock()
+}
+
 // handleBlockAnnounce lets a node that did not itself reach quorum locally
 // (it wasn't on the committee, or its votes arrived too late) adopt a
 // finalized block by independently replaying it, or — if this node has
@@ -667,6 +746,7 @@ func (n *Node) tryFinalizeLocked(r *round) {
 // out of scope per this package's own doc.
 func (n *Node) handleBlockAnnounce(sender peer.ID, ann shadownet.BlockAnnouncePayload) {
 	height := ann.Block.Height
+	n.recordHighestAnnounced(height)
 	if height <= n.chn.HeadHeight() {
 		return // stale
 	}
@@ -695,7 +775,7 @@ func (n *Node) handleBlockAnnounce(sender peer.ID, ann shadownet.BlockAnnouncePa
 	if height <= n.chn.HeadHeight() {
 		return
 	}
-	if err := n.tryAdoptBlockLocked(ann.Block); err != nil {
+	if err := n.tryAdoptBlockLocked(ann.Block, false); err != nil {
 		n.log("validator: rejecting announced block at height %d: %v", height, err)
 		return
 	}
@@ -708,13 +788,38 @@ func (n *Node) handleBlockAnnounce(sender peer.ID, ann shadownet.BlockAnnouncePa
 // verification core both handleBlockAnnounce's single-block path and
 // handleBlockResponse's multi-block catch-up path share. Callers must
 // already hold roundMu, and b.Height must equal n.chn.NextHeight().
-func (n *Node) tryAdoptBlockLocked(b types.Block) error {
+//
+// excludeSelfFromCommittee is a Phase 2 independent audit finding: every
+// node counts itself in its own onlineSet from the moment it's
+// constructed (see NewNode), so recomputing "the committee" from this
+// node's own current online view always includes self — correct for
+// handleBlockAnnounce's single-block path (b.Height is this node's own
+// very next height, so self was almost certainly online and a real
+// candidate committee member for this exact round, even if its vote
+// simply arrived too late to reach local quorum itself), but wrong for
+// handleBlockResponse's multi-block catch-up path: there, b can be an
+// arbitrarily old height from before this node ever joined the network,
+// so self provably cast no vote in that historical round, and including
+// it anyway inflates the recomputed committee's denominator with an
+// identity that couldn't have contributed to b's real quorum — compounding
+// with every other node met since, this can push BFTQuorumMet's real
+// 2/3+ supermajority threshold on the already-quorate vote set b actually
+// carries out of reach, wrongly rejecting a legitimately finalized block
+// (see TestNodeCatchesUpAcrossMultipleBlocks). Callers pass true only for
+// that multi-block catch-up case; excluding self there only ever shrinks
+// the denominator toward the committee's true historical size, never
+// below the votes b actually carries, so it cannot turn an illegitimate
+// quorum into a legitimate one.
+func (n *Node) tryAdoptBlockLocked(b types.Block, excludeSelfFromCommittee bool) error {
 	height := b.Height
 	if height != n.chn.NextHeight() {
 		return fmt.Errorf("block at height %d is not the expected next height %d", height, n.chn.NextHeight())
 	}
 
 	online := n.onlineSet(time.Now())
+	if excludeSelfFromCommittee {
+		online = excludeSelf(online, n.identity)
+	}
 	committee := consensus.AssignCommittee(online, height, committeeSize(len(online)))
 
 	if r, hadRound := n.rounds[height]; hadRound {
@@ -853,6 +958,19 @@ func (n *Node) handleBlockResponse(resp shadownet.BlockResponsePayload) {
 	blocks := append([]types.Block(nil), resp.Blocks...)
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].Height < blocks[j].Height })
 
+	// Phase 2 independent audit finding: more than one block in a single
+	// response means this node was genuinely more than one block behind
+	// when it asked — real multi-block catch-up, where at least the
+	// earlier heights in this batch plausibly predate this node ever
+	// being online (see tryAdoptBlockLocked's own doc on
+	// excludeSelfFromCommittee). A single-block response, by contrast, is
+	// indistinguishable from an ordinary "missed the one announce, retry
+	// requested it" case — the same live, very-next-height situation
+	// handleBlockAnnounce's direct path already treats as "self was
+	// plausibly a real committee member", so self is not excluded there
+	// either.
+	excludeSelfFromCommittee := len(blocks) > 1
+
 	n.roundMu.Lock()
 	defer n.roundMu.Unlock()
 
@@ -863,7 +981,7 @@ func (n *Node) handleBlockResponse(resp shadownet.BlockResponsePayload) {
 		if b.Height != n.chn.NextHeight() {
 			break // a gap, or out of order; stop rather than skip ahead
 		}
-		if err := n.tryAdoptBlockLocked(b); err != nil {
+		if err := n.tryAdoptBlockLocked(b, excludeSelfFromCommittee); err != nil {
 			n.log("validator: catch-up replay failed at height %d: %v", b.Height, err)
 			break
 		}
@@ -1042,6 +1160,20 @@ func daRootOf(batch []types.ShieldedTx) types.Hash {
 		parts = append(parts, t.Proof, t.Memo)
 	}
 	return types.SumHash(parts...)
+}
+
+// excludeSelf returns ids with self removed, preserving order, without
+// mutating the input slice — used by tryAdoptBlockLocked (see its own
+// doc) to keep a node's own just-joined identity from inflating the
+// committee denominator it recomputes for a round it never voted in.
+func excludeSelf(ids []types.NFTID, self types.NFTID) []types.NFTID {
+	out := make([]types.NFTID, 0, len(ids))
+	for _, id := range ids {
+		if id != self {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func containsID(ids []types.NFTID, id types.NFTID) bool {

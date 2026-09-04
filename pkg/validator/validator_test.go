@@ -261,6 +261,75 @@ func registerOnline(n *Node, height uint64, extra ...peerKey) []types.NFTID {
 // arrive, quorum is independently reverified by chain.Append (real
 // signature checks against a real committee), and the chain head
 // genuinely advances with a persisted block.
+// TestHandleStageVoteDropsDuplicateFromSameValidator is a real,
+// independent audit finding (Phase 2, medium): StageVote isn't one of
+// pkg/net's rate-limited message types, so nothing previously stopped a
+// peer from replaying its own already-valid vote envelope indefinitely,
+// each replay unconditionally appended to r.votes despite
+// consensus.TallyVotes already dedupe-counting by validator — real,
+// unbounded memory/CPU growth per round even though the count itself
+// never moved. This proves handleStageVote now drops a validator's
+// second vote for the same round outright, before it's ever appended.
+func TestHandleStageVoteDropsDuplicateFromSameValidator(t *testing.T) {
+	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
+	p1, p2, p3 := genPeer(t), genPeer(t), genPeer(t)
+	height := n.chn.NextHeight()
+	committee := registerOnline(n, height, p1, p2, p3)
+	if len(committee) != 4 {
+		t.Fatalf("expected all 4 online validators in the committee, got %d", len(committee))
+	}
+
+	voteTx := mustSignVote(t, n, "proposal-dedup", 1)
+	prop := shadownet.BlockProposalPayload{
+		Height:    height,
+		Epoch:     0,
+		Proposer:  committee[0],
+		Batch:     []types.ShieldedTx{voteTx},
+		Timestamp: time.Now().UnixMilli(),
+	}
+	n.handleBlockProposal(prop)
+
+	n.roundMu.Lock()
+	r, ok := n.rounds[height]
+	n.roundMu.Unlock()
+	if !ok {
+		t.Fatalf("expected a tracked round at height %d after a valid proposal", height)
+	}
+
+	byPeer := map[types.NFTID]peerKey{p1.id: p1, p2.id: p2, p3.id: p3}
+	var voter types.NFTID
+	for _, id := range committee {
+		if id != n.identity {
+			voter = id
+			break
+		}
+	}
+	peer := byPeer[voter]
+	sig, err := crypto.DilithiumSign(peer.sk, r.candidate[:])
+	if err != nil {
+		t.Fatalf("sign vote: %v", err)
+	}
+	vote := shadownet.StageVotePayload{Height: height, Validator: voter, CandidateHash: r.candidate, Sig: types.DilithiumSig(sig)}
+
+	// Send the identical, real, valid vote three times: 4-of-4 quorum
+	// needs 3 real distinct votes (self + 2 more), so with only self and
+	// one other validator's vote (however many times it's replayed), this
+	// round must never reach quorum or get deleted.
+	n.handleStageVote(vote)
+	n.handleStageVote(vote)
+	n.handleStageVote(vote)
+
+	n.roundMu.Lock()
+	defer n.roundMu.Unlock()
+	r, ok = n.rounds[height]
+	if !ok {
+		t.Fatalf("round must still be tracked (only 2 distinct votes, quorum not reached)")
+	}
+	if len(r.votes) != 2 {
+		t.Fatalf("expected exactly 2 votes (self + one real validator) despite 3 replays of the same vote, got %d", len(r.votes))
+	}
+}
+
 func TestFullRoundReachesQuorumAndCommits(t *testing.T) {
 	n := newTestNode(t, time.Minute, time.Now().UnixMilli())
 	p1, p2, p3 := genPeer(t), genPeer(t), genPeer(t)

@@ -132,13 +132,15 @@ func TestTxStatusCommittedAfterRealAppend(t *testing.T) {
 	}
 	v1id, v1pk, v1sk := genKey()
 	v2id, v2pk, v2sk := genKey()
-	v3id, _, _ := genKey()
+	v3id, v3pk, v3sk := genKey()
 	lookup := func(id types.NFTID) (crypto.DilithiumPublicKey, bool) {
 		switch id {
 		case v1id:
 			return v1pk, true
 		case v2id:
 			return v2pk, true
+		case v3id:
+			return v3pk, true
 		}
 		return nil, false
 	}
@@ -156,9 +158,16 @@ func TestTxStatusCommittedAfterRealAppend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sign v2: %v", err)
 	}
+	sig3, err := crypto.DilithiumSign(v3sk, candidate[:])
+	if err != nil {
+		t.Fatalf("sign v3: %v", err)
+	}
+	// Real BFT-safe quorum for a 3-member committee is unanimous 3 of 3
+	// (see consensus.BFTQuorumMet's own doc).
 	b.Votes = []types.Vote{
 		{Validator: v1id, StateRoot: candidate, Sig: types.DilithiumSig(sig1)},
 		{Validator: v2id, StateRoot: candidate, Sig: types.DilithiumSig(sig2)},
+		{Validator: v3id, StateRoot: candidate, Sig: types.DilithiumSig(sig3)},
 	}
 	if err := env.chn.Append(b, committee, lookup); err != nil {
 		t.Fatalf("append: %v", err)

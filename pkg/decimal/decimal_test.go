@@ -1,6 +1,7 @@
 package decimal_test
 
 import (
+	"math"
 	"testing"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
@@ -13,6 +14,31 @@ func TestBasicMath(t *testing.T) {
 	want := decimal.MustFromString("250")
 	if got.Cmp(want) != 0 {
 		t.Fatalf("2.5*100 = %s, want %s", got, want)
+	}
+}
+
+// TestFromUint64PreservesMagnitudeAboveMaxInt64 is a real, independent
+// audit finding (Phase 2, high): several real, ZK-proof-bound uint64
+// quantities in this codebase (e.g. TransferPublicInputs.FeeAmount) are
+// range-constrained only to the full 64-bit domain, so they can
+// legitimately exceed math.MaxInt64. A bare int64(n) cast on such a value
+// silently reinterprets its top bit as a sign bit, producing a large
+// *negative* Decimal — exactly the bug this constructor exists to avoid
+// at its real call site (pkg/tx/pipeline.go's fee collection).
+func TestFromUint64PreservesMagnitudeAboveMaxInt64(t *testing.T) {
+	var n uint64 = math.MaxInt64 + 1 // the smallest value an int64 cast corrupts
+	got := decimal.FromUint64(n)
+	if got.Sign() <= 0 {
+		t.Fatalf("FromUint64(%d) must be strictly positive, got %s (sign=%d)", n, got, got.Sign())
+	}
+	want := decimal.MustFromString("9223372036854775808") // 2^63
+	if got.Cmp(want) != 0 {
+		t.Fatalf("FromUint64(%d) = %s, want %s", n, got, want)
+	}
+
+	buggy := decimal.FromInt(int64(n))
+	if buggy.Sign() >= 0 {
+		t.Fatalf("sanity check failed: expected the old int64(n) cast to actually produce a negative value for this n, got %s", buggy)
 	}
 }
 

@@ -413,6 +413,23 @@ for what's still required before a real deployment (a production ZK
 trusted-setup ceremony and the spec 18.6 hardening phase in full — this
 is a tested reference implementation, not an audited production system).
 
+### Phase 2: independent audit results
+
+Two independent, adversarial review passes — a cryptography/ZK-circuit
+review and a general Go/systems review of consensus and P2P — found and
+fixed a critical BFT quorum-safety bug (a simple majority was accepted
+where a real supermajority is required, letting one equivocating
+validator finalize two conflicting blocks at the same height), a critical
+unauthenticated-heartbeat identity-hijack bug, a high-severity integer
+overflow that could corrupt Vault accounting, a high-severity catch-up
+committee-recomputation bug the quorum fix itself surfaced, and three
+further medium/low-severity findings — all seven fixed and
+regression-tested. Full findings, fixes, and test references:
+[`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md). This is the internal
+half of Phase 2's own roadmap item — a paid external firm engagement on
+the same two angles is still the recommended next step before mainnet,
+not a step this internal pass replaces.
+
 ### Fuzzing
 
 Two real Go native fuzz targets exercise the two boundaries spec 23's own

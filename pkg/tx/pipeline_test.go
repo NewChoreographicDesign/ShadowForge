@@ -329,6 +329,127 @@ func TestPipelineCommittedTransferCollectsFeeIntoVault(t *testing.T) {
 	}
 }
 
+// TestPipelineCommittedTransferWithFeeAboveMaxInt64CreditsVaultPositively
+// is a real, independent audit finding (Phase 2, high), proven end to end
+// with a genuine Groth16 proof rather than just the decimal package's own
+// unit test: TransferPublicInputs.FeeAmount is range-constrained only to
+// the circuit's own 64-bit domain (pkg/zk/circuit.go's valueBits), so a
+// real, provable transfer can carry a fee >= 2^63. stage5PlaceFinal used
+// to route that fee through decimal.FromInt(int64(FeeAmount)) — a cast
+// that reinterprets the top bit as a sign bit for any value in that range,
+// silently *decrementing* every Vault pool instead of crediting it. This
+// proves the fix (decimal.FromUint64): every pool ends up positive and
+// exactly matches the real fee's true magnitude times its split.
+func TestPipelineCommittedTransferWithFeeAboveMaxInt64CreditsVaultPositively(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+
+	sys := getZKSystem(t)
+	ztree := zk.NewTree()
+	mk := func(v uint64) zk.NoteSecret {
+		sk, err := zk.NewSpendKey()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rho, err := zk.NewRho()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return zk.NoteSecret{Value: v, OwnerSK: sk, Rho: rho}
+	}
+
+	const bigFee uint64 = 1<<63 + 12345 // > math.MaxInt64; the old int64() cast would go negative
+	in0, in1 := mk(bigFee+100), mk(0)
+	idx0, err := ztree.Insert(in0.Commitment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx1, err := ztree.Insert(in1.Commitment())
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof0, err := ztree.Prove(idx0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof1, err := ztree.Prove(idx1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out0, out1 := mk(50), mk(50) // in0+in1 (bigFee+100) == out0+out1 (100) + bigFee
+
+	input := zk.TransferInput{
+		MerkleRoot: proof0.Root,
+		Fee:        bigFee,
+		InSecrets:  []zk.NoteSecret{in0, in1},
+		InProofs:   []zk.Proof{proof0, proof1},
+		OutSecrets: []zk.NoteSecret{out0, out1},
+	}
+	zproof, err := sys.Prove(input)
+	if err != nil {
+		t.Fatalf("prove: %v", err)
+	}
+	proofBytes, err := zk.ProofToBytes(zproof)
+	if err != nil {
+		t.Fatalf("serialize proof: %v", err)
+	}
+
+	pub := input.Public()
+	txPub := &types.TransferPublicInputs{
+		MerkleRoot: types.Hash(zk.ToBytes32(pub.MerkleRoot)),
+		FeeAmount:  pub.Fee,
+	}
+	for _, n := range pub.Nullifiers {
+		txPub.Nullifiers = append(txPub.Nullifiers, types.Hash(zk.ToBytes32(n)))
+	}
+	for _, c := range pub.OutCommits {
+		txPub.OutCommits = append(txPub.OutCommits, types.Hash(zk.ToBytes32(c)))
+	}
+	if txPub.FeeAmount != bigFee {
+		t.Fatalf("test fixture's own proven fee = %d, want %d", txPub.FeeAmount, bigFee)
+	}
+
+	shieldedTx := mustSign(t, types.ShieldedTx{
+		Nullifier:            txPub.Nullifiers[0],
+		Commitments:          txPub.OutCommits,
+		Proof:                proofBytes,
+		FeeCommit:            types.SumHash([]byte("fee")),
+		Kind:                 types.TxTransfer,
+		TransferPublicInputs: txPub,
+	})
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
+	if results[0].Error != nil {
+		t.Fatalf("expected success, got error: %v", results[0].Error)
+	}
+
+	wantFee := decimal.FromUint64(bigFee)
+	splits := vault.DefaultSplits()
+	v := deps.Vault
+	for name, got := range map[string]decimal.Decimal{
+		"EpochBonusPool": v.EpochBonusPool,
+		"AuditPool":      v.AuditPool,
+		"RemainderPool":  v.RemainderPool,
+		"BurnedTotal":    v.BurnedTotal,
+	} {
+		if got.Sign() <= 0 {
+			t.Fatalf("%s must be credited positively for a real fee, got %s", name, got)
+		}
+	}
+	if got, want := v.EpochBonusPool, wantFee.Mul(splits.EpochBonus); got.Cmp(want) != 0 {
+		t.Fatalf("EpochBonusPool: got %s want %s", got, want)
+	}
+	if got, want := v.AuditPool, wantFee.Mul(splits.Audit); got.Cmp(want) != 0 {
+		t.Fatalf("AuditPool: got %s want %s", got, want)
+	}
+	if got, want := v.RemainderPool, wantFee.Mul(splits.Remainder); got.Cmp(want) != 0 {
+		t.Fatalf("RemainderPool: got %s want %s", got, want)
+	}
+	if got, want := v.BurnedTotal, wantFee.Mul(splits.Burn); got.Cmp(want) != 0 {
+		t.Fatalf("BurnedTotal: got %s want %s", got, want)
+	}
+}
+
 // TestPipelineRejectedTransferDoesNotCollectFee proves a Transfer that
 // fails a later stage never has its fee collected — the Vault must stay
 // untouched, matching the pipeline's atomicity rule (spec 5.3: rejection
@@ -441,6 +562,50 @@ func TestPipelineTamperedTxIDRejected(t *testing.T) {
 	results := p.ProcessBatch([]tx.Entry{{Tx: shieldedTx, SubmittedAt: time.Now()}})
 	if results[0].Error == nil {
 		t.Fatalf("expected a tampered TxID to be rejected")
+	}
+}
+
+// TestPipelineTransferRejectsNullifierMismatchedToPublicInputs is a real,
+// independent audit finding (Phase 2, medium): types.ShieldedTx's own doc
+// says the top-level Nullifier/Commitments fields must always equal
+// TransferPublicInputs.Nullifiers[0]/.OutCommits, but nothing previously
+// enforced that. Because ComputeTxID hashes the top-level Nullifier (not
+// TransferPublicInputs), a key-holder could wrap one real, already-proven
+// (Proof, TransferPublicInputs) pair in an unlimited number of distinct,
+// individually-valid (TxID, Sig) combinations just by re-signing over a
+// different top-level Nullifier — defeating Mempool.Submit's TxID-keyed
+// ErrDuplicateTx dedup for what is really the same transfer. This proves
+// stage2TxOffer now rejects such a mismatch outright.
+func TestPipelineTransferRejectsNullifierMismatchedToPublicInputs(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+
+	tampered := shieldedTx
+	tampered.Nullifier = types.Hash{0xEE} // real proof/public inputs, forged wrapper nullifier
+	tampered = mustSign(t, tampered)
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: tampered, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected a top-level Nullifier that disagrees with TransferPublicInputs.Nullifiers[0] to be rejected")
+	}
+}
+
+// TestPipelineTransferRejectsCommitmentsMismatchedToPublicInputs is the
+// Commitments-side counterpart to the Nullifier test above.
+func TestPipelineTransferRejectsCommitmentsMismatchedToPublicInputs(t *testing.T) {
+	deps := newDeps(t)
+	p := tx.NewPipeline(deps)
+	shieldedTx := buildValidTransfer(t)
+
+	tampered := shieldedTx
+	tampered.Commitments = append([]types.Hash{}, shieldedTx.Commitments...)
+	tampered.Commitments[0] = types.Hash{0xEE} // real proof/public inputs, forged wrapper commitment
+	tampered = mustSign(t, tampered)
+
+	results := p.ProcessBatch([]tx.Entry{{Tx: tampered, SubmittedAt: time.Now()}})
+	if results[0].Error == nil {
+		t.Fatalf("expected top-level Commitments that disagree with TransferPublicInputs.OutCommits to be rejected")
 	}
 }
 

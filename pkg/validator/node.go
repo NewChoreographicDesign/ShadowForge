@@ -294,6 +294,25 @@ type Node struct {
 	// roundMu.
 	roundMu sync.Mutex
 	rounds  map[uint64]*round
+	// highestAnnounced is the highest block height this node has ever
+	// seen referenced by a real BlockAnnounce, whether or not adopting it
+	// actually succeeded — guarded by roundMu like rounds. Phase 2
+	// independent audit finding: a failed tryAdoptBlockLocked call (e.g.
+	// this node's own locally-recomputed committee view transiently
+	// disagreeing with the block's real, already-quorate vote set under
+	// real network jitter/packet loss) used to leave nothing behind to
+	// retry from — worse, if this node had a tracked round for that
+	// height, tryAdoptBlockLocked unconditionally deletes it before ever
+	// finding out whether adoption would succeed, so sweepTimeouts' own
+	// round-timeout retry (requestCatchUp) never gets a chance to fire
+	// either. sweepTimeouts now also compares n.chn.NextHeight() against
+	// this field on every tick and retries catch-up whenever this node
+	// knows it's behind, independent of whether it has a round to time
+	// out — closing a real, observed permanent-stall gap
+	// (TestFourNodesConvergeUnderJitterAndPacketLoss) where one node's
+	// transient committee-view mismatch, with no further retry trigger,
+	// left it stuck at a stale height for the rest of the run.
+	highestAnnounced uint64
 
 	// megabatchMu guards megabatchRecv/megabatchDone — real MsgMegabatchPart
 	// wire reassembly state (see that payload's own doc). Separate from
