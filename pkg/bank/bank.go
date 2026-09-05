@@ -6,6 +6,7 @@ package bank
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
@@ -35,7 +36,30 @@ var (
 	ErrDailyCapExceeded   = errors.New("bank: daily Bank cap exceeded for this wallet")
 	ErrHoldStillLocked    = errors.New("bank: hold is still within its 24-hour lock")
 	ErrHoldNotOpen        = errors.New("bank: hold is not open for withdrawal")
+	// ErrSFGIssuedOverflow is returned by Deposit when the computed SFG
+	// amount doesn't fit in a uint64. Real, independent pentest finding:
+	// sfgIssuedDec.Uint64() (Decimal.Uint64 -> big.Int.Uint64) is
+	// documented by math/big itself as undefined — in practice a silent
+	// low-64-bits truncation, not a panic or saturation — for any value
+	// that doesn't fit. net/SFGUSDPrice both come from real deposit
+	// inputs and an oracle price that this package does not itself bound
+	// to "reasonable" magnitudes, so a legitimately tiny SFGUSDPrice
+	// (or a compromised/manipulated one, if the oracle layer is ever
+	// weaker than assumed) makes sfgIssuedDec arbitrarily large — silently
+	// wrapping into an attacker-uncontrolled but *wrong* SFGIssued value
+	// instead of failing loudly. Rejecting outright before that truncation
+	// ever happens is the only safe behavior; a real deposit should never
+	// legitimately issue an amount too large for a uint64 (spec 19's own
+	// worked examples are nowhere close), so this is a pure defense-in-depth
+	// backstop, not a real usability regression.
+	ErrSFGIssuedOverflow = errors.New("bank: computed SFG amount overflows uint64")
 )
+
+// maxUint64Decimal is the largest value Decimal.Uint64() (and therefore
+// BankHold.SFGIssued) can hold exactly — see ErrSFGIssuedOverflow's own
+// doc for why Deposit must reject anything above it rather than silently
+// truncating.
+var maxUint64Decimal = decimal.FromUint64(math.MaxUint64)
 
 // DepositParams are the inputs to Deposit (spec 11.1).
 type DepositParams struct {
@@ -128,6 +152,9 @@ func Deposit(p DepositParams) (types.BankHold, error) {
 	if sfgIssuedDec.Sign() < 0 {
 		sfgIssuedDec = decimal.Zero
 	}
+	if sfgIssuedDec.Cmp(maxUint64Decimal) > 0 {
+		return types.BankHold{}, ErrSFGIssuedOverflow
+	}
 
 	holdID := types.SumHash(p.Owner[:], []byte(p.Asset), []byte(fmt.Sprintf("%d", p.Now)))
 	return types.BankHold{
@@ -215,7 +242,16 @@ func Withdraw(p WithdrawParams) (WithdrawResult, error) {
 	capAmount := hold.EntryBuffer.Mul(refundCap)
 	refund = decimal.Min(refund, capAmount)
 
-	baseSFG := decimal.FromInt(int64(hold.SFGIssued))
+	// Real, independent pentest finding: hold.SFGIssued is a uint64 that
+	// can legitimately reach or exceed 2^63 (Deposit's own overflow guard
+	// only rejects amounts that don't fit a uint64 at all, not ones in the
+	// upper half of its range) — the previous decimal.FromInt(int64(...))
+	// cast here reinterpreted any such value as negative, which would have
+	// turned repay into a negative amount: the Bank paying the withdrawing
+	// user instead of collecting repayment. decimal.FromUint64 preserves
+	// the true, non-negative magnitude (same fix and same bug class as
+	// pkg/tx/pipeline.go's stage5PlaceFinal fee-collection fix).
+	baseSFG := decimal.FromUint64(hold.SFGIssued)
 
 	asymmetry := decimal.MustFromString("1")
 	if p.PriceNowUSD.Sign() > 0 && hold.EntryPriceUSD.Sign() > 0 && p.PriceNowUSD.Cmp(hold.EntryPriceUSD) < 0 {

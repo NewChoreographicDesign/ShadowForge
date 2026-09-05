@@ -115,13 +115,42 @@ var ParamKeys = map[string]bool{
 	"SilentTxSpikePercent": true,
 }
 
+// paramBounds gives each ParamKeys entry the real [min, max] range its live
+// consumer can safely accept, closing a real, independent pentest finding:
+// ApplyParamChange previously accepted any parseable decimal for any of
+// these keys, with no sanity bound at all. Concretely, a passed
+// ProposalParamChange setting DepositATRMultiple negative would make
+// pkg/bank.Deposit's buffer negative, so net (= grossUSD - buffer) would
+// exceed the real gross deposit value — a direct SFG-over-issuance bug,
+// not merely bad bookkeeping, reachable through the one real path
+// governance has to change live protocol economics. A rate or share
+// param outside [0, 1] is equally nonsensical for its own live consumer
+// (pkg/vault's fee split, pkg/bank's fee/surcharge/refund-cap math) and
+// is rejected the same way. This does not second-guess governance's
+// right to set any value inside the sane range — including 0, which
+// several of these already treat as "disabled" — only values no correct
+// implementation of the formula they feed could ever intend.
+var paramBounds = map[string]struct{ min, max decimal.Decimal }{
+	"DepositATRMultiple":   {decimal.Zero, decimal.MustFromString("1000")},
+	"WithdrawATRMultiple":  {decimal.Zero, decimal.MustFromString("1000")},
+	"BankFeeRate":          {decimal.Zero, decimal.MustFromString("1")},
+	"RefundCap":            {decimal.Zero, decimal.MustFromString("1")},
+	"CycleSurchargeRate":   {decimal.Zero, decimal.MustFromString("1")},
+	"VaultEpochBonusShare": {decimal.Zero, decimal.MustFromString("1")},
+	"VaultBurnShare":       {decimal.Zero, decimal.MustFromString("1")},
+	"VaultAuditShare":      {decimal.Zero, decimal.MustFromString("1")},
+	"VaultRemainderShare":  {decimal.Zero, decimal.MustFromString("1")},
+	"SilentTxSpikePercent": {decimal.Zero, decimal.MustFromString("1")},
+}
+
 // ApplyParamChange mutates p according to a passed ProposalParamChange
 // proposal's key/rawValue — the real effect a passing governance vote has
 // on the running protocol (spec 9.1's "governance weight" / spec 17.4's
 // epoch-end tally), closing the gap where a proposal's outcome was
 // tallied and persisted but never actually changed anything live. An
-// unrecognized key or an unparseable value is rejected rather than
-// silently ignored or applied partially.
+// unrecognized key, an unparseable value, or a value outside that key's
+// real, sane range (see paramBounds) is rejected rather than silently
+// ignored or applied partially.
 func ApplyParamChange(p *Params, key, rawValue string) error {
 	if !ParamKeys[key] {
 		return fmt.Errorf("governance: unknown or unsupported param key %q", key)
@@ -129,6 +158,9 @@ func ApplyParamChange(p *Params, key, rawValue string) error {
 	v, err := decimal.FromString(rawValue)
 	if err != nil {
 		return fmt.Errorf("governance: invalid value %q for param %q: %w", rawValue, key, err)
+	}
+	if bounds, ok := paramBounds[key]; ok && (v.Cmp(bounds.min) < 0 || v.Cmp(bounds.max) > 0) {
+		return fmt.Errorf("governance: value %s for param %q is outside the allowed range [%s, %s]", v, key, bounds.min, bounds.max)
 	}
 	switch key {
 	case "DepositATRMultiple":

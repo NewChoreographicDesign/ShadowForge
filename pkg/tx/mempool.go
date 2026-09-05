@@ -39,6 +39,10 @@ const MaxTxSize = 256 * 1024
 // ErrMempoolFull is returned by Submit once MaxSize entries are pending.
 var ErrMempoolFull = errors.New("tx: mempool is full")
 
+// ErrTxTooLarge is returned by Submit for a transaction whose serialized
+// size exceeds MaxTxSize.
+var ErrTxTooLarge = errors.New("tx: transaction exceeds MaxTxSize")
+
 // ErrDuplicateTx is returned by Submit for a TxID this mempool has already
 // admitted (whether still pending, already drained into a round, or seen
 // recently enough not to have expired from the dedup window). Callers that
@@ -79,10 +83,31 @@ func (m *Mempool) maxSize() int {
 
 // Submit admits tx to the mempool, timestamped now. It returns
 // ErrMempoolFull without admitting tx once MaxSize entries are already
-// pending, and ErrDuplicateTx without re-admitting a TxID already seen
-// within seenTTL (whether still pending, already drained, or resubmitted
-// via gossip echo).
+// pending, ErrDuplicateTx without re-admitting a TxID already seen within
+// seenTTL (whether still pending, already drained, or resubmitted via
+// gossip echo), and ErrTxTooLarge without admitting a transaction whose
+// serialized size exceeds MaxTxSize.
+//
+// Real, independent pentest finding: MaxTxSize's own doc says it "caps
+// one transaction's serialized size" and is "checked at pipeline Stage 2"
+// — true, but Stage 2 only runs once a transaction is later drained into
+// a batch a node happens to be proposing or verifying. Before this fix,
+// nothing enforced MaxTxSize here at admission, so a transaction could
+// sit in the mempool, fully counted against MaxSize, at up to
+// pkg/net.MaxEnvelopeSize (4 MiB — 16x MaxTxSize) for as long as it took
+// to be drained and finally rejected. A remote, entirely unauthenticated
+// peer (no signature or proof is checked before Submit — that's Stage
+// 2's own job) sending TxOffer messages with an oversized field (e.g. a
+// large Memo) could exhaust real memory well beyond what MaxTxSize was
+// ever meant to bound (worst case MaxSize * MaxEnvelopeSize, not MaxSize
+// * MaxTxSize) — a real, remote, pre-authentication memory-exhaustion DoS.
+// Enforcing the same bound here, at the only real admission point every
+// external transaction passes through, closes it directly.
 func (m *Mempool) Submit(t types.ShieldedTx, now time.Time) error {
+	if size, err := jsonSize(t); err == nil && size > MaxTxSize {
+		return ErrTxTooLarge
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if seenAt, dup := m.seen[t.TxID]; dup && now.Sub(seenAt) < seenTTL {

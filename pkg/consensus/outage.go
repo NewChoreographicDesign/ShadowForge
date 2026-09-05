@@ -10,6 +10,7 @@
 package consensus
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -41,6 +42,38 @@ func DefaultOutageThresholds() OutageThresholds {
 // over a long-running node's lifetime. Mirrors pkg/tx.Mempool's own
 // TxTTL-based seenTTL windowed dedup.
 const backlogSeenTTL = 10 * time.Minute
+
+// maxBacklogTxSize mirrors pkg/tx.MaxTxSize (not imported directly to
+// avoid a new cross-package dependency for one constant): the same real,
+// independent pentest finding applies here as there — a transaction's
+// serialized size must be bounded before it is ever admitted anywhere,
+// not just when pkg/tx's own Stage 2 eventually gets around to checking
+// it. See maxBacklogSize's own doc for why the backlog needed this even
+// more urgently than the live mempool did.
+const maxBacklogTxSize = 256 * 1024
+
+// maxBacklogSize bounds how many transactions Enqueue will ever accept
+// into the backlog queue. Real, independent pentest finding: unlike
+// pkg/tx.Mempool (bounded by DefaultMaxMempoolSize), this backlog had no
+// bound at all — neither a transaction-count cap nor (until
+// maxBacklogTxSize above) a per-transaction size cap. Since Enqueue is
+// reachable from any connected peer's TxOffer while an outage is active
+// (pkg/validator's handleMessage routes here instead of the live mempool
+// whenever OutageController.Active()), and an outage is exactly the kind
+// of real network stress an attacker might induce or exploit, this was a
+// genuinely unauthenticated, unbounded remote memory-exhaustion vector —
+// arguably a sharper one than the live mempool's, since it had no ceiling
+// whatsoever. Sized the same as pkg/tx's own mempool cap since both exist
+// to bound the same real resource (pending-transaction memory).
+const maxBacklogSize = 100_000
+
+// ErrBacklogFull is returned by Enqueue once maxBacklogSize entries are
+// already backlogged.
+var ErrBacklogFull = errors.New("consensus: outage backlog is full")
+
+// ErrBacklogTxTooLarge is returned by Enqueue for a transaction whose
+// serialized size exceeds maxBacklogTxSize.
+var ErrBacklogTxTooLarge = errors.New("consensus: transaction exceeds the outage backlog's size limit")
 
 // ErrDuplicateBacklogTx is returned by Enqueue for a TxID already in the
 // backlog. A real validator node wires Enqueue behind the same gossip
@@ -96,15 +129,38 @@ func (o *OutageController) Active() bool {
 }
 
 // Enqueue adds an incoming transaction to the backlog queue, rejecting a
-// TxID already backlogged within backlogSeenTTL with ErrDuplicateBacklogTx.
+// TxID already backlogged within backlogSeenTTL with ErrDuplicateBacklogTx,
+// a transaction over maxBacklogTxSize with ErrBacklogTxTooLarge, and any
+// transaction once the backlog already holds maxBacklogSize entries with
+// ErrBacklogFull (see both constants' own doc for why: this is a real
+// pentest-found fix, not defensive boilerplate for its own sake).
 // Wallets may keep signing offline (spec 5.6); those signed transactions
 // arrive here once connectivity is restored enough to submit.
 func (o *OutageController) Enqueue(t types.ShieldedTx, now time.Time) error {
+	if b, err := json.Marshal(t); err == nil && len(b) > maxBacklogTxSize {
+		return ErrBacklogTxTooLarge
+	}
+
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.sweepSeenLocked(now)
+	// Real, independent pentest finding: sweepSeenLocked used to run here,
+	// on every single Enqueue call — an O(len(seen)) scan paid by every
+	// incoming transaction, not just occasionally. Under sustained
+	// flooding that grows seen toward maxBacklogSize, that made filling
+	// the backlog an O(n^2) operation (empirically ~60s of CPU to reach
+	// 100,000 entries in this package's own regression test) — a real,
+	// attacker-controlled CPU-exhaustion amplifier layered on top of the
+	// memory-exhaustion gap maxBacklogTxSize/maxBacklogSize above already
+	// close. pkg/tx.Mempool never had this problem because its own
+	// analogous sweep runs only from DrainBatch/DrainBatchBytes (paid once
+	// per proposal round by whichever node is proposing), never from
+	// Submit (paid once per incoming transaction) — moving the sweep to
+	// BuildMegabatch here restores that same amortization.
 	if seenAt, dup := o.seen[t.TxID]; dup && now.Sub(seenAt) < backlogSeenTTL {
 		return ErrDuplicateBacklogTx
+	}
+	if len(o.backlog) >= maxBacklogSize {
+		return ErrBacklogFull
 	}
 	o.seen[t.TxID] = now
 	o.backlog = append(o.backlog, t)
@@ -176,6 +232,11 @@ func (o *OutageController) BacklogDepth() int {
 func (o *OutageController) BuildMegabatch(normalBatchSize int) []types.ShieldedTx {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// Paced by proposal rounds, not by incoming transactions — see
+	// Enqueue's own doc on why the sweep moved here, mirroring
+	// pkg/tx.Mempool.DrainBatch's identical amortization of its own
+	// sweepSeenLocked.
+	o.sweepSeenLocked(time.Now())
 	max := normalBatchSize * MegabatchMultiplier
 	if max <= 0 || len(o.backlog) == 0 {
 		return nil

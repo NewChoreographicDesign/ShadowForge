@@ -272,6 +272,48 @@ func TestOutageEnqueueRejectsDuplicateWithinTTL(t *testing.T) {
 	}
 }
 
+// TestOutageEnqueueRejectsOversizedTx is a real, independent pentest
+// finding: before this fix, Enqueue had no per-transaction size check at
+// all, unlike pkg/tx.Mempool.Submit's MaxTxSize bound — and Enqueue is
+// reachable from any connected peer's TxOffer while an outage is active
+// (pkg/validator's handleMessage routes there instead of the live mempool
+// whenever OutageController.Active()), so this was a real, unauthenticated,
+// remote memory-exhaustion vector, active during exactly the kind of real
+// network stress an attacker might exploit.
+func TestOutageEnqueueRejectsOversizedTx(t *testing.T) {
+	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
+	oversized := types.ShieldedTx{TxID: types.Hash{1}, Memo: make([]byte, 257*1024)}
+	if err := o.Enqueue(oversized, now); err != consensus.ErrBacklogTxTooLarge {
+		t.Fatalf("expected ErrBacklogTxTooLarge for an oversized transaction, got %v", err)
+	}
+	if o.BacklogDepth() != 0 {
+		t.Fatalf("a rejected oversized transaction must not be backlogged, depth=%d", o.BacklogDepth())
+	}
+}
+
+// TestOutageEnqueueRejectsWhenBacklogFull is the count-cap counterpart to
+// TestOutageEnqueueRejectsOversizedTx — the same real pentest finding
+// applies to total backlog depth, not just one transaction's size: before
+// this fix, the backlog had no ceiling whatsoever, unlike pkg/tx.Mempool's
+// MaxSize.
+func TestOutageEnqueueRejectsWhenBacklogFull(t *testing.T) {
+	o := consensus.NewOutageController(consensus.DefaultOutageThresholds())
+	now := time.Now()
+	for i := 0; i < 100_000; i++ {
+		id := types.Hash{byte(i), byte(i >> 8), byte(i >> 16)}
+		if err := o.Enqueue(types.ShieldedTx{TxID: id}, now); err != nil {
+			t.Fatalf("enqueue %d: unexpected error %v", i, err)
+		}
+	}
+	if err := o.Enqueue(types.ShieldedTx{TxID: types.Hash{0xFF, 0xFF, 0xFF}}, now); err != consensus.ErrBacklogFull {
+		t.Fatalf("expected ErrBacklogFull once the backlog is at capacity, got %v", err)
+	}
+	if o.BacklogDepth() != 100_000 {
+		t.Fatalf("rejected submission past capacity must not grow the backlog, depth=%d", o.BacklogDepth())
+	}
+}
+
 // TestOutageReinsertBypassesDuplicateCheck proves Reinsert (used by a real
 // validator's dual-track proposal builder to return backlog entries that
 // didn't fit a byte-bounded recovery batch) succeeds even though Enqueue

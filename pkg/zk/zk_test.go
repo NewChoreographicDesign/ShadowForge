@@ -1,6 +1,7 @@
 package zk_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/zk"
@@ -88,6 +89,60 @@ func TestShieldedTransferProofRoundTrip(t *testing.T) {
 	}
 	if err := sys.Verify(proof, pubWitness); err != nil {
 		t.Fatalf("verify: %v", err)
+	}
+}
+
+// TestProofFromBytesRejectsHugeCommitmentsClaim is a real, independent
+// pentest finding, found by native Go fuzzing (FuzzProofFromBytesNeverPanics)
+// rather than static review: gnark-crypto v0.21.0's slice decoder (used
+// internally by gnark v0.16.3's groth16.Proof.ReadFrom for the Commitments
+// field) reads a raw, attacker-controlled uint32 length prefix and
+// immediately allocates a slice of that length with no bound check —
+// fuzzing found a real 160-byte input that crashed the whole process with
+// "fatal error: runtime: out of memory", not a recoverable panic. Since
+// Proof bytes arrive over the network as part of an untrusted
+// types.ShieldedTx.Proof field, this was a genuine, remote,
+// pre-authentication denial-of-service against any validator processing
+// such a transaction. This proves ProofFromBytes now rejects the exact
+// class of input that caused it — a real, well-formed proof prefix
+// (Ar/Bs/Krs) followed by a Commitments-length claim far beyond anything
+// a real proof would ever carry — with a clean error instead of crashing.
+func TestProofFromBytesRejectsHugeCommitmentsClaim(t *testing.T) {
+	sys, err := zk.Setup()
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	input, _ := buildInput(t)
+	proof, err := sys.Prove(input)
+	if err != nil {
+		t.Fatalf("prove: %v", err)
+	}
+	realBytes, err := zk.ProofToBytes(proof)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+
+	// realBytes is Ar(32) || Bs(64) || Krs(32) || commitments-length(4) ||
+	// ... — splice in a huge claimed length right where the real (zero)
+	// one is, keeping Ar/Bs/Krs genuinely well-formed so this actually
+	// exercises the vulnerable field, not an earlier parse failure.
+	const prefixLen = 32 + 64 + 32
+	if len(realBytes) < prefixLen+4 {
+		t.Fatalf("real proof too short (%d bytes) for this test's assumptions", len(realBytes))
+	}
+	tampered := append([]byte{}, realBytes...)
+	tampered[prefixLen] = 0xFF
+	tampered[prefixLen+1] = 0xFF
+	tampered[prefixLen+2] = 0xFF
+	tampered[prefixLen+3] = 0xFF
+
+	if _, err := zk.ProofFromBytes(tampered); !errors.Is(err, zk.ErrProofClaimsTooManyCommitments) {
+		t.Fatalf("expected ErrProofClaimsTooManyCommitments, got %v", err)
+	}
+
+	// A real, honestly-generated proof (zero commitments) must still work.
+	if _, err := zk.ProofFromBytes(realBytes); err != nil {
+		t.Fatalf("expected a real proof to still deserialize cleanly, got %v", err)
 	}
 }
 

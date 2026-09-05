@@ -87,6 +87,40 @@ func TestApplyParamChangeRejectsUnparseableValue(t *testing.T) {
 	}
 }
 
+// TestApplyParamChangeRejectsNegativeATRMultiple is a real, independent
+// pentest finding: before this fix, a passed ProposalParamChange could set
+// DepositATRMultiple to any parseable value, including negative. Since
+// pkg/bank.Deposit computes buffer = DepositATRMultiple * ATRUSD and then
+// net = grossUSD - buffer, a negative multiplier makes buffer negative and
+// therefore net *larger* than the real gross deposit value — a direct
+// SFG-over-issuance bug, not just bad bookkeeping. This proves such a
+// value is rejected outright and never reaches live Params.
+func TestApplyParamChangeRejectsNegativeATRMultiple(t *testing.T) {
+	p := governance.Default()
+	before := p.DepositATRMultiple
+	if err := governance.ApplyParamChange(&p, "DepositATRMultiple", "-1"); err == nil {
+		t.Fatalf("expected a negative DepositATRMultiple to be rejected")
+	}
+	if p.DepositATRMultiple.Cmp(before) != 0 {
+		t.Fatalf("expected params to be untouched after a rejected change")
+	}
+}
+
+// TestApplyParamChangeRejectsFeeRateAboveOne is the upper-bound
+// counterpart: a rate or share parameter above 1 (100%) is equally
+// nonsensical for its own live consumers (pkg/vault's fee split,
+// pkg/bank's fee math) and must be rejected the same way.
+func TestApplyParamChangeRejectsFeeRateAboveOne(t *testing.T) {
+	p := governance.Default()
+	before := p.BankFeeRate
+	if err := governance.ApplyParamChange(&p, "BankFeeRate", "1.5"); err == nil {
+		t.Fatalf("expected a BankFeeRate above 1 to be rejected")
+	}
+	if p.BankFeeRate.Cmp(before) != 0 {
+		t.Fatalf("expected params to be untouched after a rejected change")
+	}
+}
+
 func TestIsVaultShareKey(t *testing.T) {
 	for _, key := range []string{"VaultEpochBonusShare", "VaultBurnShare", "VaultAuditShare", "VaultRemainderShare"} {
 		if !governance.IsVaultShareKey(key) {

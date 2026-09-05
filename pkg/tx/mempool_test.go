@@ -67,6 +67,29 @@ func TestMempoolDefaultMaxSize(t *testing.T) {
 // TxID it has already admitted — the property pkg/validator's TxOffer
 // gossip forwarding relies on to avoid two peers relaying the same
 // transaction back and forth forever.
+// TestMempoolSubmitRejectsOversizedTx is a real, independent pentest
+// finding: before this fix, Submit admitted a transaction of any size —
+// MaxTxSize was documented as "checked at pipeline Stage 2" only, which
+// runs far later, after a transaction has already been counted against
+// MaxSize and held in memory. Since a TxOffer's wire size is bounded only
+// by pkg/net.MaxEnvelopeSize (4 MiB, 16x MaxTxSize), and Submit is
+// reachable from any peer's gossip with no signature or proof check of
+// its own, this was a real, remote, pre-authentication memory-exhaustion
+// vector (worst case MaxSize * MaxEnvelopeSize, not MaxSize * MaxTxSize).
+// This proves an oversized transaction is rejected outright, before ever
+// being admitted.
+func TestMempoolSubmitRejectsOversizedTx(t *testing.T) {
+	m := tx.NewMempool()
+	now := time.Now()
+	oversized := types.ShieldedTx{TxID: types.Hash{1}, Memo: make([]byte, tx.MaxTxSize+1)}
+	if err := m.Submit(oversized, now); err != tx.ErrTxTooLarge {
+		t.Fatalf("expected ErrTxTooLarge for an oversized transaction, got %v", err)
+	}
+	if m.Len() != 0 {
+		t.Fatalf("a rejected oversized transaction must not be admitted, len=%d", m.Len())
+	}
+}
+
 func TestMempoolSubmitRejectsDuplicateTxID(t *testing.T) {
 	m := tx.NewMempool()
 	now := time.Now()

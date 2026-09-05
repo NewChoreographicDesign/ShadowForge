@@ -58,6 +58,28 @@ func TestDepositRejectsWhenBufferExceedsGross(t *testing.T) {
 	}
 }
 
+// TestDepositRejectsSFGIssuedOverflow is a real, independent pentest
+// finding: Decimal.Uint64() (big.Int.Uint64 underneath) is documented as
+// undefined for a value that doesn't fit a uint64 — in practice a silent
+// low-64-bits truncation, not a panic. An extremely small (but positive,
+// so not caught by the existing SFGUSDPrice<=0 check) oracle price
+// against an ordinary deposit amount drives sfgIssuedDec far past
+// math.MaxUint64; before this fix, Deposit would have silently issued a
+// wrapped, meaningless SFGIssued value instead of failing loudly.
+func TestDepositRejectsSFGIssuedOverflow(t *testing.T) {
+	_, err := bank.Deposit(bank.DepositParams{
+		ExternalAmount: dec("1"),
+		PriceUSD:       dec("60000"),
+		ATRUSD:         dec("1"), // tiny buffer so it doesn't reject first
+		SFGUSDPrice:    dec("0.0000000000000000001"),
+		Now:            1000,
+		DailyCapUSD:    dec("1000000000"), // raise the cap so it doesn't reject first either
+	})
+	if err != bank.ErrSFGIssuedOverflow {
+		t.Fatalf("expected ErrSFGIssuedOverflow, got %v", err)
+	}
+}
+
 func TestDepositRejectsWhenDailyCapExceeded(t *testing.T) {
 	_, err := bank.Deposit(bank.DepositParams{
 		ExternalAmount: dec("2"),
@@ -113,6 +135,44 @@ func TestWithdrawRefundNeverNegative(t *testing.T) {
 	}
 	if res.RefundSFG.Sign() != 0 {
 		t.Fatalf("expected zero refund when retention exceeds buffer, got %s", res.RefundSFG)
+	}
+}
+
+// TestWithdrawRepayPositiveForSFGIssuedAboveMaxInt64 is a real, independent
+// pentest finding: hold.SFGIssued is a uint64 that can legitimately reach
+// or exceed 2^63 (Deposit's own overflow guard only rejects amounts that
+// don't fit a uint64 at all). The previous decimal.FromInt(int64(...))
+// cast on this exact field would have reinterpreted such a value as
+// negative, turning RepaySFG negative — the Bank would owe the
+// withdrawing user SFG instead of collecting repayment, a real
+// value-creation exploit. This proves repay stays strictly positive and
+// matches the true, non-negative magnitude.
+func TestWithdrawRepayPositiveForSFGIssuedAboveMaxInt64(t *testing.T) {
+	const hugeSFGIssued uint64 = 1<<63 + 54321 // > math.MaxInt64
+	hold := types.BankHold{
+		EntryBuffer:    dec("100"),
+		EntryPriceUSD:  dec("60000"),
+		SFGIssued:      hugeSFGIssued,
+		OpenedAt:       0,
+		DailySnapshots: []types.ATRPoint{{ATRUSD: dec("10")}},
+	}
+	res, err := bank.Withdraw(bank.WithdrawParams{
+		Hold:        hold,
+		PriceNowUSD: dec("60000"),
+		Now:         int64(bank.DepositLockDuration.Milliseconds()) + 1,
+	})
+	if err != nil {
+		t.Fatalf("withdraw: %v", err)
+	}
+	if res.RepaySFG.Sign() <= 0 {
+		t.Fatalf("RepaySFG must be strictly positive for a real SFGIssued amount, got %s", res.RepaySFG)
+	}
+	// No asymmetry/slippage/exit-fee/gas at these params beyond the
+	// defaults Withdraw itself applies, so RepaySFG should be comfortably
+	// larger than the base amount, never anywhere near a negative or
+	// wrapped-looking small value.
+	if res.RepaySFG.Cmp(dec("1")) <= 0 {
+		t.Fatalf("RepaySFG looks wrapped/corrupted for SFGIssued=%d, got %s", hugeSFGIssued, res.RepaySFG)
 	}
 }
 
