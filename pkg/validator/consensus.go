@@ -13,9 +13,31 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
+	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
+
+// talliedMintCommits extracts, in order, the real spec-17.4 direct-path
+// epoch-mint output commitments a TallyDueProposals call actually applied
+// (Passed, MintApplied, and the direct — not staked — path): the exact
+// real canonical-tree insertions Deps.ZKTree just received, in the same
+// order it received them (TallyDueProposals' own doc: iterated off
+// Store.ListProposals' ProposalID-sorted order, so this is deterministic
+// across every honest node). Both handleBlockProposal and
+// tryAdoptBlockLocked call TallyDueProposals themselves and use its
+// return here — nobody ever trusts a peer's claim of what tallied, only
+// its own locally, independently recomputed answer — so this never needs
+// to be part of HashBlock: see types.Block.TalliedMintCommits' own doc.
+func talliedMintCommits(tallied []state.ProposalRecord) []types.Hash {
+	var out []types.Hash
+	for _, record := range tallied {
+		if record.Passed && record.MintApplied && record.MintAmount > 0 && !record.MintStaked {
+			out = append(out, record.MintOutCommit)
+		}
+	}
+	return out
+}
 
 // committeeSize implements spec 5.3.1/19.5's adaptive width, scaled to a
 // whole committee (one slot per stage, spec 5.7: "with one validator per
@@ -531,7 +553,8 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	// given this batch's own Epoch plus already-committed proposal state,
 	// so every honest node reaches the same outcome — see
 	// Pipeline.TallyDueProposals' own doc for why.
-	if _, err := pipeline.TallyDueProposals(types.EpochNumber(prop.Epoch)); err != nil {
+	tallied, err := pipeline.TallyDueProposals(types.EpochNumber(prop.Epoch))
+	if err != nil {
 		n.log("validator: rejecting proposal at height %d: epoch tally failed: %v", prop.Height, err)
 		txn.Discard()
 		n.tree.TruncateTo(treeSnapshot)
@@ -543,6 +566,7 @@ func (n *Node) handleBlockProposal(prop shadownet.BlockProposalPayload) {
 	daRoot := daRootOf(prop.Batch)
 	block := n.chn.NextBlock(prop.Epoch, prop.Batch, txRoot, stateRoot, daRoot, prop.Proposer, prop.Timestamp)
 	block.DualTrack = prop.DualTrack
+	block.TalliedMintCommits = talliedMintCommits(tallied)
 	candidate := types.HashBlock(block)
 
 	sig, err := crypto.DilithiumSign(n.sk, candidate[:])
@@ -748,11 +772,17 @@ func (n *Node) tryAdoptBlockLocked(b types.Block) error {
 	// too — otherwise a node that only ever adopts blocks via announce or
 	// catch-up would silently disagree with the rest of the network about
 	// which proposals have already been tallied.
-	if _, err := pipeline.TallyDueProposals(types.EpochNumber(b.Epoch)); err != nil {
+	tallied, err := pipeline.TallyDueProposals(types.EpochNumber(b.Epoch))
+	if err != nil {
 		txn.Discard()
 		n.tree.TruncateTo(treeSnapshot)
 		return fmt.Errorf("epoch tally failed: %w", err)
 	}
+	// Never trust the wire's own claim of what tallied — this node just
+	// independently recomputed it above, so its local copy of b is
+	// overwritten with that real, self-derived answer before it's ever
+	// persisted (see talliedMintCommits' own doc).
+	b.TalliedMintCommits = talliedMintCommits(tallied)
 
 	stateRoot := n.tree.Root()
 	if stateRoot != b.StateRoot {

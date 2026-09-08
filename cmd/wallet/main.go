@@ -206,14 +206,20 @@ Needs its own one-time shared setup, like eligibility above:
   wallet propose-mint -keystore <file> -bootstrap <addr> -query <url> -proposal <id> -amount <n> -eligibility-zk-params <file> -mint-zk-params <file>
 Once tallied, check 'wallet proposal -id <id>' for real Passed/
 MintApplied status. The proposer alone knows the minted note's real
-opening (they built it), so, like a shielded transfer's own bootstrap
-gap, this build has no wallet-sync mechanism to auto-discover somebody
-else's mint; save what propose-mint prints — it is the only record of
-that note's opening this build ever produces. ('wallet note' does not
-verify this: this build's note-existence index is only ever populated
-by a wallet's own optional PutNote call, which nothing in this CLI — for
-Transfer's own outputs either — currently makes, a real, separate,
-pre-existing gap rather than one this fix introduces.)
+opening (they built it) — save what propose-mint prints, it is the only
+record of that note's opening this build ever produces. Nobody but the
+proposer can ever discover this note (there's no memo, unlike a
+Transfer output), but the proposer's own long-lived wallet process can:
+pkg/shieldedwallet.Wallet.ExpectMintedNote registers the printed
+secret so a later Sync recognizes and claims it automatically once the
+proposal tallies — this CLI's own one-shot 'balance'/'transfer' commands
+don't yet expose a flag for that (a real, separate follow-up), so a
+script driving this CLI still needs to reconstruct the note by other
+means for now. ('wallet note' does not verify this: this build's
+note-existence index is only ever populated by a wallet's own optional
+PutNote call, which nothing in this CLI — for Transfer's own outputs
+either — currently makes, a real, separate, pre-existing gap rather than
+one this fix introduces.)
 
 Add -staked to 'propose-mint' for spec 17.4's other proposer path: the
 requested amount locks as a real position (no upfront fee) instead of
@@ -248,9 +254,11 @@ All commands prompt for a keystore passphrase on the real terminal
 (input hidden) where one is needed. Pass -passphrase-stdin to read it
 from stdin instead, one line, for scripting.
 
-A real, disclosed limitation shared by "balance" and "transfer": this
-build has no on-chain mechanism that originates a wallet's very first
-shielded note (see pkg/shieldedwallet's own doc) — a brand-new wallet
-genuinely has a balance of 0 until it receives a real transfer from one
-that already holds spendable notes.`)
+A real, disclosed limitation shared by "balance" and "transfer": a
+brand-new wallet has a balance of 0 until it either receives a real
+transfer from one that already holds spendable notes, or is itself the
+proposer of a passed 'propose-mint' proposal (see that command's own
+help above, and pkg/shieldedwallet's own doc) — there is still no way
+for a wallet to originate its first note purely by syncing a live
+network on its own.`)
 }

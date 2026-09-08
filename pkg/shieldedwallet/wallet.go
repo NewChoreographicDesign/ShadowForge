@@ -83,14 +83,22 @@ type ownedNote struct {
 // transfer always spends exactly 2 known notes and produces exactly 2
 // outputs (payment + change, even when change is zero), never 1. A
 // wallet with fewer than 2 known spendable notes cannot build a transfer
-// at all. Nothing in this build currently originates a shielded
-// wallet's *first* note either (Kind Mint is accepted but has no
-// on-chain effect — see pkg/tx.Pipeline.TallyDueProposals' own doc,
-// "Actual SFG token minting stays unwired"), so bootstrapping a wallet's
-// first two notes is, honestly, outside what this reference build's
-// live network can do for you today; tests and any live demonstration
-// necessarily seed them directly, the same way pkg/tx's own test suite
-// already does.
+// at all.
+//
+// The vestigial Kind Mint transaction (types.TxMint's own doc) is still
+// a no-op with no on-chain effect — it does not originate a note. The
+// real mechanism is spec 17.4's epoch mint (a passed, tallied
+// propose-mint proposal's direct path): TallyDueProposals really does
+// insert its MintOutCommit into this same canonical tree. A wallet can't
+// discover that by scanning Batch/memo data the way it discovers a
+// Transfer output addressed to it, though — a mint has no memo, and only
+// the proposer who built it knows its opening — so ExpectMintedNote
+// exists to close that gap: call it with the secret 'wallet propose-mint'
+// prints, before Sync reaches the block whose TalliedMintCommits carries
+// it, and Sync will recognize and claim it automatically. A wallet that
+// never calls ExpectMintedNote for a note it didn't itself propose still
+// has no way to discover it — that part of the limitation is real and
+// permanent, not a gap: nobody but the proposer ever knows the opening.
 type Wallet struct {
 	pk          crypto.DilithiumPublicKey
 	sk          crypto.DilithiumPrivateKey
@@ -105,6 +113,10 @@ type Wallet struct {
 	syncedHeight uint64
 	synced       bool
 	notes        map[types.Hash]*ownedNote // keyed by commitment
+	// expectedMints are real spec-17.4 direct-path epoch-mint notes this
+	// wallet's owner itself proposed and knows the opening of, registered
+	// via ExpectMintedNote — see that method's own doc.
+	expectedMints map[types.Hash]zk.NoteSecret
 }
 
 // Config configures a Wallet.
@@ -127,15 +139,35 @@ func New(pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, shieldedPu
 		httpClient = &http.Client{}
 	}
 	return &Wallet{
-		pk:          pk,
-		sk:          sk,
-		shieldedPub: shieldedPub,
-		shieldedKey: shieldedKey,
-		queryBase:   cfg.QueryBase,
-		http:        httpClient,
-		tree:        zk.NewTree(),
-		notes:       map[types.Hash]*ownedNote{},
+		pk:            pk,
+		sk:            sk,
+		shieldedPub:   shieldedPub,
+		shieldedKey:   shieldedKey,
+		queryBase:     cfg.QueryBase,
+		http:          httpClient,
+		tree:          zk.NewTree(),
+		notes:         map[types.Hash]*ownedNote{},
+		expectedMints: map[types.Hash]zk.NoteSecret{},
 	}, nil
+}
+
+// ExpectMintedNote registers a real spec-17.4 direct-path epoch-mint note
+// this wallet's owner itself proposed and knows the full opening of (the
+// secret 'wallet propose-mint' prints) — mirroring pkg/stakewallet.
+// Wallet.Remember for the staked path. A later Sync that replays a block
+// whose TalliedMintCommits contains this secret's own commitment claims
+// it as an ordinary spendable note, at whatever real tree index it
+// actually landed at — see Wallet's own doc for why nothing else can
+// discover a mint-originated note this way.
+//
+// This package never persists anything (mirroring pkg/txbuilder's own
+// stance): the caller alone is responsible for calling this again after
+// a process restart, with whatever secret it saved the first time.
+func (w *Wallet) ExpectMintedNote(secret zk.NoteSecret) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	c := types.Hash(zk.ToBytes32(secret.Commitment()))
+	w.expectedMints[c] = secret
 }
 
 // Identity is this wallet's consensus-style identity.
@@ -224,6 +256,25 @@ func (w *Wallet) replayBlock(b types.Block) {
 			w.notes[c] = &ownedNote{secret: secret, index: idx, nullifier: types.Hash(zk.ToBytes32(secret.Nullifier()))}
 		}
 	}
+
+	// Real spec-17.4 direct-path epoch-mint insertions land in this same
+	// tree after the block's own Batch (see types.Block.
+	// TalliedMintCommits' own doc for the exact real order this
+	// reproduces) — every wallet must replay them for index-parity, even
+	// ones it doesn't own, or every index after this point silently
+	// disagrees with the real network's canonical tree.
+	for _, c := range b.TalliedMintCommits {
+		elem := zk.FieldElementFromBytes32(c)
+		idx, err := w.tree.Insert(elem)
+		if err != nil {
+			continue
+		}
+		secret, mine := w.expectedMints[c]
+		if !mine {
+			continue
+		}
+		w.notes[c] = &ownedNote{secret: secret, index: idx, nullifier: types.Hash(zk.ToBytes32(secret.Nullifier()))}
+	}
 }
 
 func (w *Wallet) fetchStatus(ctx context.Context) (uint64, error) {
@@ -273,18 +324,19 @@ func (w *Wallet) fetchBlock(ctx context.Context, height uint64) (types.Block, er
 // replaying a real committed output would) and recording it as spendable.
 // It returns the resulting tree index.
 //
-// This exists for a real, disclosed reason, not just tests: this build
-// has no on-chain mechanism that originates a wallet's very first note
-// (Kind Mint is accepted but has no effect — see Wallet's own doc), so
-// there is currently no way for a wallet to legitimately discover a
-// first spendable note purely by syncing a live network. A genesis or
-// otherwise externally-provisioned note has to be imported this way,
-// with the caller responsible for making sure the same commitment lands
-// at the same real index in the network's actual canonical tree (e.g. by
-// arranging for it to be the first thing ever inserted there) — an
-// incorrect index only ever produces an unprovable Merkle proof later,
-// never a false membership claim, since Prove itself recomputes the real
-// path.
+// This exists for a real, disclosed reason, not just tests: the
+// vestigial Kind Mint transaction still has no on-chain effect (see
+// Wallet's own doc), and even the real spec-17.4 epoch mint — which does
+// originate a genuine first note, via ExpectMintedNote plus an ordinary
+// Sync — only helps a wallet that is itself the proposer. A genesis or
+// otherwise externally-provisioned note (e.g. one seeded outside any
+// mint proposal, the way this package's own tests do it) still has to be
+// imported this way, with the caller responsible for making sure the
+// same commitment lands at the same real index in the network's actual
+// canonical tree (e.g. by arranging for it to be the first thing ever
+// inserted there) — an incorrect index only ever produces an unprovable
+// Merkle proof later, never a false membership claim, since Prove itself
+// recomputes the real path.
 func (w *Wallet) ImportCanonicalNote(secret zk.NoteSecret) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

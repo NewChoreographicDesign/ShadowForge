@@ -591,6 +591,29 @@ type Block struct {
 	ProposerSig DilithiumSig
 	Votes       []Vote
 	DualTrack   bool // true if this block is the backlog track of a megabatch
+	// TalliedMintCommits is the ordered list of real spec-17.4 direct-path
+	// epoch-mint output commitments (state.ProposalRecord.MintOutCommit)
+	// that landed in the real canonical note tree while this block was
+	// committed — the same tree Batch's own Transfer outputs live in, in
+	// the same insertion order pkg/tx.Pipeline.TallyDueProposals actually
+	// used (ProposalID-sorted, applied after Batch's own Stage 4
+	// insertions). It exists purely so a client (pkg/shieldedwallet.
+	// Wallet's own replayBlock) can reproduce that exact tree state
+	// without needing block-height-independent side information — see
+	// pkg/stakewallet's own doc for why the separate, block-independent
+	// staked-mint tree doesn't need this.
+	//
+	// Deliberately excluded from HashBlock, the same way Batch itself is
+	// (committed via TxRoot instead): every honest node computes this
+	// field by independently calling TallyDueProposals itself (both when
+	// proposing and when replaying/adopting a block — see pkg/validator's
+	// talliedMintCommits), never by trusting what a peer put on the wire,
+	// so an incorrect or omitted entry here can only ever make a client's
+	// own later Merkle proof fail to verify against the real network —
+	// never a false membership claim — the same "wrong data self-defeats,
+	// never falsely accepts" property pkg/shieldedwallet.Wallet.
+	// ImportCanonicalNote's own doc already relies on.
+	TalliedMintCommits []Hash
 }
 
 // HashBlock computes a block's canonical header hash: everything a

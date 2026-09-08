@@ -145,6 +145,55 @@ func (n *testNetwork) commit(t *testing.T, txn types.ShieldedTx) uint64 {
 	return b.Height
 }
 
+// commitMint commits a real block whose Batch is empty but whose
+// TalliedMintCommits carries commit, and, in the same order, inserts
+// commit into the network's own real canonical tree — exactly the shape
+// pkg/tx.Pipeline.TallyDueProposals' real spec-17.4 direct-mint
+// execution produces (types.Block.TalliedMintCommits' own doc), without
+// needing the full real proposal/vote/eligibility-proof machinery
+// pkg/tx's own mint tests already exercise: this test only needs to
+// prove pkg/shieldedwallet's own replay of that shape is correct.
+func (n *testNetwork) commitMint(t *testing.T, commit zk.FieldElement) uint64 {
+	t.Helper()
+	if _, err := n.zkTree.Insert(commit); err != nil {
+		t.Fatalf("insert mint commit into network tree: %v", err)
+	}
+	root, err := n.zkTree.Root()
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	n.zkRoots.Record(root)
+
+	lookup := func(id types.NFTID) (crypto.DilithiumPublicKey, bool) {
+		switch id {
+		case n.v1id:
+			return n.v1pk, true
+		case n.v2id:
+			return n.v2pk, true
+		}
+		return nil, false
+	}
+	b := n.chn.NextBlock(0, nil, types.Hash{1}, types.Hash{2}, types.Hash{}, n.v1id, time.Now().UnixMilli())
+	b.TalliedMintCommits = []types.Hash{types.Hash(zk.ToBytes32(commit))}
+	candidate := types.HashBlock(b)
+	sig1, err := crypto.DilithiumSign(n.v1sk, candidate[:])
+	if err != nil {
+		t.Fatalf("sign v1: %v", err)
+	}
+	sig2, err := crypto.DilithiumSign(n.v2sk, candidate[:])
+	if err != nil {
+		t.Fatalf("sign v2: %v", err)
+	}
+	b.Votes = []types.Vote{
+		{Validator: n.v1id, StateRoot: candidate, Sig: types.DilithiumSig(sig1)},
+		{Validator: n.v2id, StateRoot: candidate, Sig: types.DilithiumSig(sig2)},
+	}
+	if err := n.chn.Append(b, []types.NFTID{n.v1id, n.v2id}, lookup); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	return b.Height
+}
+
 func newTestWallet(t *testing.T, net *testNetwork) *shieldedwallet.Wallet {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
@@ -410,5 +459,75 @@ func TestSyncIgnoresMemosNotAddressedToThisWallet(t *testing.T) {
 	}
 	if got := uninvolved.Balance(); got != 0 {
 		t.Fatalf("expected an uninvolved wallet to discover nothing, got balance %d", got)
+	}
+}
+
+// TestWalletDiscoversRealEpochMintNote proves the real gap this task
+// closed is actually closed: a wallet that itself proposed a real
+// spec-17.4 direct-path epoch mint, and registered the resulting secret
+// via ExpectMintedNote, discovers it as a genuinely spendable note
+// purely by calling Sync — no out-of-band tree manipulation the way
+// bootstrapSenderNotes/genesisNotes above still need for the mint
+// mechanism's own more fundamental "nobody but the proposer can ever
+// discover it" limitation (see Wallet's own doc) — and can actually
+// spend it in a further real, committed Transfer. An uninvolved wallet
+// must stay index-aligned with the real network tree too, but must never
+// claim a note it doesn't hold the opening to.
+func TestWalletDiscoversRealEpochMintNote(t *testing.T) {
+	net := newTestNetwork(t)
+	proposer := newTestWallet(t, net)
+	uninvolved := newTestWallet(t, net)
+
+	// A wallet needs 2 known notes to build any Transfer (zk.NumInputs) —
+	// give the proposer a second, ordinary bootstrap note so the minted
+	// note isn't stranded alone once discovered.
+	genesis := genesisNotes(t, net, []uint64{5})
+	claimGenesisNotes(t, proposer, genesis)
+	seedGenesisIndices(t, uninvolved, genesis)
+
+	minted := mkNote(t, 50)
+	proposer.ExpectMintedNote(minted)
+
+	height := net.commitMint(t, minted.Commitment())
+	if height != 1 {
+		t.Fatalf("expected height 1, got %d", height)
+	}
+
+	ctx := context.Background()
+	if err := proposer.Sync(ctx); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if got := proposer.Balance(); got != 55 {
+		t.Fatalf("expected proposer's balance to be 5 (bootstrap) + 50 (real minted note) = 55, got %d", got)
+	}
+	if proposer.KnownNoteCount() != 2 {
+		t.Fatalf("expected proposer to hold exactly 2 known notes, got %d", proposer.KnownNoteCount())
+	}
+
+	if err := uninvolved.Sync(ctx); err != nil {
+		t.Fatalf("uninvolved sync: %v", err)
+	}
+	if got := uninvolved.Balance(); got != 0 {
+		t.Fatalf("expected an uninvolved wallet to discover nothing from the mint, got balance %d", got)
+	}
+
+	// The minted note is genuinely spendable: prove it the same way
+	// TestWalletToWalletTransferEndToEnd does, by actually building AND
+	// committing a further real transfer that spends it — this exercises
+	// the real canonical-root check, so a wrong local tree index for the
+	// minted note (or for uninvolved's index-parity mirror) would be
+	// caught right here, not just silently accepted.
+	receiver := newTestWallet(t, net)
+	txn, err := proposer.BuildTransfer(getZKSystem(t), receiver.ShieldedPublicKey(), 40, 1)
+	if err != nil {
+		t.Fatalf("build transfer spending the minted note: %v", err)
+	}
+	net.commit(t, txn)
+
+	if err := receiver.Sync(ctx); err != nil {
+		t.Fatalf("receiver sync: %v", err)
+	}
+	if got := receiver.Balance(); got != 40 {
+		t.Fatalf("expected receiver to discover a real 40-value note funded by the mint, got balance %d", got)
 	}
 }
