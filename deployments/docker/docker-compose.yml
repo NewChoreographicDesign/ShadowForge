@@ -23,6 +23,11 @@
 # one entry point, so they stay star-connected to a single validator.
 #
 # Run: docker compose -f deployments/docker/docker-compose.yml up --build
+# Then open http://localhost:8090 for the block explorer (Phase 3's
+# roadmap item) — it's a static page that runs entirely in your browser
+# and talks directly to validator2's published query API
+# (http://localhost:8081, see validator2's -query-listen/ports below),
+# so nothing about it needs to run inside the compose network itself.
 services:
   validator1:
     build:
@@ -46,6 +51,14 @@ services:
       - -bootstrap-file=/shared/validator1.addr,/shared/sentinel1.addr
       - -announce-file=/shared/validator2.addr
       - -skip-zk-setup
+      # 0.0.0.0, not the -query-listen default's loopback-only bind: this
+      # is validator2's own explicit choice to publish its read-only
+      # query API (see pkg/query.Config.ListenAddr's own doc) — both to
+      # the host (via ports: below, for the explorer's browser-side
+      # fetches) and, incidentally, to its sibling containers.
+      - -query-listen=0.0.0.0:8081
+    ports:
+      - "8081:8081"
     volumes:
       - shared:/shared
     depends_on:
@@ -79,6 +92,24 @@ services:
       - -interval=3s
     volumes:
       - shared:/shared
+    depends_on:
+      - validator2
+
+  explorer:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/explorer"]
+    command:
+      - -listen=0.0.0.0:8090
+      # A host-visible address, not validator2's in-network service name:
+      # -query's default reaches a viewer's own browser, which runs on
+      # the host, not inside this compose network (see cmd/explorer's own
+      # doc — nothing here proxies the API, so this has to be an address
+      # the browser itself can dial).
+      - -query=http://localhost:8081
+    ports:
+      - "8090:8090"
     depends_on:
       - validator2
 

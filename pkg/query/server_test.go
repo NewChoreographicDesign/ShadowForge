@@ -136,6 +136,161 @@ func TestBlockRejectsNonNumericHeight(t *testing.T) {
 	}
 }
 
+// appendBlock commits one more real, quorum-gated block onto env's chain
+// (mirroring TestTxStatusCommittedAfterRealAppend's own real Append
+// path, generalized to a reusable helper) and returns its height — for
+// tests that just need N real blocks to exist, not any particular
+// content.
+func appendBlock(t *testing.T, env *testEnv, batch []types.ShieldedTx) uint64 {
+	t.Helper()
+	type validatorKey struct {
+		id types.NFTID
+		pk crypto.DilithiumPublicKey
+		sk crypto.DilithiumPrivateKey
+	}
+	genKey := func() validatorKey {
+		pk, sk, err := crypto.GenerateDilithiumKey()
+		if err != nil {
+			t.Fatalf("generate key: %v", err)
+		}
+		return validatorKey{id: types.NFTID(types.SumHash(pk)), pk: pk, sk: sk}
+	}
+	v1, v2 := genKey(), genKey()
+	lookup := func(id types.NFTID) (crypto.DilithiumPublicKey, bool) {
+		switch id {
+		case v1.id:
+			return v1.pk, true
+		case v2.id:
+			return v2.pk, true
+		}
+		return nil, false
+	}
+	b := env.chn.NextBlock(0, batch, types.Hash{9}, types.Hash{1}, types.Hash{}, v1.id, time.Now().UnixMilli())
+	candidate := types.HashBlock(b)
+	for _, v := range []validatorKey{v1, v2} {
+		sig, err := crypto.DilithiumSign(v.sk, candidate[:])
+		if err != nil {
+			t.Fatalf("sign: %v", err)
+		}
+		b.Votes = append(b.Votes, types.Vote{Validator: v.id, StateRoot: candidate, Sig: types.DilithiumSig(sig)})
+	}
+	if err := env.chn.Append(b, []types.NFTID{v1.id, v2.id}, lookup); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	return b.Height
+}
+
+// --- /v1/blocks: pagination ---
+
+func TestBlocksListsRecentNewestFirst(t *testing.T) {
+	env := newTestEnv(t)
+	appendBlock(t, env, nil) // height 1
+	appendBlock(t, env, nil) // height 2
+	appendBlock(t, env, nil) // height 3
+
+	resp, body := env.get(t, "/v1/blocks?limit=2")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var got struct {
+		Blocks  []types.Block `json:"blocks"`
+		HasMore bool          `json:"has_more"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(got.Blocks))
+	}
+	if got.Blocks[0].Height != 3 || got.Blocks[1].Height != 2 {
+		t.Fatalf("expected newest-first [3,2], got [%d,%d]", got.Blocks[0].Height, got.Blocks[1].Height)
+	}
+	if !got.HasMore {
+		t.Fatalf("expected has_more=true with genesis and height 1 still unpaged")
+	}
+}
+
+func TestBlocksPaginatesWithBefore(t *testing.T) {
+	env := newTestEnv(t)
+	appendBlock(t, env, nil) // height 1
+	appendBlock(t, env, nil) // height 2
+	appendBlock(t, env, nil) // height 3
+
+	resp, body := env.get(t, "/v1/blocks?limit=2&before=2")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var got struct {
+		Blocks  []types.Block `json:"blocks"`
+		HasMore bool          `json:"has_more"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Blocks) != 2 {
+		t.Fatalf("expected 2 blocks, got %d", len(got.Blocks))
+	}
+	if got.Blocks[0].Height != 1 || got.Blocks[1].Height != 0 {
+		t.Fatalf("expected [1,0] below cursor 2, got [%d,%d]", got.Blocks[0].Height, got.Blocks[1].Height)
+	}
+	if got.HasMore {
+		t.Fatalf("expected has_more=false once genesis (height 0) is reached")
+	}
+}
+
+func TestBlocksRejectsBadLimit(t *testing.T) {
+	env := newTestEnv(t)
+	resp, _ := env.get(t, "/v1/blocks?limit=0")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+	resp, _ = env.get(t, "/v1/blocks?limit=not-a-number")
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestBlocksCapsExcessiveLimit(t *testing.T) {
+	env := newTestEnv(t)
+	for i := 0; i < 5; i++ {
+		appendBlock(t, env, nil)
+	}
+	resp, body := env.get(t, "/v1/blocks?limit=100000")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var got struct {
+		Blocks []types.Block `json:"blocks"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Blocks) != 6 { // genesis (0) + 5 appended (1-5)
+		t.Fatalf("expected 6 blocks (genesis + 5), got %d", len(got.Blocks))
+	}
+}
+
+func TestBlocksOnFreshChainReturnsOnlyGenesis(t *testing.T) {
+	env := newTestEnv(t)
+	resp, body := env.get(t, "/v1/blocks")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var got struct {
+		Blocks  []types.Block `json:"blocks"`
+		HasMore bool          `json:"has_more"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Blocks) != 1 || got.Blocks[0].Height != 0 {
+		t.Fatalf("expected only genesis on a fresh chain, got %+v", got.Blocks)
+	}
+	if got.HasMore {
+		t.Fatalf("expected has_more=false on a fresh chain")
+	}
+}
+
 // --- /v1/tx/{txid}: the real committed/pending/unknown tri-state ---
 
 func TestTxStatusUnknownForNeverSeenTx(t *testing.T) {
@@ -235,6 +390,71 @@ func TestTxStatusCommittedAfterRealAppend(t *testing.T) {
 	}
 	if got.Height == nil || *got.Height != 1 {
 		t.Fatalf("expected height 1, got %+v", got.Height)
+	}
+}
+
+// TestTxStatusCommittedIncludesFullContent proves handleTx's enrichment:
+// once a tx is committed, the response carries its own full, real
+// content (the exact same object /v1/blocks/{height} already returns in
+// full as part of that height's Batch — see handleBlock's own doc for
+// why that's already safe), not just status/height.
+func TestTxStatusCommittedIncludesFullContent(t *testing.T) {
+	env := newTestEnv(t)
+	txid := types.Hash{0x23}
+	batch := []types.ShieldedTx{
+		{TxID: types.Hash{0x01}, Kind: types.TxVote},
+		{TxID: txid, Kind: types.TxNFTTransfer, NFTTransferPublicInputs: &types.NFTTransferPublicInputs{
+			Target: types.NFTID{0x77}, NewOwner: types.Address{0x88},
+		}},
+	}
+	height := appendBlock(t, env, batch)
+
+	resp, body := env.get(t, "/v1/tx/"+txid.String())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var got struct {
+		Status string            `json:"status"`
+		Height *uint64           `json:"height"`
+		Tx     *types.ShieldedTx `json:"tx"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Status != "committed" || got.Height == nil || *got.Height != height {
+		t.Fatalf("unexpected status/height: %+v", got)
+	}
+	if got.Tx == nil {
+		t.Fatalf("expected tx content to be included once committed")
+	}
+	if got.Tx.TxID != txid || got.Tx.Kind != types.TxNFTTransfer {
+		t.Fatalf("unexpected tx content: %+v", got.Tx)
+	}
+	if got.Tx.NFTTransferPublicInputs == nil || got.Tx.NFTTransferPublicInputs.Target != (types.NFTID{0x77}) {
+		t.Fatalf("expected the real NFTTransferPublicInputs to round-trip, got %+v", got.Tx.NFTTransferPublicInputs)
+	}
+}
+
+// TestTxStatusPendingOmitsContent proves a pending (mempool-only) tx
+// never carries content in the response — Tx is populated purely from
+// the real committed block, never from the mempool's own copy, so an
+// unconfirmed transaction never appears to have already landed.
+func TestTxStatusPendingOmitsContent(t *testing.T) {
+	env := newTestEnv(t)
+	txid := types.Hash{0x24}
+	if err := env.mempool.Submit(types.ShieldedTx{TxID: txid, Kind: types.TxTransfer}, time.Now()); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	resp, body := env.get(t, "/v1/tx/"+txid.String())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, body)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, present := got["tx"]; present {
+		t.Fatalf("SAFETY VIOLATION: a pending tx must never carry committed content: %v", got)
 	}
 }
 

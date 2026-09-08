@@ -99,6 +99,7 @@ func NewServer(store *state.Store, chn *chain.Chain, mempool *tx.Mempool, cfg Co
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
+	mux.HandleFunc("GET /v1/blocks", s.handleBlocks)
 	mux.HandleFunc("GET /v1/blocks/{height}", s.handleBlock)
 	mux.HandleFunc("GET /v1/tx/{txid}", s.handleTx)
 	mux.HandleFunc("GET /v1/nullifier/{hash}", s.handleNullifier)

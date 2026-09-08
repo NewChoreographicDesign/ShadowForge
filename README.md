@@ -74,6 +74,33 @@ docker compose -f deployments/docker/docker-compose.yml up --build
 > real quorum-gated commits, growing the chain to height 12 in one run.
 > The transcript is reproducible with the local-process command above.
 
+Run the block explorer (Phase 3's roadmap item — a static, dependency-free
+frontend that talks directly to a live node's `pkg/query` HTTP API from
+your browser; see `cmd/explorer`'s own doc for why there's no server-side
+proxy and nothing new it exposes beyond what `pkg/query` already answers
+any stranger):
+
+```sh
+go run ./cmd/explorer -listen 127.0.0.1:8090 -query http://127.0.0.1:8081
+```
+
+Then open <http://127.0.0.1:8090>. Point `-query` at whichever node's
+`-query-listen` address you want to browse (a node's own default, `-query`'s
+own default here, and the Docker Compose topology's `validator2` all use
+`8081`). This was verified end to end in a headless browser (Playwright)
+against a real running node — real blocks, a real committed Transfer
+(shielded amount correctly withheld, its public fee shown), a real
+BankDeposit, a real Vote binding a real epoch-mint claim, a real
+NFTTransfer, real governance-proposal detail, and real nullifier/NFT/hold
+lookups all render correctly, and a real supply figure is computed purely
+from public, tallied mint proposals. `docker compose` also wires it up as
+an `explorer` service against `validator2`'s now-published query API
+(`http://localhost:8081` from the host, once `validator2`'s
+`-query-listen` is `0.0.0.0:8081` — see that service's own comment) — the
+compose change itself could not be exercised in this sandbox for the same
+no-Docker-daemon reason noted above, but it's the identical binary and
+flags verified working outside Docker.
+
 ## What's real here
 
 Every claim below is backed by a passing test in the corresponding
@@ -513,6 +540,9 @@ cmd/hello/           Phase 0 toolchain sanity binary
 cmd/shadowc/         ShadowRust CLI: parse, lint, interp, gen
 cmd/node/            L1 validator node entrypoint
 cmd/walletsim/       lightweight wallet traffic simulator (spec 6, Phase 2 net)
+cmd/wallet/          real end-user CLI: query, submit, vote, transfer, governance
+cmd/explorer/        static block explorer frontend (Phase 3), talks directly to pkg/query
+pkg/query/           real, read-only HTTP JSON API over a live node's chain state
 pkg/types/           canonical spec-4 data model structs
 pkg/decimal/         exact rational arithmetic
 pkg/crypto/          Dilithium3 (PQC) signatures, AEAD encryption

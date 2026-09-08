@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShadowForge Explorer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%97%86%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<script>
+  window.EXPLORER_DEFAULT_QUERY_BASE = "{{.DefaultQueryBase}}";
+</script>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark">&#9670;</span>
+      <span class="brand-name">ShadowForge Explorer</span>
+    </div>
+    <div class="node-control">
+      <label for="node-input">Node</label>
+      <input id="node-input" type="text" spellcheck="false" autocomplete="off">
+      <button id="node-apply">Connect</button>
+      <span id="node-status" class="status-dot status-unknown" title="connection status"></span>
+    </div>
+  </div>
+</header>
+
+<div class="privacy-banner">
+  <strong>Shielded by design.</strong> A Transfer's sender, receiver, and amount are never visible here or
+  anywhere else on the network — only a nullifier and output commitments (opaque hashes) are public. This
+  explorer shows exactly what any stranger can already see from <code>pkg/query</code>'s own public API,
+  nothing more, and nothing less. Governance, NFT, and Bank actions are transparent by protocol design, so
+  their real amounts and targets <em>are</em> shown.
+</div>
+
+<nav class="tabs">
+  <button class="tab-btn active" data-view="home">Blocks</button>
+  <button class="tab-btn" data-view="governance">Governance</button>
+  <button class="tab-btn" data-view="lookup">Lookup</button>
+  <button class="tab-btn" data-view="stats">Supply</button>
+</nav>
+
+<main id="app">
+  <section class="search-row">
+    <input id="search-input" type="text" placeholder="Block height / txid / nullifier / note / NFT id / hold id / proposal id" spellcheck="false" autocomplete="off">
+    <button id="search-btn">Search</button>
+  </section>
+
+  <section id="status-strip" class="status-strip"></section>
+
+  <section id="view-home" class="view active">
+    <div class="panel-head">
+      <h2>Recent blocks</h2>
+      <button id="blocks-refresh" title="refresh now">&#8635;</button>
+    </div>
+    <div id="blocks-list" class="blocks-list"></div>
+    <button id="blocks-more" class="load-more" hidden>Load older</button>
+  </section>
+
+  <section id="view-block" class="view">
+    <button class="back-btn" data-back="home">&larr; back to blocks</button>
+    <div id="block-detail"></div>
+  </section>
+
+  <section id="view-tx" class="view">
+    <button class="back-btn" data-back="home">&larr; back</button>
+    <div id="tx-detail"></div>
+  </section>
+
+  <section id="view-governance" class="view">
+    <div class="panel-head"><h2>Governance proposals</h2></div>
+    <div id="proposals-list" class="proposals-list"></div>
+  </section>
+
+  <section id="view-proposal" class="view">
+    <button class="back-btn" data-back="governance">&larr; back to proposals</button>
+    <div id="proposal-detail"></div>
+  </section>
+
+  <section id="view-lookup" class="view">
+    <div class="panel-head"><h2>Direct lookups</h2></div>
+    <p class="hint">These mirror pkg/query's own privacy-preserving endpoints exactly: a nullifier or note
+      lookup only ever answers yes/no, never a value or owner.</p>
+    <div class="lookup-grid">
+      <div class="lookup-card">
+        <h3>Nullifier</h3>
+        <input data-lookup="nullifier" type="text" placeholder="64-hex nullifier">
+        <button data-lookup-btn="nullifier">Check spent</button>
+        <div class="lookup-result" data-lookup-result="nullifier"></div>
+      </div>
+      <div class="lookup-card">
+        <h3>Note commitment</h3>
+        <input data-lookup="note" type="text" placeholder="64-hex commitment">
+        <button data-lookup-btn="note">Check exists</button>
+        <div class="lookup-result" data-lookup-result="note"></div>
+      </div>
+      <div class="lookup-card">
+        <h3>Validator NFT</h3>
+        <input data-lookup="nft" type="text" placeholder="64-hex NFT id">
+        <button data-lookup-btn="nft">Look up</button>
+        <div class="lookup-result" data-lookup-result="nft"></div>
+      </div>
+      <div class="lookup-card">
+        <h3>Bank hold</h3>
+        <input data-lookup="hold" type="text" placeholder="64-hex hold id">
+        <button data-lookup-btn="hold">Look up</button>
+        <div class="lookup-result" data-lookup-result="hold"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-stats" class="view">
+    <div class="panel-head"><h2>Supply</h2></div>
+    <p class="hint">Derived purely from public, tallied governance records (<code>/v1/proposals</code>) —
+      the sum of every passed, applied real epoch mint. This is safe to total precisely because minting is
+      transparent by design; individual shielded transfers never factor into it and can't be recovered from it.</p>
+    <div id="stats-body" class="stats-body"></div>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>Reads directly from a validator's own <code>pkg/query</code> HTTP API in your browser. No account, no
+    tracking, no server-side proxy — this page holds no state about you beyond what your browser's own
+    localStorage keeps for convenience (your chosen node address).</p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

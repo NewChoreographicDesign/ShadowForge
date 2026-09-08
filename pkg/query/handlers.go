@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
+	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
 
 // statusResponse answers /v1/status.
@@ -20,6 +21,78 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		HeadHash:  s.chn.HeadHash().String(),
 		GenesisMs: s.genesis,
 	})
+}
+
+// blocksResponse answers /v1/blocks?limit=&before= — a page of recently
+// committed blocks, newest first. Same safety reasoning as handleBlock's
+// own doc: every field of every block returned is data real BFT
+// consensus already broadcast to every peer, so paginating over them
+// reveals nothing new.
+type blocksResponse struct {
+	Blocks  []types.Block `json:"blocks"`
+	HasMore bool          `json:"has_more"`
+}
+
+const (
+	defaultBlocksLimit = 20
+	maxBlocksLimit     = 100
+)
+
+// handleBlocks answers /v1/blocks?limit=&before= — the block explorer's
+// "recent blocks" / "load older" feed. limit caps how many blocks come
+// back (default defaultBlocksLimit, capped at maxBlocksLimit); before, if
+// given, is a height cursor — the page starts just below it, letting a
+// caller page backward from wherever the previous page ended, rather
+// than always starting at the current head. Every height from 1 up to
+// the real chain head is guaranteed contiguous (chain.Append only ever
+// accepts the next height in sequence), so this never needs to skip
+// gaps — it stops exactly when it reaches height 0 (never a real stored
+// block; the pre-genesis sentinel HeadHeight starts at).
+func (s *Server) handleBlocks(w http.ResponseWriter, r *http.Request) {
+	limit := defaultBlocksLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	if limit > maxBlocksLimit {
+		limit = maxBlocksLimit
+	}
+
+	start := s.chn.HeadHeight()
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		n, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "before must be a non-negative integer")
+			return
+		}
+		if n == 0 {
+			writeJSON(w, http.StatusOK, blocksResponse{Blocks: []types.Block{}, HasMore: false})
+			return
+		}
+		start = n - 1
+	}
+
+	blocks := make([]types.Block, 0, limit)
+	for height := start; len(blocks) < limit; height-- {
+		b, found, err := s.store.GetBlock(height)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal error")
+			s.logf("query: list blocks at %d: %v", height, err)
+			return
+		}
+		if found {
+			blocks = append(blocks, b)
+		}
+		if height == 0 {
+			break
+		}
+	}
+	hasMore := len(blocks) > 0 && blocks[len(blocks)-1].Height > 1
+	writeJSON(w, http.StatusOK, blocksResponse{Blocks: blocks, HasMore: hasMore})
 }
 
 // handleBlock answers /v1/blocks/{height} with the full committed block —
@@ -56,6 +129,14 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 type txStatusResponse struct {
 	Status string  `json:"status"`
 	Height *uint64 `json:"height,omitempty"`
+	// Tx is the committed transaction's own full content — present only
+	// when Status == "committed". This is not a new leak: it is the
+	// exact same ShieldedTx already returned in full as part of that
+	// height's own /v1/blocks/{height} response (handleBlock's own doc),
+	// surfaced here too purely as a convenience so a caller who already
+	// knows a txid doesn't have to separately fetch and linear-scan the
+	// containing block's Batch to find it again.
+	Tx *types.ShieldedTx `json:"tx,omitempty"`
 }
 
 func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +153,18 @@ func (s *Server) handleTx(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if found {
-		writeJSON(w, http.StatusOK, txStatusResponse{Status: "committed", Height: &height})
+		resp := txStatusResponse{Status: "committed", Height: &height}
+		if b, blockFound, err := s.store.GetBlock(height); err != nil {
+			s.logf("query: get block %d for tx %s: %v", height, txid, err)
+		} else if blockFound {
+			for i := range b.Batch {
+				if b.Batch[i].TxID == txid {
+					resp.Tx = &b.Batch[i]
+					break
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
