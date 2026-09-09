@@ -37,10 +37,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
+	"github.com/shadowforge/shadowforge-l1/pkg/metrics"
 	"github.com/shadowforge/shadowforge-l1/pkg/state"
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
@@ -172,11 +175,62 @@ func (s *Server) Addr() string {
 	return s.addr
 }
 
+// statusRecordingWriter wraps a real http.ResponseWriter purely to
+// observe the status code it ends up writing — every actual byte still
+// flows straight through to the real writer, so this can never change
+// what a caller receives, only what loggingMiddleware reports afterward.
+type statusRecordingWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusRecordingWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func (s *Server) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-		s.logf("query: %s %s from %s", r.Method, r.URL.Path, remoteIP(r))
+		rec := &statusRecordingWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		s.logf("query: %s %s from %s -> %d", r.Method, r.URL.Path, remoteIP(r), rec.status)
+		metrics.ObserveQueryRequest(routeLabel(r.URL.Path), strconv.Itoa(rec.status))
 	})
+}
+
+// routeLabel collapses a real request path into its fixed route
+// pattern — the same shape NewServer registered it under — so a real
+// query API serving many distinct heights/hashes/ids over its lifetime
+// never explodes queryRequestsTotal's label cardinality (one series per
+// route, not one per value ever queried). An unrecognized path (already
+// a 404 from the mux itself before this middleware even runs — every
+// registered route is listed here) reports as "other" rather than its
+// own literal, unbounded value.
+func routeLabel(path string) string {
+	switch {
+	case path == "/v1/status":
+		return "/v1/status"
+	case path == "/v1/blocks":
+		return "/v1/blocks"
+	case strings.HasPrefix(path, "/v1/blocks/"):
+		return "/v1/blocks/{height}"
+	case strings.HasPrefix(path, "/v1/tx/"):
+		return "/v1/tx/{txid}"
+	case strings.HasPrefix(path, "/v1/nullifier/"):
+		return "/v1/nullifier/{hash}"
+	case strings.HasPrefix(path, "/v1/note/"):
+		return "/v1/note/{commitment}"
+	case strings.HasPrefix(path, "/v1/nft/"):
+		return "/v1/nft/{id}"
+	case strings.HasPrefix(path, "/v1/hold/"):
+		return "/v1/hold/{id}"
+	case path == "/v1/proposals":
+		return "/v1/proposals"
+	case strings.HasPrefix(path, "/v1/proposal/"):
+		return "/v1/proposal/{id}"
+	default:
+		return "other"
+	}
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

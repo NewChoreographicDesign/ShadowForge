@@ -101,6 +101,60 @@ compose change itself could not be exercised in this sandbox for the same
 no-Docker-daemon reason noted above, but it's the identical binary and
 flags verified working outside Docker.
 
+Run the real Prometheus metrics endpoint (`pkg/metrics`) any `cmd/node`
+already serves:
+
+```sh
+go run ./cmd/node -listen /ip4/127.0.0.1/tcp/4001 -metrics-listen 127.0.0.1:9100
+curl http://127.0.0.1:9100/metrics   # shadowforge_chain_height, _blocks_committed_total,
+                                       # _mempool_size, _online_validators, _node_info,
+                                       # _query_requests_total, plus the standard Go
+                                       # runtime/process collectors — all real, sampled
+                                       # from this node's own live state, nothing synthetic
+```
+
+Run the real, minimal status page (Phase 3's roadmap item — a small server
+that itself polls one or more nodes' real `/v1/status` on an interval and
+keeps a real, persisted uptime history; see `cmd/statuspage`/`pkg/statuscheck`'s
+own doc for why this, unlike the explorer, needs a real always-running
+poller rather than a browser-direct design):
+
+```sh
+go run ./cmd/statuspage -listen 127.0.0.1:8095 \
+  -nodes validator1=http://127.0.0.1:8081 \
+  -data /tmp/statuspage.json -interval 15s
+```
+
+Then open <http://127.0.0.1:8095>. Verified end to end in a headless
+browser against real running nodes, including one deliberately
+unreachable one: the up node showed its real height (including the
+`height: 0` case — an earlier version of `pkg/statuscheck.Check` used
+`omitempty` on that field, which silently dropped a real, legitimate zero
+height from the JSON response and rendered as "height undefined" in the
+browser; fixed, then reverified) and real latency, the unreachable one
+showed a real connection-refused error and 0% uptime, and the overall
+banner correctly reflected all three states (all up / partial / all
+down). History persists across a restart (`-data`) — verified by
+starting a second `Monitor` against the same file and confirming it
+loads the first one's real recorded check.
+
+`docker compose` wires up the complete monitoring/logging/status stack:
+Prometheus (`deployments/docker/prometheus/`) scrapes every validator-role
+node's `:9100`; Grafana (`deployments/docker/grafana/`) comes up with both
+a Prometheus and a Loki datasource and the "ShadowForge L1 — Real Node
+Metrics" dashboard already provisioned, no manual setup; Promtail ships
+every container's real stdout/stderr to Loki via the Docker socket
+(`docker_sd_configs`, Promtail's own documented mechanism — no
+logging-driver changes needed on any service); `statuspage` polls all
+three validator-role nodes over the compose network. `docker compose
+config` (a client-side render/validation that needs no daemon) confirms
+every service, volume mount, and cross-service reference resolves
+correctly; actually running the stack could not be exercised in this
+sandbox for the same no-Docker-daemon reason noted above. Real, publicly
+reachable hosting (a cloud VM/Vercel/etc.) is intentionally out of scope
+for this pass — nothing here provisions or points at any live
+infrastructure; that integration is planned for later.
+
 ## What's real here
 
 Every claim below is backed by a passing test in the corresponding
@@ -542,7 +596,10 @@ cmd/node/            L1 validator node entrypoint
 cmd/walletsim/       lightweight wallet traffic simulator (spec 6, Phase 2 net)
 cmd/wallet/          real end-user CLI: query, submit, vote, transfer, governance
 cmd/explorer/        static block explorer frontend (Phase 3), talks directly to pkg/query
+cmd/statuspage/      real, self-polling uptime status page (Phase 3)
 pkg/query/           real, read-only HTTP JSON API over a live node's chain state
+pkg/metrics/         real Prometheus instrumentation (chain height, mempool, query traffic)
+pkg/statuscheck/     real node-uptime poller + persisted history (cmd/statuspage's backend)
 pkg/types/           canonical spec-4 data model structs
 pkg/decimal/         exact rational arithmetic
 pkg/crypto/          Dilithium3 (PQC) signatures, AEAD encryption
@@ -560,7 +617,7 @@ pkg/governance/       genesis parameters, NFT-weighted voting
 pkg/govwallet/         real network-syncing client for anonymous voter-eligibility proofs (Kind Vote/VoteReveal)
 pkg/container/        enterprise L1 container subspace
 pkg/silent/            Poisson silent-TX padding + wallet spike detection (spec 15.4)
-deployments/docker/   Dockerfile + docker-compose.yml (4-node network)
+deployments/docker/   Dockerfile + docker-compose.yml (4-node network, monitoring/logging stack, status page)
 docs/                 architecture notes, spec source, scope decisions
 examples/             sample .sr programs
 ```

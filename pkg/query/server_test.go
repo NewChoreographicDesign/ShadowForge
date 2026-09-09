@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/query"
@@ -16,6 +18,40 @@ import (
 	"github.com/shadowforge/shadowforge-l1/pkg/tx"
 	"github.com/shadowforge/shadowforge-l1/pkg/types"
 )
+
+// queryRequestsMetric reads the real, current value of pkg/metrics'
+// shadowforge_query_requests_total{path,status} series via Prometheus's
+// own public Gather API — the same interface a real scrape uses —
+// without pkg/query needing to expose any test-only hook of its own.
+// Missing means never observed, not an error (a fresh counter series
+// only exists once first incremented).
+func queryRequestsMetric(t *testing.T, path, status string) float64 {
+	t.Helper()
+	mfs, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "shadowforge_query_requests_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			var gotPath, gotStatus string
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "path":
+					gotPath = l.GetValue()
+				case "status":
+					gotStatus = l.GetValue()
+				}
+			}
+			if gotPath == path && gotStatus == status {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
 
 // testEnv wires up a real store + chain + mempool and starts a real query
 // Server bound to a real loopback socket (port 0, OS-assigned) — every
@@ -702,7 +738,37 @@ func TestProposalsListsAllReal(t *testing.T) {
 	}
 }
 
-// --- cross-cutting: CORS, rate limiting ---
+// --- cross-cutting: CORS, rate limiting, metrics ---
+
+// TestRequestsObservedInMetricsWithLowCardinalityLabels proves real HTTP
+// requests actually increment pkg/metrics' real counter (not a mock),
+// and that distinct dynamic values (two different heights) collapse
+// into the same route label rather than each minting its own series —
+// the real defense against unbounded label cardinality on a public node
+// that will be queried with many distinct heights/hashes/ids over its
+// lifetime.
+func TestRequestsObservedInMetricsWithLowCardinalityLabels(t *testing.T) {
+	env := newTestEnv(t)
+	appendBlock(t, env, nil) // real height 1, so both 0 and 1 exist
+	before200 := queryRequestsMetric(t, "/v1/blocks/{height}", "200")
+	before404 := queryRequestsMetric(t, "/v1/blocks/{height}", "404")
+
+	env.get(t, "/v1/blocks/0")   // real, existing genesis height -> 200
+	env.get(t, "/v1/blocks/1")   // a different height, same route label -> 200
+	env.get(t, "/v1/blocks/999") // not found -> 404
+
+	if got := queryRequestsMetric(t, "/v1/blocks/{height}", "200") - before200; got != 2 {
+		t.Fatalf("expected 2 new 200s under the shared route label, got %v", got)
+	}
+	if got := queryRequestsMetric(t, "/v1/blocks/{height}", "404") - before404; got != 1 {
+		t.Fatalf("expected 1 new 404 under the shared route label, got %v", got)
+	}
+	// The literal, unbounded heights must never have minted their own
+	// label values.
+	if got := queryRequestsMetric(t, "/v1/blocks/0", "200"); got != 0 {
+		t.Fatalf("expected no series keyed by the literal path, got %v", got)
+	}
+}
 
 func TestCORSHeaderPresentOnGET(t *testing.T) {
 	env := newTestEnv(t)

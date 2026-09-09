@@ -23,11 +23,28 @@
 # one entry point, so they stay star-connected to a single validator.
 #
 # Run: docker compose -f deployments/docker/docker-compose.yml up --build
-# Then open http://localhost:8090 for the block explorer (Phase 3's
-# roadmap item) — it's a static page that runs entirely in your browser
-# and talks directly to validator2's published query API
-# (http://localhost:8081, see validator2's -query-listen/ports below),
-# so nothing about it needs to run inside the compose network itself.
+# Then:
+#   - http://localhost:8090  block explorer (Phase 3's roadmap item) — a
+#     static page that runs entirely in your browser and talks directly
+#     to validator2's published query API (http://localhost:8081, see
+#     validator2's -query-listen/ports below), so nothing about it needs
+#     to run inside the compose network itself.
+#   - http://localhost:3000  Grafana (admin/admin on first login) — the
+#     "ShadowForge L1 — Real Node Metrics" dashboard is pre-provisioned
+#     (deployments/docker/grafana/), real Prometheus metrics on the left,
+#     real aggregated container logs (via Loki/Promtail) at the bottom.
+#   - http://localhost:9090  Prometheus's own UI, if you want to run ad
+#     hoc queries against the same real metrics Grafana graphs.
+#   - http://localhost:8095  status page (cmd/statuspage) — this
+#     container itself polls validator1/validator2/sentinel1's real
+#     /v1/status every 15s and renders real, persisted uptime history
+#     (statuspage_data volume), unlike the explorer's browser-direct
+#     design: uptime has to be observed continuously by something that
+#     keeps running whether or not anyone has the page open.
+# Every validator-role node publishes its own real Prometheus metrics
+# (pkg/metrics) on :9100, which prometheus/prometheus.yml scrapes; every
+# container's real stdout/stderr is shipped to Loki by promtail via the
+# Docker socket (no logging-driver changes needed on any service).
 services:
   validator1:
     build:
@@ -38,6 +55,12 @@ services:
       - -listen=/ip4/0.0.0.0/tcp/4001
       - -announce-file=/shared/validator1.addr
       - -skip-zk-setup # keep the 4-node smoke test fast; omit to exercise real Transfer proofs
+      # 0.0.0.0, not the loopback-only default: statuspage (another
+      # container on this same network) needs to reach it. Not published
+      # to the host (no ports: entry) — nothing outside this compose
+      # network needs it, unlike validator2's own identical choice below.
+      - -query-listen=0.0.0.0:8081
+      - -metrics-listen=0.0.0.0:9100
     volumes:
       - shared:/shared
 
@@ -57,6 +80,7 @@ services:
       # the host (via ports: below, for the explorer's browser-side
       # fetches) and, incidentally, to its sibling containers.
       - -query-listen=0.0.0.0:8081
+      - -metrics-listen=0.0.0.0:9100
     ports:
       - "8081:8081"
     volumes:
@@ -76,6 +100,9 @@ services:
       - -announce-file=/shared/sentinel1.addr
       - -sentinel
       - -skip-zk-setup
+      # Same reasoning as validator1's identical addition above.
+      - -query-listen=0.0.0.0:8081
+      - -metrics-listen=0.0.0.0:9100
     volumes:
       - shared:/shared
     depends_on:
@@ -113,5 +140,84 @@ services:
     depends_on:
       - validator2
 
+  # --- Monitoring & log aggregation (Phase 3's "hosting, monitoring, log
+  # aggregation, status page" roadmap item) ---
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - validator1
+      - validator2
+      - sentinel1
+
+  loki:
+    image: grafana/loki:3.1.0
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+
+  promtail:
+    image: grafana/promtail:3.1.0
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      # Read-only access to the real Docker socket is how promtail's own
+      # documented docker_sd_configs discovers and tails every sibling
+      # container's real stdout/stderr — no logging-driver change needed
+      # on validator1/validator2/sentinel1/walletsim/explorer themselves.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+
+  statuspage:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/statuspage"]
+    command:
+      - -listen=0.0.0.0:8095
+      # In-network service names, unlike the explorer's -query (that one
+      # reaches a viewer's browser; this one is polled by this container
+      # itself — see cmd/statuspage's own doc on why it needs a real,
+      # continuously-running poller rather than the explorer's
+      # browser-direct-fetch design).
+      - -nodes=validator1=http://validator1:8081,validator2=http://validator2:8081,sentinel1=http://sentinel1:8081
+      - -data=/data/statuspage.json
+      - -interval=15s
+    ports:
+      - "8095:8095"
+    volumes:
+      - statuspage_data:/data
+    depends_on:
+      - validator1
+      - validator2
+      - sentinel1
+
 volumes:
   shared:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  statuspage_data:

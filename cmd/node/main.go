@@ -29,6 +29,7 @@ import (
 	"log"
 	mathrand "math/rand"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,10 +37,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"github.com/shadowforge/shadowforge-l1/pkg/chain"
 	"github.com/shadowforge/shadowforge-l1/pkg/consensus"
 	"github.com/shadowforge/shadowforge-l1/pkg/crypto"
 	"github.com/shadowforge/shadowforge-l1/pkg/decimal"
+	"github.com/shadowforge/shadowforge-l1/pkg/metrics"
 	shadownet "github.com/shadowforge/shadowforge-l1/pkg/net"
 	"github.com/shadowforge/shadowforge-l1/pkg/oracle"
 	"github.com/shadowforge/shadowforge-l1/pkg/query"
@@ -85,6 +89,7 @@ func main() {
 	disableOracle := flag.Bool("disable-oracle", false, "disable real oracle price/ATR verification of BankDeposit/BankWithdraw claims (spec 11.3) — for isolated test networks without internet access")
 	oracleMaxDisagreement := flag.String("oracle-max-disagreement", "0.02", "fractional bound (e.g. 0.02 = 2%) beyond which the oracle quorum's real sources are treated as disagreeing (spec 11.3)")
 	queryListen := flag.String("query-listen", "127.0.0.1:8081", "address for the read-only HTTP query API (chain status, tx status, balances-equivalent lookups) — empty disables it. Binding a non-loopback address deliberately exposes it beyond this machine; see pkg/query's doc for exactly what it does and does not reveal")
+	metricsListen := flag.String("metrics-listen", "127.0.0.1:9100", "address for the real Prometheus /metrics endpoint (pkg/metrics) — empty disables it. Same safe-default-loopback stance as -query-listen: binding a non-loopback address is this node operator's explicit choice to publish it")
 	pohAttestorKeys := flag.String("poh-attestor-keys", "", "comma-separated hex-encoded Dilithium public keys this node trusts to sign real proof-of-humanity attestations (spec 10.1) for Kind NFTMint. Empty (the default) means no attestor is trusted, so every NFTMint attempt is rejected — this also means nobody can newly qualify for real governance voting eligibility (TxVote/TxVoteReveal now require a real, PoH-verified NFT) until at least one is configured; see 'wallet zk-setup'-adjacent 'wallet poh-attest' for the attestor-side tool")
 	flag.Parse()
 
@@ -233,6 +238,7 @@ func main() {
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
 	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mintZK, stakeZK, unstakeZK, mempool, pk, sk, *sentinelFlag, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
+	metrics.SetNodeInfo(role, vnode.Identity().String())
 
 	for _, addr := range strings.Split(*bootstrap, ",") {
 		addr = strings.TrimSpace(addr)
@@ -266,6 +272,7 @@ func main() {
 	vnode.Start(ctx)
 	go epochLoop(ctx, consensus.GenesisTime(*genesisMs))
 	go chainStatusLoop(ctx, vnode)
+	go metricsLoop(ctx, vnode, mempool)
 
 	if *queryListen != "" {
 		qsrv := query.NewServer(store, chn, mempool, query.Config{
@@ -278,6 +285,14 @@ func main() {
 		}
 		if !isLoopback(*queryListen) {
 			log.Printf("WARNING: query API bound to a non-loopback address (%s) — it is now reachable by anyone who can route to this machine. See pkg/query's doc comment for exactly what it does and does not expose.", *queryListen)
+		}
+	}
+	if *metricsListen != "" {
+		if err := startMetricsServer(ctx, *metricsListen); err != nil {
+			log.Fatalf("start metrics server: %v", err)
+		}
+		if !isLoopback(*metricsListen) {
+			log.Printf("WARNING: metrics endpoint bound to a non-loopback address (%s) — it is now reachable by anyone who can route to this machine. See pkg/metrics's doc comment for exactly what it exposes.", *metricsListen)
 		}
 	}
 	if *sentinelFlag {
@@ -774,4 +789,62 @@ func chainStatusLoop(ctx context.Context, vnode *validator.Node) {
 			}
 		}
 	}
+}
+
+// metricsLoop periodically samples this node's own real, live state
+// (chain height, mempool depth, online validator count) into pkg/
+// metrics' gauges, and credits blocksCommittedTotal with the real height
+// delta since the last sample — mirroring chainStatusLoop's own
+// "^uint64(0) means no baseline yet" sentinel so a restart never credits
+// blocks this process didn't itself observe getting committed.
+func metricsLoop(ctx context.Context, vnode *validator.Node, mempool *tx.Mempool) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	lastHeight := ^uint64(0)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h := vnode.Chain().HeadHeight()
+			metrics.SetChainHeight(h)
+			metrics.SetMempoolSize(mempool.Len())
+			metrics.SetOnlineValidators(vnode.OnlineValidatorCount(time.Now()))
+			if lastHeight != ^uint64(0) && h > lastHeight {
+				metrics.AddBlocksCommitted(h - lastHeight)
+			}
+			lastHeight = h
+		}
+	}
+}
+
+// startMetricsServer binds addr and serves promhttp.Handler() (the real
+// Prometheus text-exposition format over pkg/metrics' collectors, plus
+// the standard Go runtime/process collectors promauto's default
+// registry always includes) until ctx is done. It blocks until the
+// listener is confirmed bound, mirroring pkg/query.Server.Start's own
+// "don't log ready before it's true" contract.
+func startMetricsServer(ctx context.Context, addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	srv := &http.Server{Handler: mux}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("metrics: serve error: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("metrics: shutdown error: %v", err)
+		}
+	}()
+	log.Printf("metrics: listening on %s (/metrics)", ln.Addr())
+	return nil
 }

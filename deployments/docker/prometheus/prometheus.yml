@@ -1,0 +1,17 @@
+# Real Prometheus scrape config for the Phase 3 monitoring stack
+# (deployments/docker/docker-compose.yml's prometheus service). Every
+# target below is a real cmd/node process's own -metrics-listen endpoint
+# (pkg/metrics) — nothing here is a placeholder or example.com target.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: shadowforge-nodes
+    static_configs:
+      - targets:
+          - validator1:9100
+          - validator2:9100
+          - sentinel1:9100
+        labels:
+          network: shadowforge-local-compose

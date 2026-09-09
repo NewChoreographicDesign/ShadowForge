@@ -449,6 +449,16 @@ func (n *Node) Mempool() *tx.Mempool { return n.mempool }
 // the caller's own logging.
 func (n *Node) Net() *shadownet.Node { return n.net }
 
+// OnlineValidatorCount is the real number of validator identities (any
+// role — civilian or sentinel) this node currently observes as online
+// via heartbeat: read-only monitoring access to the exact same
+// heartbeat-derived set committee assignment (onlineSet) already uses
+// internally, for a real, live "online validators" gauge (see
+// pkg/metrics).
+func (n *Node) OnlineValidatorCount(now time.Time) int {
+	return len(n.onlineSet(now))
+}
+
 // ReassembledMegabatch returns the real, wire-reassembled outage-recovery
 // megabatch a peer announced for height, if this node has completed
 // reassembling one — real transparency into what a recovery round claims

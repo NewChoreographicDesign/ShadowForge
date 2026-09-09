@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShadowForge Network Status</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%97%86%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<script>
+  window.STATUSPAGE_REFRESH_SECONDS = {{.RefreshSeconds}};
+</script>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">&#9670;</span>
+    <span class="brand-name">ShadowForge Network Status</span>
+  </div>
+  <div class="updated" id="updated">connecting…</div>
+</header>
+
+<div id="overall-banner" class="overall-banner banner-unknown">checking real node status…</div>
+
+<main id="nodes"></main>
+
+<footer class="foot">
+  <p>Polled directly from each node's own real <code>pkg/query</code> <code>/v1/status</code> endpoint by this
+    page's own server (<code>cmd/statuspage</code>, <code>pkg/statuscheck</code>) — a real, timestamped check
+    every <span id="interval-label">?</span>, not a simulation. A node that doesn't answer is recorded as down,
+    honestly, not silently skipped.</p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
