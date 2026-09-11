@@ -112,6 +112,38 @@ compose change itself could not be exercised in this sandbox for the same
 no-Docker-daemon reason noted above, but it's the identical binary and
 flags verified working outside Docker.
 
+Run the real validator-NFT mint page (`cmd/mintpage`) — a web UI over the
+exact same real signing and submission `wallet identity`/`wallet
+poh-attest`/`wallet nft-mint` already do from a terminal (same
+`pkg/walletkey` keystore format, same `pkg/nft` attestation, same
+`pkg/txbuilder`/`pkg/txclient` submit-and-confirm path — nothing here is a
+second implementation). It generates a matching pair of identity files
+(an encrypted wallet keystore and a node `-key-file`) so the address that
+ends up owning the NFT is the same one your validator heartbeats as, and
+includes an "attestor panel" for whoever is manually vouching for
+proof-of-humanity (spec 10.1) to sign attestations from the same page:
+
+```sh
+go run ./cmd/mintpage -listen 127.0.0.1:8096 -default-query http://127.0.0.1:8081
+```
+
+Then open <http://127.0.0.1:8096>. This is loopback-only by default —
+every request can carry a real wallet passphrase in plaintext (the same
+trust boundary as typing one into a local CLI prompt), and the binary
+does no TLS itself. Verified end to end against a real 2-node local
+network (`pkg/consensus.MinCommitteeSize` is 2, so a lone node can never
+form quorum with itself — a real, correct BFT property, not a bug): a
+real attestor identity was generated, the target node was started with
+`-poh-attestor-keys` trusting it, a real attestation was signed through
+the page's attestor panel, and the resulting `TxNFTMint` was submitted,
+independently re-verified, and committed at a real height with two real
+validator votes — `NFTMintPublicInputs.Owner` in the committed block
+matches the requesting identity exactly. `docker compose` wires this up
+too (`mintpage` service, `http://localhost:8096`, bootstrap prefilled
+from `validator1`'s own announce file); minting only matters there once a
+real `-poh-attestor-keys` is added to the validator-role nodes' commands,
+since they otherwise run with `-skip-nft-check` for smoke-test speed.
+
 Run the real Prometheus metrics endpoint (`pkg/metrics`) any `cmd/node`
 already serves:
 
@@ -628,6 +660,7 @@ cmd/walletsim/       lightweight wallet traffic simulator (spec 6, Phase 2 net)
 cmd/wallet/          real end-user CLI: query, submit, vote, transfer, governance
 cmd/explorer/        static block explorer frontend (Phase 3), talks directly to pkg/query
 cmd/statuspage/      real, self-polling uptime status page (Phase 3)
+cmd/mintpage/         real validator-NFT mint web UI (identity, PoH attestation, mint)
 pkg/query/           real, read-only HTTP JSON API over a live node's chain state
 pkg/metrics/         real Prometheus instrumentation (chain height, mempool, query traffic)
 pkg/statuscheck/     real node-uptime poller + persisted history (cmd/statuspage's backend)

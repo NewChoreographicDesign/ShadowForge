@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShadowForge Validator NFT Mint</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%E2%97%86%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<script>
+  window.MINTPAGE_DEFAULT_BOOTSTRAP = "{{.DefaultBootstrap}}";
+  window.MINTPAGE_DEFAULT_QUERY = "{{.DefaultQuery}}";
+</script>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">&#9670;</span>
+    <span class="brand-name">ShadowForge Validator NFT Mint</span>
+  </div>
+</header>
+
+<main class="wrap">
+
+<p class="lede">
+  This mints the real, free, one-per-wallet soulbound <b>validator NFT</b> (spec 10.1) —
+  the credential a wallet needs before a node running as that identity can heartbeat, join a
+  committee, or vote (spec 4.5/10.1/243). It is a functional access credential, not artwork:
+  there is no image attached to it. Every step below calls this page's own server, which
+  performs the exact same real signing and submission <code>wallet identity</code> /
+  <code>wallet poh-attest</code> / <code>wallet nft-mint</code> do from the command line —
+  nothing here is simulated.
+</p>
+
+<section class="card" id="step1">
+  <h2>1. Your identity</h2>
+  <p class="hint">
+    The address that ends up owning the NFT must be the <b>same identity your validator node
+    runs as</b> (its <code>-key-file</code>). Generate a fresh one here and you'll get both a
+    wallet keystore <i>and</i> a matching node identity file in one step — or load an existing
+    keystore below if you already have one.
+  </p>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="gen">Generate new</button>
+    <button class="tab" data-tab="load">Load existing</button>
+  </div>
+
+  <div class="tab-panel" id="tab-gen">
+    <label>Passphrase (protects the keystore file, min 8 chars)
+      <input type="password" id="gen-passphrase" autocomplete="new-password">
+    </label>
+    <button id="gen-btn">Generate identity</button>
+    <div class="result" id="gen-result" hidden></div>
+  </div>
+
+  <div class="tab-panel hidden" id="tab-load">
+    <label>Keystore file (walletkey.json)
+      <input type="file" id="load-file" accept=".json">
+    </label>
+    <button id="load-btn">Load</button>
+    <div class="result" id="load-result" hidden></div>
+  </div>
+
+  <div class="identity-banner" id="identity-banner" hidden>
+    <span>Active identity:</span> <code id="identity-address"></code>
+  </div>
+</section>
+
+<section class="card" id="step2">
+  <h2>2. Proof-of-humanity attestation</h2>
+  <p class="hint">
+    A trusted attestor signs a real, time-limited claim that this address passed a real
+    proof-of-humanity check (spec 10.1 — that check itself happens by whatever real means the
+    attestor uses; this page never decides it). Pick a nonce for this mint attempt (any number
+    you haven't used before for this identity works — the default is fine), then either run the
+    attestor panel below yourself, or send your address + nonce to whoever runs it and paste
+    back what they give you.
+  </p>
+
+  <label>Nonce for this mint attempt
+    <input type="number" id="mint-nonce" min="0" step="1" value="1">
+  </label>
+
+  <details id="attestor-panel">
+    <summary>Attestor panel (run this if you are the attestor)</summary>
+    <div class="attestor-body">
+      <label>Attestor's own keystore file
+        <input type="file" id="attest-keystore" accept=".json">
+      </label>
+      <label>Attestor passphrase
+        <input type="password" id="attest-passphrase" autocomplete="current-password">
+      </label>
+      <label>Requester's address (hex)
+        <input type="text" id="attest-owner" placeholder="prefilled from step 1 once you have an identity">
+      </label>
+      <label>Nonce (must match step 2's nonce above)
+        <input type="number" id="attest-nonce" min="0" step="1">
+      </label>
+      <button id="attest-btn">Sign attestation</button>
+      <div class="result" id="attest-result" hidden></div>
+    </div>
+  </details>
+
+  <div class="grid2">
+    <label>Attestor public key (hex)
+      <input type="text" id="mint-attestor-pubkey">
+    </label>
+    <label>Attestation signature (hex)
+      <input type="text" id="mint-attestation-sig">
+    </label>
+    <label>Attestation issued-at (unix ms)
+      <input type="number" id="mint-issued-at-ms">
+    </label>
+  </div>
+</section>
+
+<section class="card" id="step3">
+  <h2>3. Mint</h2>
+  <p class="hint">
+    Submits the real, signed mint transaction to a live node and waits for it to confirm
+    committed — the same broadcast-and-confirm path <code>wallet nft-mint</code> uses.
+  </p>
+
+  <div class="grid2">
+    <label>Bootstrap peer multiaddr
+      <input type="text" id="mint-bootstrap" placeholder="/ip4/127.0.0.1/tcp/4001/p2p/...">
+    </label>
+    <label>Query API URL(s), comma-separated
+      <input type="text" id="mint-query" placeholder="http://127.0.0.1:8081">
+    </label>
+  </div>
+
+  <label>Your keystore file (from step 1)
+    <input type="file" id="mint-keystore" accept=".json">
+  </label>
+  <label>Your passphrase
+    <input type="password" id="mint-passphrase" autocomplete="current-password">
+  </label>
+
+  <button id="mint-btn">Mint NFT</button>
+  <div class="result" id="mint-result" hidden></div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <p>Every field on this page is submitted to this page's own server and processed with the
+    real <code>pkg/walletkey</code> / <code>pkg/nft</code> / <code>pkg/txbuilder</code> /
+    <code>pkg/txclient</code> packages (<code>cmd/mintpage</code>) — the same code
+    <code>wallet identity</code>, <code>wallet poh-attest</code>, and <code>wallet nft-mint</code>
+    run from a terminal. Passphrases are never written to disk unencrypted and never logged.
+    Keep this page on loopback / behind your own TLS unless you know what you're doing.</p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -29,6 +29,17 @@
 #     to validator2's published query API (http://localhost:8081, see
 #     validator2's -query-listen/ports below), so nothing about it needs
 #     to run inside the compose network itself.
+#   - http://localhost:8096  validator-NFT mint page (cmd/mintpage) — the
+#     real spec-10.1 mint flow (identity, proof-of-humanity attestation,
+#     mint) as a web UI instead of the 'wallet' CLI. Its bootstrap peer is
+#     prefilled from validator1's own announce file, same mechanism as
+#     every other service here. Minting only matters for real once at
+#     least one node trusts a real attestor key (-poh-attestor-keys,
+#     see validator1/validator2/sentinel1's commands below) — every
+#     validator-role node here runs with -skip-nft-check for smoke-test
+#     speed, so this network doesn't require a real mint before a node
+#     joins consensus; add a real -poh-attestor-keys and drop
+#     -skip-nft-check on the nodes you want to actually enforce it.
 #   - http://localhost:3000  Grafana (admin/admin on first login) — the
 #     "ShadowForge L1 — Real Node Metrics" dashboard is pre-provisioned
 #     (deployments/docker/grafana/), real Prometheus metrics on the left,
@@ -147,6 +158,26 @@ services:
     ports:
       - "8090:8090"
     depends_on:
+      - validator2
+
+  mintpage:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile
+    entrypoint: ["/usr/local/bin/mintpage"]
+    command:
+      - -listen=0.0.0.0:8096
+      - -default-bootstrap-file=/shared/validator1.addr
+      # Host-visible, not the in-network service name: like explorer's own
+      # -query above, this is fetched by a viewer's browser, which runs on
+      # the host, not inside this compose network.
+      - -default-query=http://localhost:8081
+    ports:
+      - "8096:8096"
+    volumes:
+      - shared:/shared
+    depends_on:
+      - validator1
       - validator2
 
   # --- Monitoring & log aggregation (Phase 3's "hosting, monitoring, log
