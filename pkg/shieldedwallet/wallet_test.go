@@ -145,6 +145,41 @@ func (n *testNetwork) commit(t *testing.T, txn types.ShieldedTx) uint64 {
 	return b.Height
 }
 
+// appendDirect commits txn straight to the real chain, bypassing Stage 2
+// well-formedness (signature, fee commitment) entirely — used only for a
+// real, chain-committed genesis-funding event, matching cmd/wallet's own
+// identical end-to-end transfer test: a real chain's genesis coinbase is
+// never itself a signed, fee-paying user transaction either.
+func (n *testNetwork) appendDirect(t *testing.T, txn types.ShieldedTx) {
+	t.Helper()
+	lookup := func(id types.NFTID) (crypto.DilithiumPublicKey, bool) {
+		switch id {
+		case n.v1id:
+			return n.v1pk, true
+		case n.v2id:
+			return n.v2pk, true
+		}
+		return nil, false
+	}
+	b := n.chn.NextBlock(0, []types.ShieldedTx{txn}, types.Hash{1}, types.Hash{2}, types.Hash{}, n.v1id, time.Now().UnixMilli())
+	candidate := types.HashBlock(b)
+	sig1, err := crypto.DilithiumSign(n.v1sk, candidate[:])
+	if err != nil {
+		t.Fatalf("sign v1: %v", err)
+	}
+	sig2, err := crypto.DilithiumSign(n.v2sk, candidate[:])
+	if err != nil {
+		t.Fatalf("sign v2: %v", err)
+	}
+	b.Votes = []types.Vote{
+		{Validator: n.v1id, StateRoot: candidate, Sig: types.DilithiumSig(sig1)},
+		{Validator: n.v2id, StateRoot: candidate, Sig: types.DilithiumSig(sig2)},
+	}
+	if err := n.chn.Append(b, []types.NFTID{n.v1id, n.v2id}, lookup); err != nil {
+		t.Fatalf("append direct: %v", err)
+	}
+}
+
 func newTestWallet(t *testing.T, net *testNetwork) *shieldedwallet.Wallet {
 	t.Helper()
 	pk, sk, err := crypto.GenerateDilithiumKey()
@@ -364,6 +399,101 @@ func TestWalletToWalletTransferEndToEnd(t *testing.T) {
 	}
 	if got := other.Balance(); got != 10 {
 		t.Fatalf("expected other to discover a real 10-value note from the receiver's own transfer, got balance %d", got)
+	}
+}
+
+// TestFreshResyncDropsAlreadySpentNotes proves a real, previously-latent
+// bug this task found and fixed: pkg/shieldedwallet's own design
+// deliberately makes every fresh process resync from genesis rather than
+// persist local state (see cmd/wallet's loadShieldedWallet doc) — but a
+// brand-new Wallet's very first Sync used to replay a spent note's
+// original output commitment, decrypt its own old memo again, and record
+// it as spendable, with nothing to ever notice a later block in that
+// same replay had already consumed it. A real user running 'wallet
+// balance' after 'wallet transfer' would see a permanently inflated
+// total. Fixed by dropSpentLocked, called from replayBlock for every
+// replayed Transfer's own consumed Nullifiers. This test builds a
+// second, brand-new Wallet sharing the first's real keys and proves ITS
+// first-ever Sync, from genesis, already reflects the spend.
+func TestFreshResyncDropsAlreadySpentNotes(t *testing.T) {
+	net := newTestNetwork(t)
+
+	pk, sk, err := crypto.GenerateDilithiumKey()
+	if err != nil {
+		t.Fatalf("generate dilithium: %v", err)
+	}
+	xsk, err := stdecdh.X25519().GenerateKey(stdrand.Reader)
+	if err != nil {
+		t.Fatalf("generate x25519: %v", err)
+	}
+	sender, err := shieldedwallet.New(pk, sk, xsk.PublicKey(), xsk, shieldedwallet.Config{QueryBase: net.queryURL})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	receiver := newTestWallet(t, net)
+
+	// Fund sender with a real, chain-committed genesis event — not the
+	// package's own off-chain ImportCanonicalNote bypass, since this test
+	// specifically needs a later, brand-new wallet's from-genesis Sync to
+	// discover these notes by replaying an actual block.
+	values := []uint64{60, 40}
+	secrets := make([]zk.NoteSecret, len(values))
+	for i, v := range values {
+		secrets[i] = mkNote(t, v)
+	}
+	outCommits := make([]types.Hash, len(secrets))
+	receiverPubs := make([]*stdecdh.PublicKey, len(secrets))
+	for i, s := range secrets {
+		outCommits[i] = types.Hash(zk.ToBytes32(s.Commitment()))
+		if _, err := net.zkTree.Insert(s.Commitment()); err != nil {
+			t.Fatalf("seed canonical tree: %v", err)
+		}
+		receiverPubs[i] = xsk.PublicKey()
+	}
+	root, err := net.zkTree.Root()
+	if err != nil {
+		t.Fatalf("root: %v", err)
+	}
+	net.zkRoots.Record(root)
+	genesisMemo, err := shieldedwallet.EncryptMemos(receiverPubs, secrets)
+	if err != nil {
+		t.Fatalf("encrypt genesis memos: %v", err)
+	}
+	genesisTx := types.ShieldedTx{
+		Kind:                 types.TxTransfer,
+		Commitments:          outCommits,
+		Nullifier:            types.SumHash([]byte("shieldedwallet-test-genesis-funding")),
+		TransferPublicInputs: &types.TransferPublicInputs{MerkleRoot: types.Hash(zk.ToBytes32(root)), OutCommits: outCommits},
+		Memo:                 genesisMemo,
+	}
+	genesisTx.TxID = types.ComputeTxID(genesisTx.Proof, genesisTx.Commitments, genesisTx.Nullifier)
+	net.appendDirect(t, genesisTx)
+
+	if err := sender.Sync(context.Background()); err != nil {
+		t.Fatalf("sender sync: %v", err)
+	}
+	if sender.Balance() != 100 {
+		t.Fatalf("expected sender's real genesis balance to be 100, got %d", sender.Balance())
+	}
+
+	txn, err := sender.BuildTransfer(getZKSystem(t), receiver.ShieldedPublicKey(), 70, 5)
+	if err != nil {
+		t.Fatalf("build transfer: %v", err)
+	}
+	net.commit(t, txn)
+
+	fresh, err := shieldedwallet.New(pk, sk, xsk.PublicKey(), xsk, shieldedwallet.Config{QueryBase: net.queryURL})
+	if err != nil {
+		t.Fatalf("new fresh: %v", err)
+	}
+	if err := fresh.Sync(context.Background()); err != nil {
+		t.Fatalf("fresh sync: %v", err)
+	}
+	if got := fresh.Balance(); got != 25 {
+		t.Fatalf("expected a fresh, from-genesis resync to reflect the real spend and report only the real 25-value change, got %d (a stale resync would double-count the already-spent 60+40, reporting 125)", got)
+	}
+	if fresh.KnownNoteCount() != 1 {
+		t.Fatalf("expected exactly 1 known note after a fresh resync, got %d", fresh.KnownNoteCount())
 	}
 }
 

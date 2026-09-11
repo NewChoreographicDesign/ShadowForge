@@ -196,6 +196,15 @@ func (w *Wallet) replayBlock(b types.Block) {
 		if t.Kind != types.TxTransfer || t.TransferPublicInputs == nil {
 			continue
 		}
+		// A real transfer's own consumed inputs — checked against every
+		// currently-known owned note's real nullifier before this
+		// transaction's outputs are considered, so a note this wallet
+		// spent in an earlier process (or, in theory, had spent out from
+		// under it) is dropped from a later, fresh Sync exactly as the
+		// ownedNote.nullifier field's own doc promises, rather than
+		// silently double-counted forever by every resync after the one
+		// that first discovered it.
+		w.dropSpentLocked(t.TransferPublicInputs.Nullifiers)
 		memos, _ := UnpackMemos(t.Memo) // a malformed/absent memo just means no notes recovered from it
 		for i, c := range t.TransferPublicInputs.OutCommits {
 			elem := zk.FieldElementFromBytes32(c)
@@ -222,6 +231,25 @@ func (w *Wallet) replayBlock(b types.Block) {
 				continue
 			}
 			w.notes[c] = &ownedNote{secret: secret, index: idx, nullifier: types.Hash(zk.ToBytes32(secret.Nullifier()))}
+		}
+	}
+}
+
+// dropSpentLocked removes any currently-known owned note whose real
+// nullifier appears in nullifiers — a real committed Transfer's own
+// consumed inputs, replayed from chain data exactly like every other
+// honest wallet independently does. Callers must hold w.mu.
+func (w *Wallet) dropSpentLocked(nullifiers []types.Hash) {
+	if len(nullifiers) == 0 || len(w.notes) == 0 {
+		return
+	}
+	spent := make(map[types.Hash]struct{}, len(nullifiers))
+	for _, n := range nullifiers {
+		spent[n] = struct{}{}
+	}
+	for c, n := range w.notes {
+		if _, ok := spent[n.nullifier]; ok {
+			delete(w.notes, c)
 		}
 	}
 }
