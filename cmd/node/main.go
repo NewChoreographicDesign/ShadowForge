@@ -72,6 +72,9 @@ func main() {
 	bootstrap := flag.String("bootstrap", "", "comma-separated bootstrap peer multiaddrs")
 	dataDir := flag.String("data", "", "Badger data directory (empty = in-memory)")
 	sentinelFlag := flag.Bool("sentinel", false, "run as a protocol sentinel validator")
+	validateFlag := flag.Bool("validate", false, "toggle real civilian validating on (spec 5.4/243's 'Enable Validating'): heartbeat, become eligible for committee assignment, and vote/propose real blocks. Off by default — a plain node stays a genuine read-only participant (it still fully syncs and independently reverifies every block) until deliberately opted in. Meaningless combined with -sentinel, which manages its own participation via real sentinel-activation state instead")
+	sentinelKeys := flag.String("sentinel-keys", "", "comma-separated hex-encoded Dilithium public keys this node trusts as real protocol-run sentinels (spec 5.5). A heartbeat's own IsSentinel claim is only honored when its key is in this set — otherwise it's treated as an ordinary civilian heartbeat, still subject to the real NFT-ownership gate. Empty (the default) means no sentinel claim is ever trusted, so every -sentinel node's peers see it purely as a civilian (and it needs a real NFT like any other, unless -skip-nft-check is set)")
+	skipNFTCheck := flag.Bool("skip-nft-check", false, "skip the real spec-4.5/10.1/243 NFT-ownership gate on inbound civilian heartbeats — an identity with no real, minted ValidatorNFT is normally never counted online or assigned to a committee. Keep this off for any network meant to reflect real validator admission; on (the same fast-local-network escape hatch -skip-zk-setup already is) only for a quick multi-process smoke test where minting real NFTs for every node first would just add friction")
 	skipZK := flag.Bool("skip-zk-setup", false, "skip the Groth16 trusted setup (Kind Transfer proofs will be rejected)")
 	zkParamsPath := flag.String("zk-params", "", "path to a shared Groth16 parameters file (pkg/zk.System.WriteTo's format). If it exists, load it; if not, run a fresh trusted setup and write it there for other nodes/wallets to load. Empty (the default) runs an independent, unshared setup — fine for a single node, but a proof any wallet builds will never verify here unless every party loads the exact same params file (see 'wallet zk-setup' to generate one)")
 	skipEligibilityZK := flag.Bool("skip-eligibility-zk-setup", false, "skip the anonymous voter-eligibility Groth16 trusted setup (TxVote/TxVoteReveal will be rejected — no wallet can vote at all on this node, not even anonymously)")
@@ -93,7 +96,10 @@ func main() {
 	pohAttestorKeys := flag.String("poh-attestor-keys", "", "comma-separated hex-encoded Dilithium public keys this node trusts to sign real proof-of-humanity attestations (spec 10.1) for Kind NFTMint. Empty (the default) means no attestor is trusted, so every NFTMint attempt is rejected — this also means nobody can newly qualify for real governance voting eligibility (TxVote/TxVoteReveal now require a real, PoH-verified NFT) until at least one is configured; see 'wallet zk-setup'-adjacent 'wallet poh-attest' for the attestor-side tool")
 	flag.Parse()
 
-	role := "civilian"
+	role := "civilian (observer — pass -validate to actually heartbeat/validate)"
+	if *validateFlag {
+		role = "civilian (validating)"
+	}
 	if *sentinelFlag {
 		role = "sentinel"
 	}
@@ -227,7 +233,7 @@ func main() {
 		}
 	}
 
-	trustedPoHAttestors, err := parsePoHAttestorKeys(*pohAttestorKeys)
+	trustedPoHAttestors, err := parseHexPubKeys(*pohAttestorKeys)
 	if err != nil {
 		log.Fatalf("parse -poh-attestor-keys: %v", err)
 	}
@@ -235,8 +241,19 @@ func main() {
 		log.Println("no -poh-attestor-keys configured: Kind NFTMint will reject every attempt, so no wallet can newly qualify for real governance voting eligibility on this node")
 	}
 
+	trustedSentinelKeys, err := parseHexPubKeys(*sentinelKeys)
+	if err != nil {
+		log.Fatalf("parse -sentinel-keys: %v", err)
+	}
+	if *sentinelFlag && len(trustedSentinelKeys) == 0 {
+		log.Println("WARNING: -sentinel set but -sentinel-keys is empty: peers will not trust this node's own sentinel claim (nothing configured to trust it against), so it will be treated as an ordinary civilian and needs a real NFT (or -skip-nft-check) like any other")
+	}
+	if *skipNFTCheck {
+		log.Println("WARNING: -skip-nft-check set: any heartbeating identity is counted online regardless of real NFT ownership — do not use this on a network meant to reflect real validator admission")
+	}
+
 	cfg := validator.DefaultConfig(consensus.GenesisTime(*genesisMs))
-	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mintZK, stakeZK, unstakeZK, mempool, pk, sk, *sentinelFlag, log.Printf)
+	vnode := validator.NewNode(cfg, h, nil, store, stateTree, chn, zkSys, v, oracleQuorum, trustedPoHAttestors, eligibilityZK, mintZK, stakeZK, unstakeZK, mempool, pk, sk, *sentinelFlag, *skipNFTCheck, trustedSentinelKeys, log.Printf)
 	log.Printf("validator identity: %s", vnode.Identity())
 	metrics.SetNodeInfo(role, vnode.Identity().String())
 
@@ -269,7 +286,7 @@ func main() {
 		log.Printf("connected to bootstrap peer %s (via %s)", addr, path)
 	}
 
-	vnode.Start(ctx)
+	vnode.Start(ctx, *validateFlag)
 	go epochLoop(ctx, consensus.GenesisTime(*genesisMs))
 	go chainStatusLoop(ctx, vnode)
 	go metricsLoop(ctx, vnode, mempool)
@@ -327,12 +344,14 @@ func main() {
 // doesn't resolve — start the first node (or run `wallet zk-setup`)
 // alone to generate it once, then point every other node/wallet at the
 // resulting file.
-// parsePoHAttestorKeys decodes -poh-attestor-keys's comma-separated,
-// hex-encoded Dilithium public keys into the real trusted-attestor set
-// Kind NFTMint checks a proof-of-humanity attestation's signer against.
-// An empty string is a real, valid, fail-closed configuration (no
-// attestor trusted yet), not an error.
-func parsePoHAttestorKeys(csv string) ([]crypto.DilithiumPublicKey, error) {
+// parseHexPubKeys decodes a comma-separated list of hex-encoded Dilithium
+// public keys into a trusted-key set — shared by -poh-attestor-keys (Kind
+// NFTMint's trusted attestor set) and -sentinel-keys (the trusted
+// protocol-run sentinel set), which use the identical format for the
+// identical reason: a small, real, operator-configured allowlist rather
+// than trusting a caller's own claim. An empty string is a real, valid,
+// fail-closed configuration (nothing trusted yet), not an error.
+func parseHexPubKeys(csv string) ([]crypto.DilithiumPublicKey, error) {
 	if csv == "" {
 		return nil, nil
 	}

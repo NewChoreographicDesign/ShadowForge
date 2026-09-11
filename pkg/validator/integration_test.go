@@ -83,7 +83,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 		logf := func(format string, args ...interface{}) {
 			t.Logf("node%d: "+format, append([]interface{}{idx}, args...)...)
 		}
-		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, eligSys, nil, nil, nil, mempool, pk, sk, false, logf)
+		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, eligSys, nil, nil, nil, mempool, pk, sk, false, true, nil, logf)
 	}
 
 	// Full mesh: every node dials every other node, so Broadcast (which
@@ -107,7 +107,7 @@ func TestFourNodesConvergeOnSameChain(t *testing.T) {
 	}
 
 	for _, node := range nodes {
-		node.Start(ctx)
+		node.Start(ctx, true)
 	}
 
 	// Let the heartbeat mesh fully converge (every node has heard every

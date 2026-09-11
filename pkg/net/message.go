@@ -55,19 +55,47 @@ func NewEnvelope(t MessageType, payload interface{}) (Envelope, error) {
 // HeartbeatPayload is sent every HeartbeatInterval (spec 5.4.2). PubKey is
 // this validator's real Dilithium public key, so peers can build the
 // identity registry real StageVote/Block verification needs
-// (pkg/chain.PubKeyLookup) — a trust-on-first-heartbeat substitute for a
-// real on-chain NFT-mint identity binding, which this reference build
-// doesn't wire end to end (see README's Scope section).
+// (pkg/chain.PubKeyLookup). Sig is a real signature over
+// HeartbeatMessage(PubKey, Timestamp, IsSentinel), verified by every
+// receiver against the embedded PubKey before anything else here is
+// trusted — proof the sender actually holds that key's private half, not
+// merely a claim. There is deliberately no NFT field: earlier this build
+// carried one, self-reported and never checked against anything, which a
+// receiver had no way to distinguish from a lie — see pkg/validator's own
+// doc on the real spec-4.5/10.1 NFT-ownership gate that closed this. The
+// consensus identity a verified heartbeat maps to is always recomputed as
+// types.NFTID(types.SumHash(PubKey)), never taken from the wire.
 type HeartbeatPayload struct {
-	NFT       types.NFTID `json:"nft"`
-	PubKey    []byte      `json:"pub_key"`
-	Timestamp int64       `json:"timestamp"`
+	PubKey    []byte             `json:"pub_key"`
+	Timestamp int64              `json:"timestamp"`
+	Sig       types.DilithiumSig `json:"sig"`
 	// IsSentinel marks this heartbeat as coming from a protocol-run
-	// sentinel validator rather than a civilian one (spec 5.5). Peers use
-	// it to count "online civilians" separately from sentinels — the
-	// input consensus.SentinelManager.Evaluate needs to decide whether
+	// sentinel validator rather than a civilian one (spec 5.5). A receiver
+	// only honors this claim if PubKey is also in its own configured
+	// trusted-sentinel-key set (cmd/node's -sentinel-keys) — otherwise a
+	// well-known-server role would be as self-asserted and unverifiable as
+	// the old NFT field was, defeating the entire point of gating civilian
+	// heartbeats on real NFT ownership. Peers use a verified sentinel
+	// heartbeat to count "online civilians" separately from sentinels —
+	// the input consensus.SentinelManager.Evaluate needs to decide whether
 	// sentinels should activate or withdraw.
 	IsSentinel bool `json:"is_sentinel,omitempty"`
+}
+
+// HeartbeatMessage is the exact hash a HeartbeatPayload.Sig must cover —
+// both the sender (signing) and every receiver (verifying) compute it
+// identically from the payload's own other fields, so it never needs to
+// be transmitted separately.
+func HeartbeatMessage(pubKey []byte, timestampMs int64, isSentinel bool) types.Hash {
+	var tsBytes [8]byte
+	for i := 0; i < 8; i++ {
+		tsBytes[i] = byte(uint64(timestampMs) >> (8 * i))
+	}
+	sentinelByte := [1]byte{0}
+	if isSentinel {
+		sentinelByte[0] = 1
+	}
+	return types.SumHash(pubKey, tsBytes[:], sentinelByte[:])
 }
 
 // TxOfferPayload carries a shielded transaction into the mempool.

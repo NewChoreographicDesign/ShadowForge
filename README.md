@@ -47,11 +47,22 @@ view to agree):
 
 ```sh
 mkdir -p /tmp/shared
-go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15001 -announce-file /tmp/shared/v1.addr -skip-zk-setup &
-go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15003 -bootstrap-file /tmp/shared/v1.addr -announce-file /tmp/shared/s1.addr -sentinel -skip-zk-setup &
-go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15002 -bootstrap-file /tmp/shared/v1.addr,/tmp/shared/s1.addr -announce-file /tmp/shared/v2.addr -skip-zk-setup &
+go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15001 -announce-file /tmp/shared/v1.addr -skip-zk-setup -validate -skip-nft-check &
+go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15003 -bootstrap-file /tmp/shared/v1.addr -announce-file /tmp/shared/s1.addr -sentinel -skip-zk-setup -skip-nft-check &
+go run ./cmd/node -listen /ip4/127.0.0.1/tcp/15002 -bootstrap-file /tmp/shared/v1.addr,/tmp/shared/s1.addr -announce-file /tmp/shared/v2.addr -skip-zk-setup -validate -skip-nft-check &
 go run ./cmd/walletsim -listen /ip4/127.0.0.1/tcp/15010 -bootstrap-file /tmp/shared/v2.addr -interval 1s
 ```
+
+Real validator admission (spec 4.5/10.1/243) requires a node to hold a
+real, minted `ValidatorNFT`: `-validate` opts a node into heartbeating and
+committee eligibility, but peers only count that heartbeat once it's
+signed by the claimed identity's key *and* that identity owns an
+unslashed NFT (`-sentinel` nodes are exempt only when a peer explicitly
+trusts their key via `-sentinel-keys`). `-skip-nft-check` is the
+fast-local-network escape hatch above — same spirit as `-skip-zk-setup` —
+for a quick smoke test where minting real NFTs for every node first would
+just add friction; leave it off for anything meant to reflect real
+validator admission.
 
 Watch any node's log for `chain height=N hash=...` — all three should
 converge on the same height and hash as `walletsim`'s transactions get
@@ -193,6 +204,26 @@ package — this is not a stub with comments describing intended behavior.
   binary was separately verified as three full-mesh OS processes plus a
   wallet simulator, growing a real chain to height 12 (see the Quickstart
   section above).
+- **Real NFT-gated validator admission, not an open committee.** Spec
+  4.5/10.1/243's design — mint an NFT, get proof-of-humanity verified,
+  and only then can that identity run a node and vote — is enforced on
+  the wire, not just documented. `HeartbeatPayload` carries a real
+  Dilithium signature (`pkg/net.HeartbeatMessage` + `crypto.DilithiumSign`/
+  `Verify`) so a peer never trusts a self-reported identity; on receipt,
+  `pkg/validator`'s `handleMessage` recomputes the sender's identity from
+  the verified key, then rejects the heartbeat unless that identity owns
+  a real, unslashed `ValidatorNFT` (`state.Store.GetNFTByOwner`) —
+  wallets can exist without ever being able to run a node or enter a
+  committee. A claimed `-sentinel` role is honored only when the peer has
+  explicitly configured that exact key via `-sentinel-keys`; any other
+  `IsSentinel` claim falls through to the same real NFT check. See
+  `pkg/validator/heartbeat_nft_test.go` for the full suite: a forged
+  signature, a real signature from an identity with no NFT, a slashed
+  NFT, an untrusted sentinel claim, and a genuinely trusted sentinel are
+  each proven admitted or rejected exactly as spec'd. `-skip-nft-check`
+  is a deliberate, off-by-default escape hatch (same shape as
+  `-skip-zk-setup`) for fast local networks that don't want to mint real
+  NFTs first.
 - **A real five-stage pipeline with atomicity and real signatures.**
   `pkg/tx` runs every transaction through Sender Leave → TX Offer →
   Receiver Check → Send Exec → Place Final (spec 5.3), verifying the

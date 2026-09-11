@@ -266,6 +266,24 @@ type Node struct {
 	// heartbeatLoop — so it genuinely stands down when not needed rather
 	// than always running with role only affecting logging.
 	isSentinel bool
+	// skipNFTCheck disables the real spec-4.5/10.1/243 NFT-ownership gate
+	// on inbound civilian heartbeats (handleMessage's MsgHeartbeat case) —
+	// cmd/node's -skip-nft-check, the identical "keep a local/test network
+	// fast, real gate stays the production default" escape hatch
+	// -skip-zk-setup already established for the Transfer circuit. False
+	// (the default, and what cmd/node's real network path always uses) is
+	// the secure state: an identity with no real, non-slashed
+	// ValidatorNFT is never counted online.
+	skipNFTCheck bool
+	// trustedSentinelKeys is the real, configured set of protocol-run
+	// sentinel identities (cmd/node's -sentinel-keys, mirroring
+	// -poh-attestor-keys' identical trusted-set pattern) — a heartbeat's
+	// own IsSentinel claim is only ever honored when its PubKey is also in
+	// this set; otherwise it is treated as an ordinary civilian claim,
+	// still subject to the NFT-ownership gate above. Without this, a
+	// self-asserted IsSentinel flag would let anyone bypass the NFT gate
+	// outright simply by claiming to be a sentinel.
+	trustedSentinelKeys []crypto.DilithiumPublicKey
 
 	identity types.NFTID
 	pk       crypto.DilithiumPublicKey
@@ -335,8 +353,10 @@ const megabatchDoneCap = 16
 // construction time. pk/sk are this node's real Dilithium identity
 // keypair; the node's consensus identity (types.NFTID) is derived from the
 // public key (types.NFTID(types.SumHash(pk))) — a genuine cryptographic
-// binding, not an arbitrary label.
-func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mintZK *zk.MintSystem, stakeZK *zk.StakeSystem, unstakeZK *zk.UnstakeSystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, logf Logf) *Node {
+// binding, not an arbitrary label. skipNFTCheck/trustedSentinelKeys
+// configure the real inbound-heartbeat gate — see those Node fields' own
+// doc.
+func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *state.Store, tree *state.MerkleTree, chn *chain.Chain, zkSys *zk.System, vlt *vault.Vault, oracleQuorum *oracle.Quorum, trustedPoHAttestors []crypto.DilithiumPublicKey, eligibilityZK *zk.EligibilitySystem, mintZK *zk.MintSystem, stakeZK *zk.StakeSystem, unstakeZK *zk.UnstakeSystem, mempool *tx.Mempool, pk crypto.DilithiumPublicKey, sk crypto.DilithiumPrivateKey, isSentinel bool, skipNFTCheck bool, trustedSentinelKeys []crypto.DilithiumPublicKey, logf Logf) *Node {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -386,19 +406,21 @@ func NewNode(cfg Config, h host.Host, limiter *shadownet.RateLimiter, store *sta
 			p := governance.Default()
 			return &p
 		}(),
-		silentMon:     silent.NewRateMonitor(),
-		sentinels:     consensus.NewSentinelManager(),
-		outage:        consensus.NewOutageController(consensus.DefaultOutageThresholds()),
-		isSentinel:    isSentinel,
-		identity:      types.NFTID(types.SumHash(pk)),
-		pk:            pk,
-		sk:            sk,
-		log:           logf,
-		online:        map[types.NFTID]onlineInfo{},
-		everSeen:      map[types.NFTID]time.Time{},
-		rounds:        map[uint64]*round{},
-		megabatchRecv: map[megabatchKey]*megabatchAssembly{},
-		megabatchDone: map[uint64][]types.ShieldedTx{},
+		silentMon:           silent.NewRateMonitor(),
+		sentinels:           consensus.NewSentinelManager(),
+		outage:              consensus.NewOutageController(consensus.DefaultOutageThresholds()),
+		isSentinel:          isSentinel,
+		skipNFTCheck:        skipNFTCheck,
+		trustedSentinelKeys: trustedSentinelKeys,
+		identity:            types.NFTID(types.SumHash(pk)),
+		pk:                  pk,
+		sk:                  sk,
+		log:                 logf,
+		online:              map[types.NFTID]onlineInfo{},
+		everSeen:            map[types.NFTID]time.Time{},
+		rounds:              map[uint64]*round{},
+		megabatchRecv:       map[megabatchKey]*megabatchAssembly{},
+		megabatchDone:       map[uint64][]types.ShieldedTx{},
 	}
 	n.net = shadownet.NewNode(h, limiter, n.handleMessage)
 	if !isSentinel {
@@ -473,10 +495,27 @@ func (n *Node) ReassembledMegabatch(height uint64) ([]types.ShieldedTx, bool) {
 	return batch, ok
 }
 
-// Start launches the heartbeat and round loops; it returns immediately and
-// runs until ctx is done.
-func (n *Node) Start(ctx context.Context) {
-	go n.heartbeatLoop(ctx)
+// Start launches the round loop, which drives real block-adoption and
+// commit-timeout logic (BlockAnnounce/BlockResponse handling runs off
+// handleMessage regardless, so a non-validating node still syncs the real
+// chain); it returns immediately and runs until ctx is done.
+//
+// The heartbeat loop only starts if validating is true or this node is a
+// sentinel (which self-gates its own broadcasts on real activation state —
+// see heartbeatLoop). validating is the real spec-5.4/243 "toggle Enable
+// Validating" a civilian NFT holder must deliberately opt into (cmd/node's
+// -validate flag) before this identity's heartbeats ever reach a peer and
+// become eligible for committee assignment — a plain node that never
+// passes it stays a genuine read-only participant: it still fully syncs
+// and independently reverifies every block, it just never announces
+// itself as available for validator duty. Without this, every process
+// that merely runs cmd/node would default to attempting to validate,
+// which is the opposite of spec 34/243's "you mint a free NFT, then
+// toggle validating" design.
+func (n *Node) Start(ctx context.Context, validating bool) {
+	if n.isSentinel || validating {
+		go n.heartbeatLoop(ctx)
+	}
 	go n.roundLoop(ctx)
 }
 
@@ -485,6 +524,22 @@ func (n *Node) recordOnline(id types.NFTID, pk crypto.DilithiumPublicKey, isSent
 	defer n.mu.Unlock()
 	n.online[id] = onlineInfo{lastBeat: now, pubKey: pk, isSentinel: isSentinel}
 	n.everSeen[id] = now
+}
+
+// trustedSentinel reports whether pubKey is in this node's own configured
+// -sentinel-keys set — the real check a heartbeat's self-asserted
+// IsSentinel claim must pass before it is ever honored (handleMessage's
+// MsgHeartbeat case). A small, static, operator-configured list, scanned
+// linearly the same way trustedPoHAttestors already is elsewhere in this
+// codebase (pkg/nft.PoHAttestation.verify) — these sets are never large
+// enough in practice for that to matter.
+func (n *Node) trustedSentinel(pubKey []byte) bool {
+	for _, k := range n.trustedSentinelKeys {
+		if string(k) == string(pubKey) {
+			return true
+		}
+	}
+	return false
 }
 
 // onlineSet returns the sorted set of validator identities heartbeat-active
@@ -601,8 +656,15 @@ func (n *Node) sendHeartbeat(ctx context.Context) {
 		return
 	}
 	n.recordOnline(n.identity, n.pk, n.isSentinel, now)
+	timestampMs := now.UnixMilli()
+	msg := shadownet.HeartbeatMessage([]byte(n.pk), timestampMs, n.isSentinel)
+	sig, err := crypto.DilithiumSign(n.sk, msg[:])
+	if err != nil {
+		n.log("validator: sign heartbeat: %v", err)
+		return
+	}
 	env, err := shadownet.NewEnvelope(shadownet.MsgHeartbeat, shadownet.HeartbeatPayload{
-		NFT: n.identity, PubKey: []byte(n.pk), Timestamp: now.UnixMilli(), IsSentinel: n.isSentinel,
+		PubKey: []byte(n.pk), Timestamp: timestampMs, Sig: types.DilithiumSig(sig), IsSentinel: n.isSentinel,
 	})
 	if err != nil {
 		n.log("validator: build heartbeat: %v", err)

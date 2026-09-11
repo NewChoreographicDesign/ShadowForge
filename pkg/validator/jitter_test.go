@@ -139,7 +139,7 @@ func TestFourNodesConvergeUnderJitterAndPacketLoss(t *testing.T) {
 		logf := func(format string, args ...interface{}) {
 			t.Logf("node%d: "+format, append([]interface{}{idx}, args...)...)
 		}
-		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, eligSys, nil, nil, nil, mempool, pk, sk, false, logf)
+		nodes[i] = validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, eligSys, nil, nil, nil, mempool, pk, sk, false, true, nil, logf)
 	}
 
 	// Full mesh, dialed on the wrapped hosts — Connect() forwards straight
@@ -164,7 +164,7 @@ func TestFourNodesConvergeUnderJitterAndPacketLoss(t *testing.T) {
 	}
 
 	for _, node := range nodes {
-		node.Start(ctx)
+		node.Start(ctx, true)
 	}
 
 	// Give the heartbeat mesh longer to converge than the clean-network

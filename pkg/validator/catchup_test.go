@@ -129,7 +129,7 @@ func TestNodeCatchesUpAcrossMultipleBlocks(t *testing.T) {
 		logf := func(format string, args ...interface{}) {
 			t.Logf("node%d: "+format, append([]interface{}{idx}, args...)...)
 		}
-		n := validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, trustedAttestors, eligSys, nil, nil, nil, mempool, pk, sk, false, logf)
+		n := validator.NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, trustedAttestors, eligSys, nil, nil, nil, mempool, pk, sk, false, true, nil, logf)
 		return n, h
 	}
 
@@ -150,8 +150,8 @@ func TestNodeCatchesUpAcrossMultipleBlocks(t *testing.T) {
 	}
 	connectCancel()
 
-	nodeA.Start(ctx)
-	nodeC.Start(ctx)
+	nodeA.Start(ctx, true)
+	nodeC.Start(ctx, true)
 
 	// A real, plain shadownet.Node (no validator.Node behind it) submits
 	// every mint the same way a real wallet would: one TxOffer, sent to

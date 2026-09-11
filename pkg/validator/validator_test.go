@@ -146,7 +146,7 @@ func newTestNode(t *testing.T, roundTimeout time.Duration, genesisMs int64) *Nod
 		OnlineTimeout:     time.Minute,
 		Genesis:           consensus.GenesisTime(genesisMs),
 	}
-	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), getTestMintSystem(t), getTestStakeSystem(t), getTestUnstakeSystem(t), mempool, pk, sk, false, testLogf(t))
+	return NewNode(cfg, h, nil, store, tree, chn, nil, v, nil, nil, getTestEligibilitySystem(t), getTestMintSystem(t), getTestStakeSystem(t), getTestUnstakeSystem(t), mempool, pk, sk, false, true, nil, testLogf(t))
 }
 
 type peerKey struct {

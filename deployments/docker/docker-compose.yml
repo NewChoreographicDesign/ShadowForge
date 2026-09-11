@@ -55,6 +55,8 @@ services:
       - -listen=/ip4/0.0.0.0/tcp/4001
       - -announce-file=/shared/validator1.addr
       - -skip-zk-setup # keep the 4-node smoke test fast; omit to exercise real Transfer proofs
+      - -validate # opt into real heartbeating/committee eligibility (spec 5.4/243) — off by default now
+      - -skip-nft-check # this smoke network mints no real ValidatorNFTs; skip that gate here, same spirit as -skip-zk-setup above
       # 0.0.0.0, not the loopback-only default: statuspage (another
       # container on this same network) needs to reach it. Not published
       # to the host (no ports: entry) — nothing outside this compose
@@ -74,6 +76,8 @@ services:
       - -bootstrap-file=/shared/validator1.addr,/shared/sentinel1.addr
       - -announce-file=/shared/validator2.addr
       - -skip-zk-setup
+      - -validate
+      - -skip-nft-check
       # 0.0.0.0, not the -query-listen default's loopback-only bind: this
       # is validator2's own explicit choice to publish its read-only
       # query API (see pkg/query.Config.ListenAddr's own doc) — both to
@@ -100,6 +104,11 @@ services:
       - -announce-file=/shared/sentinel1.addr
       - -sentinel
       - -skip-zk-setup
+      # -validate is meaningless combined with -sentinel (see -validate's own
+      # doc); no peer here configures -sentinel-keys for this node's identity,
+      # so its IsSentinel claim isn't trusted and it still needs -skip-nft-check
+      # to be counted online, same as validator1/validator2 above.
+      - -skip-nft-check
       # Same reasoning as validator1's identical addition above.
       - -query-listen=0.0.0.0:8081
       - -metrics-listen=0.0.0.0:9100

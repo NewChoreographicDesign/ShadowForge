@@ -57,7 +57,45 @@ func (n *Node) handleMessage(p peer.ID, env shadownet.Envelope) {
 		if len(hb.PubKey) == 0 {
 			return
 		}
-		n.recordOnline(hb.NFT, crypto.DilithiumPublicKey(hb.PubKey), hb.IsSentinel, time.Now())
+		// Real proof this heartbeat's sender actually holds PubKey's
+		// private half — never trust a claimed identity, the same
+		// standard every other signed input in this codebase already
+		// gets (stage votes, transactions, block proposals).
+		msg := shadownet.HeartbeatMessage(hb.PubKey, hb.Timestamp, hb.IsSentinel)
+		valid, err := crypto.DilithiumVerify(crypto.DilithiumPublicKey(hb.PubKey), msg[:], crypto.DilithiumSignature(hb.Sig))
+		if err != nil || !valid {
+			n.log("validator: dropping heartbeat from %s: signature does not verify", p)
+			return
+		}
+		// The consensus identity a verified heartbeat maps to is always
+		// recomputed from the real, just-verified PubKey — never taken
+		// from the wire (see HeartbeatPayload's own doc for why an
+		// earlier, self-reported NFT field was removed rather than kept
+		// and merely cross-checked).
+		identity := types.NFTID(types.SumHash(hb.PubKey))
+		// A sentinel claim only counts against n's own configured trusted
+		// set (-sentinel-keys) — otherwise anyone could bypass the real
+		// NFT-ownership gate below simply by asserting IsSentinel.
+		isSentinel := hb.IsSentinel && n.trustedSentinel(hb.PubKey)
+		if !isSentinel && !n.skipNFTCheck {
+			// Real spec-4.5/10.1/243 Proof-of-Authority gate: "the
+			// authority credential is a free, one-per-wallet NFT plus
+			// live heartbeats" — a civilian identity with no real,
+			// minted, non-slashed ValidatorNFT is never counted online,
+			// so it can never be assigned to a committee that proposes
+			// or votes on blocks (consensus.AssignCommittee only ever
+			// sees this node's own online set).
+			owner := types.AddressFromPubkey(hb.PubKey)
+			nftRecord, found, err := n.store.GetNFTByOwner(owner)
+			if err != nil {
+				n.log("validator: heartbeat NFT lookup for %s failed: %v", p, err)
+				return
+			}
+			if !found || nftRecord.Slashed {
+				return
+			}
+		}
+		n.recordOnline(identity, crypto.DilithiumPublicKey(hb.PubKey), isSentinel, time.Now())
 
 	case shadownet.MsgTxOffer:
 		var offer shadownet.TxOfferPayload
